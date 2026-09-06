@@ -2963,7 +2963,7 @@ impl KnowledgeEngine {
     }
 
     #[cfg(test)]
-    fn for_test(private_root: &Path) -> BrainResult<Self> {
+    pub(crate) fn for_test(private_root: &Path) -> BrainResult<Self> {
         Self::from_verified_root(
             private_root.to_path_buf(),
             AuthorityInstanceId::parse("test-authority-instance.v1")?,

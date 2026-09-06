@@ -486,6 +486,146 @@ mod tests {
     }
 
     #[test]
+    fn sha256_digest_traits_file_hash_and_conversions_are_canonical() {
+        use std::borrow::Borrow as _;
+        use std::str::FromStr as _;
+
+        let raw = Sha256Digest::digest_bytes(b"trait-surface");
+        let text = raw.as_str().to_string();
+        assert_eq!(raw.to_string(), text);
+        assert_eq!(raw.as_ref(), text);
+        assert_eq!(&*raw, text);
+        assert_eq!(raw.borrow(), text);
+        assert!(raw == text.as_str());
+        assert!(raw.eq(&text.as_str()));
+        assert!(raw == text);
+        assert!(text == raw);
+        assert_eq!(Sha256Digest::from_str(raw.as_str()).unwrap(), raw);
+        assert_eq!(Sha256Digest::try_from(raw.as_str()).unwrap(), raw);
+        assert_eq!(
+            Sha256Digest::try_from(raw.as_str().to_string()).unwrap(),
+            raw
+        );
+        assert_eq!(String::from(raw.clone()), raw.as_str());
+        assert_eq!(raw.clone().into_string(), raw.as_str());
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cerebro-digest-file-{}-{unique}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"file-digest").unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            Sha256Digest::digest_bytes(b"file-digest")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    macro_rules! exercise_semantic_digest {
+        ($($ty:ty),+ $(,)?) => {{
+            let raw = Sha256Digest::digest_bytes(b"semantic-digest-surface");
+            let text = raw.as_str().to_string();
+            $(
+                let typed = <$ty>::from(raw.clone());
+                assert_eq!(typed.as_digest(), &raw);
+                assert_eq!(typed.as_str(), raw.as_str());
+                assert_eq!(typed.to_string(), raw.as_str());
+                let as_ref: &str = typed.as_ref();
+                assert_eq!(as_ref, raw.as_str());
+                let borrowed: &str = std::borrow::Borrow::<str>::borrow(&typed);
+                assert_eq!(borrowed, raw.as_str());
+                assert_eq!(&*typed, raw.as_str());
+                assert!(typed.eq(raw.as_str()));
+                assert!(typed.eq(&raw.as_str()));
+                assert!(typed.eq(&text));
+                assert!(text.eq(&typed));
+                assert!(raw.as_str().eq(&typed));
+                assert!(typed.eq(&raw));
+                assert!(raw.eq(&typed));
+                let wire = serde_json::to_string(&typed).unwrap();
+                assert_eq!(serde_json::from_str::<$ty>(&wire).unwrap(), typed);
+                assert!(<$ty>::zero().as_digest() == &Sha256Digest::zero());
+            )+
+        }};
+    }
+
+    #[test]
+    fn every_compatibility_semantic_digest_exercises_its_full_trait_surface() {
+        exercise_semantic_digest!(
+            ParameterLayoutDigest,
+            WeightDigest,
+            ManifestCommitmentDigest,
+            CheckpointDigest,
+            EvaluationSuiteDigest,
+            EvaluationReceiptDigest,
+            ProbeProtocolDigest,
+            ProbeEvidenceDigest,
+            ActivationEvidenceDigest,
+            LearningTargetDigest,
+            AdaptiveLearningPolicyDigest,
+            AdaptiveLearningReceiptDigest,
+            LearningEvidenceDigest,
+            ControllerDatasetDigest,
+            LearnedControllerPolicyDigest,
+            LearnedControllerReceiptDigest,
+            SkillBankDigest,
+            SkillFieldSetDigest,
+            ObservationRecordDigest,
+            ProvenanceDigest,
+            RepresentationProtocolDigest,
+            RepresentationRequestDigest,
+            CorpusDigest,
+            ConfigDigest,
+            SourceTreeDigest,
+            AnalysisVersionDigest,
+            ReportDigest,
+            MemoryDigest,
+            EvidenceBundleDigest,
+            CanonicalEngineHeadDigest,
+            CausalCreditDigest,
+            ProtectedMapDigest,
+        );
+    }
+
+    macro_rules! exercise_sealed_digest {
+        ($ty:ty, $has_draft:expr) => {{
+            let raw = Sha256Digest::digest_bytes(b"sealed-semantic-digest-surface");
+            let typed = <$ty>::from_computed(raw.clone());
+            assert_eq!(typed.as_str(), raw.as_str());
+            assert_eq!(typed.to_string(), raw.as_str());
+            let wire = serde_json::to_string(&typed).unwrap();
+            assert_eq!(serde_json::from_str::<$ty>(&wire).unwrap(), typed);
+            if $has_draft {
+                assert_ne!(typed.as_str(), Sha256Digest::zero().as_str());
+            }
+        }};
+    }
+
+    #[test]
+    fn sealed_semantic_digests_round_trip_without_raw_public_conversions() {
+        exercise_sealed_digest!(AcquisitionRequestDigest, true);
+        exercise_sealed_digest!(SystemEnvelopeDigest, true);
+        exercise_sealed_digest!(CapabilityIrDigest, true);
+        exercise_sealed_digest!(CapabilityBundleDigest, true);
+        exercise_sealed_digest!(CaptureReceiptDigest, true);
+        exercise_sealed_digest!(ResidencyPolicyDigest, false);
+        exercise_sealed_digest!(ResidencyPrecommitDigest, true);
+        exercise_sealed_digest!(ResidencyDecisionDigest, true);
+
+        assert!(AcquisitionRequestDigest::draft_marker().is_draft());
+        assert!(SystemEnvelopeDigest::draft_marker().is_draft());
+        assert!(CapabilityIrDigest::draft_marker().is_draft());
+        assert!(CapabilityBundleDigest::draft_marker().is_draft());
+        assert!(CaptureReceiptDigest::draft_marker().is_draft());
+        assert!(ResidencyPrecommitDigest::draft_marker().is_draft());
+        assert!(ResidencyDecisionDigest::draft_marker().is_draft());
+    }
+
+    #[test]
     fn semantic_digest_domains_are_distinct_but_wire_compatible() {
         use std::any::TypeId;
 

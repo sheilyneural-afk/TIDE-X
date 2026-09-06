@@ -2343,16 +2343,12 @@ mod tests {
     #[test]
     fn residency_decision_authority_lifecycle_fail_closed() {
         let root = fixture_root("auth-lifecycle");
-        let prev = std::env::var("TIDEX_PRIVATE_ROOT").ok();
-        std::env::set_var("TIDEX_PRIVATE_ROOT", &root);
-
-        let engine = KnowledgeEngine::open_with_authority_instance(
-            &root,
-            crate::knowledge_engine::AuthorityInstanceId::parse("test-auth-inst.v1").unwrap(),
-        )
-        .unwrap();
-
-        let authority = ResidencyDecisionAuthority::current(&root, &engine).unwrap();
+        let engine = KnowledgeEngine::for_test(&root).unwrap();
+        let authority = ResidencyDecisionAuthority {
+            private_root: root.clone(),
+            knowledge_engine: &engine,
+            policy: ResidencyPolicy::current().unwrap(),
+        };
         assert_eq!(authority.policy().digest(), policy().digest());
 
         // Calling decide on non-existent reference fails closed
@@ -2363,10 +2359,6 @@ mod tests {
         let round = ResidencyDecisionRoundId::parse("round.v1").unwrap();
         assert!(authority.authenticate_decision(&dummy_ref, &round).is_err());
 
-        match prev {
-            Some(ref p) => std::env::set_var("TIDEX_PRIVATE_ROOT", p),
-            None => std::env::remove_var("TIDEX_PRIVATE_ROOT"),
-        }
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -1202,7 +1202,7 @@ pub fn load_verified_governed_composition_receipt(
     receipt_path: impl AsRef<Path>,
     receipt_sha256: &str,
 ) -> BrainResult<GovernedCompositionReceipt> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     if !valid_digest(receipt_sha256) {
         return Err(BrainError::Integrity(
             "governed_composition_receipt_digest_invalid".into(),
@@ -1484,7 +1484,7 @@ pub fn load_verified_learning_finalization_receipt(
     root: impl AsRef<Path>,
     reference: &PrivateFileReference,
 ) -> BrainResult<LearningFinalizationReceipt> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     load_verified_learning_finalization_receipt_under_root(&root, reference, None)
 }
 

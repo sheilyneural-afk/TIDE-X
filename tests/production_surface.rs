@@ -106,25 +106,11 @@ fn ledger_diagnose_cli_lifecycle() {
     std::fs::create_dir_all(&temp_root).unwrap();
     cerebro_tidex::security::secure_dir(&temp_root).unwrap();
 
-    let previous = std::env::var("TIDEX_PRIVATE_ROOT").ok();
-    std::env::set_var("TIDEX_PRIVATE_ROOT", &temp_root);
-
-    // Open an engine to create the ledger structure
-    let _engine = cerebro_tidex::engine::BrainEngine::open(
-        &temp_root,
-        cerebro_tidex::contracts::BrainConfig::default(),
-    )
-    .unwrap();
-
     let output = Command::new(executable)
         .env("TIDEX_PRIVATE_ROOT", &temp_root)
         .output()
         .expect("execute ledger_diagnose");
 
-    match previous {
-        Some(ref p) => std::env::set_var("TIDEX_PRIVATE_ROOT", p),
-        None => std::env::remove_var("TIDEX_PRIVATE_ROOT"),
-    }
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -136,6 +122,56 @@ fn ledger_diagnose_cli_lifecycle() {
     assert!(stdout.contains("verified_head="));
 
     let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn adaptive_learning_cycle_cli_routes_fail_closed_on_missing_authority_inputs() {
+    let executable = env!("CARGO_BIN_EXE_adaptive-learning-cycle");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("test-adaptive-cli-{unique}"));
+    std::fs::create_dir_all(&root).unwrap();
+    cerebro_tidex::security::secure_dir(&root).unwrap();
+
+    let no_args = Command::new(executable).output().unwrap();
+    assert_eq!(no_args.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&no_args.stderr).contains("usage:"));
+
+    let routes: &[&[&str]] = &[
+        &[
+            "start",
+            "missing-session",
+            "/tmp/tidex-missing-target.json",
+            "/tmp/tidex-missing-policy.json",
+        ],
+        &["next", "missing-session"],
+        &[
+            "assimilate",
+            "missing-session",
+            "/tmp/tidex-missing-evidence.json",
+        ],
+        &["show", "missing-session"],
+        &[
+            "controller-train",
+            "/tmp/tidex-missing-dataset.json",
+            "/tmp/tidex-missing-controller-policy.json",
+            "/tmp/tidex-missing-binding.json",
+        ],
+        &["controller-show", "missing-session"],
+        &["controller-compose", "/tmp/tidex-missing-invocation.json"],
+        &["unknown-command"],
+    ];
+    for route in routes {
+        let output = Command::new(executable)
+            .args(*route)
+            .env("TIDEX_PRIVATE_ROOT", &root)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "route={route:?}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -215,4 +251,22 @@ fn tidex_finalize_cli_lifecycle() {
         .output()
         .expect("execute tidex_finalize");
     assert_eq!(output.status.code(), Some(2));
+
+    // 4. Correct arity reaches the authority-bound finalization path and fails
+    // closed because the receipt does not exist under the isolated child root.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("test-finalize-cli-{unique}"));
+    std::fs::create_dir_all(&root).unwrap();
+    cerebro_tidex::security::secure_dir(&root).unwrap();
+    let missing = root.join("missing-receipt.json");
+    let output = Command::new(executable)
+        .args(["session-1", missing.to_str().unwrap()])
+        .env("TIDEX_PRIVATE_ROOT", &root)
+        .output()
+        .expect("execute tidex_finalize valid arity");
+    assert_eq!(output.status.code(), Some(2));
+    std::fs::remove_dir_all(root).unwrap();
 }

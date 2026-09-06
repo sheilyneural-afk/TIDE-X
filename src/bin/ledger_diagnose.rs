@@ -43,21 +43,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         cerebro_tidex::security::secure_dir(&root).unwrap();
 
-        let prev = std::env::var("TIDEX_PRIVATE_ROOT").ok();
-        std::env::set_var("TIDEX_PRIVATE_ROOT", &root);
-
-        let _engine = cerebro_tidex::engine::BrainEngine::open(
-            &root,
-            cerebro_tidex::contracts::BrainConfig::default(),
-        )
-        .unwrap();
-
         assert!(run_diagnose(&root).is_ok());
-
-        match prev {
-            Some(ref p) => std::env::set_var("TIDEX_PRIVATE_ROOT", p),
-            None => std::env::remove_var("TIDEX_PRIVATE_ROOT"),
-        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

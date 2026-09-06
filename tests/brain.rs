@@ -337,4 +337,16 @@ fn sleep_cycle_unpromoted_and_idempotent_lifecycle() {
     assert!(report2.idempotent);
     assert_eq!(report.corpus_digest, report2.corpus_digest);
     assert_eq!(report.memory_digest, report2.memory_digest);
+
+    assert!(matches!(
+        engine.status(),
+        Err(cerebro_tidex::BrainError::Integrity(m)) if m == "active_skill_bank_missing"
+    ));
+
+    let recovery = engine.recover_incomplete_corpus_transition().unwrap();
+    assert_eq!(
+        recovery.outcome,
+        cerebro_tidex::engine::CorpusTransitionRecoveryOutcome::NoIncompleteTransition
+    );
 }
+

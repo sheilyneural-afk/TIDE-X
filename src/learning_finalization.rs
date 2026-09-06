@@ -459,15 +459,23 @@ pub(crate) mod tests {
         root: &Path,
         session_name: &str,
     ) -> (SessionId, PathBuf, PathBuf) {
+        make_test_scenario_with_count(root, session_name, 2)
+    }
+
+    pub(crate) fn make_test_scenario_with_count(
+        root: &Path,
+        session_name: &str,
+        count: usize,
+    ) -> (SessionId, PathBuf, PathBuf) {
         crate::security::secure_dir(root).unwrap();
+        let capability_ids = (1..=count)
+            .map(|c| CapabilityId::parse(format!("cap-{c}")).unwrap())
+            .collect();
         let target = LearningTarget {
             target_id: LearningTargetId::parse("fin-target").unwrap(),
-            capability_ids: vec![
-                CapabilityId::parse("cap-1").unwrap(),
-                CapabilityId::parse("cap-2").unwrap(),
-            ],
-            candidate_budget: 2,
-            plan_steps: 2,
+            capability_ids,
+            candidate_budget: count,
+            plan_steps: count,
             noise_variance: 0.1,
             cost_weight: 0.0,
             risk_weight: 0.0,
@@ -484,18 +492,27 @@ pub(crate) mod tests {
         let mut first_obs_path = PathBuf::new();
         let mut shifts = Vec::new();
 
-        for i in 1..=2 {
+        for i in 1..=count {
             let issued = issue_next_persistent_learning_aperture(root, session_name).unwrap();
             let step = issued.receipt.cycle.pending_step.as_ref().unwrap();
 
-            let layout_raw = br#"{"schema":"cerebro.tidex.parameter_layout/test"}"#.to_vec();
+            let layout = crate::block_tomography::ParameterBlockLayout::from_shapes(&[
+                crate::block_tomography::BlockShapeSpec {
+                    name: "block_0".into(),
+                    shape: vec![3],
+                    count: 3,
+                },
+            ])
+            .unwrap();
+            let mut layout_raw = serde_json::to_vec_pretty(&layout).unwrap();
+            layout_raw.push(b'\n');
             let layout_digest = Sha256Digest::digest_bytes(&layout_raw);
             let layout_path = root
                 .join("state/parameter_layouts/by-sha")
                 .join(format!("{layout_digest}.json"));
             write_or_verify_immutable(root, &layout_path, &layout_raw).unwrap();
             let dense =
-                crate::artifact::create_content_addressed_dvec(root, &[0.25, -0.5]).unwrap();
+                crate::artifact::create_content_addressed_dvec(root, &[0.1 * i as f32, 0.2, 0.3]).unwrap();
 
             let observation = DeltaObservation {
                 observation_id: ObservationId::parse(format!("obs-fin-{i}")).unwrap(),
@@ -503,11 +520,21 @@ pub(crate) mod tests {
                 to_checkpoint: "candidate".into(),
                 generation: 1,
                 delta: vec![0.1 * i as f64, 0.2, 0.3],
-                functional_response: vec![0.5, -0.2 * i as f64],
+                functional_response: (1..=count)
+                    .map(|k| 0.5 / k as f64 - 0.1 * i as f64)
+                    .collect(),
                 confounders: Vec::new(),
                 reliability: 0.95,
                 independence_group: step.aperture_id.to_string(),
-                experiment_lineage: ExperimentLineage::default(),
+                experiment_lineage: ExperimentLineage {
+                    run_id: format!("fin-run-{i}"),
+                    replicate_id: format!("fin-rep-{i}"),
+                    randomization_id: format!("fin-rand-{i}"),
+                    dataset_split_digest: format!("{:064x}", 0x10 + i),
+                    initial_checkpoint_digest: format!("{:064x}", 0x20 + i),
+                    optimizer_config_digest: format!("{:064x}", 0x30 + i),
+                    template_config_digest: format!("{:064x}", 0x40 + i),
+                },
                 dense_artifact: Some(dense),
                 parameter_layout_sha256: Some(layout_digest),
                 representation_artifact: None,

@@ -891,6 +891,262 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_bytes_accessors_and_reverification_are_bound_to_exact_bytes() {
+        let expected = Sha256Digest::digest_bytes(b"payload");
+        let authenticated =
+            AuthenticatedBytes::authenticate(b"payload".to_vec(), expected.clone()).unwrap();
+        assert_eq!(authenticated.digest(), &expected);
+        assert_eq!(authenticated.len(), 7);
+        assert!(!authenticated.is_empty());
+        authenticated.verify("unexpected").unwrap();
+
+        let empty = AuthenticatedBytes::from_trusted_bytes(Vec::new());
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let mut mutated = authenticated;
+        mutated.bytes[0] ^= 1;
+        let error = mutated
+            .verify("execution_program_digest_mismatch")
+            .unwrap_err();
+        assert_eq!(error.kind, IsolationErrorKind::AuthenticationFailed);
+        assert_eq!(error.detail, "execution_program_digest_mismatch");
+
+        let formatted = IsolationError::new(IsolationErrorKind::InvalidContract, "detail");
+        assert_eq!(formatted.to_string(), "InvalidContract:detail");
+    }
+
+    #[test]
+    fn isolation_limit_and_request_boundary_matrix_fails_closed() {
+        limits().validate().unwrap();
+        let invalid_limits = [
+            IsolationLimits {
+                address_space_bytes: 1,
+                ..limits()
+            },
+            IsolationLimits {
+                cpu_seconds: 0,
+                ..limits()
+            },
+            IsolationLimits {
+                wall_millis: 0,
+                ..limits()
+            },
+            IsolationLimits {
+                process_count: 0,
+                ..limits()
+            },
+            IsolationLimits {
+                output_bytes: 0,
+                ..limits()
+            },
+            IsolationLimits {
+                temporary_storage_bytes: 1,
+                ..limits()
+            },
+            IsolationLimits {
+                temporary_storage_bytes: 512 * 1024 * 1024,
+                address_space_bytes: 256 * 1024 * 1024,
+                ..limits()
+            },
+            IsolationLimits {
+                staging_bytes: 0,
+                ..limits()
+            },
+            IsolationLimits {
+                staging_bytes: 512 * 1024 * 1024,
+                address_space_bytes: 256 * 1024 * 1024,
+                ..limits()
+            },
+        ];
+        for invalid in invalid_limits {
+            assert_eq!(
+                invalid.validate().unwrap_err().kind,
+                IsolationErrorKind::InvalidContract
+            );
+        }
+
+        let mut valid = request();
+        validate_request(&valid).unwrap();
+        valid.program = AuthenticatedBytes::from_trusted_bytes(Vec::new());
+        assert_eq!(
+            validate_request(&valid).unwrap_err().detail,
+            "execution_program_size_invalid"
+        );
+
+        let mut too_many_args = request();
+        too_many_args.arguments = vec!["x".into(); MAX_ARGUMENT_COUNT + 1];
+        assert_eq!(
+            validate_request(&too_many_args).unwrap_err().detail,
+            "execution_argument_count_exceeded"
+        );
+
+        let mut too_many_arg_bytes = request();
+        too_many_arg_bytes.arguments = vec!["x".repeat(MAX_ARGUMENT_BYTES + 1)];
+        assert_eq!(
+            validate_request(&too_many_arg_bytes).unwrap_err().detail,
+            "execution_argument_bytes_exceeded"
+        );
+
+        let mut tampered = request();
+        tampered.input.bytes[0] ^= 1;
+        assert_eq!(
+            validate_request(&tampered).unwrap_err().detail,
+            "execution_input_digest_mismatch"
+        );
+    }
+
+    #[test]
+    fn backend_helpers_and_descriptor_manifest_validate_exact_file_properties() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tidex-backend-probe-{}-{unique}",
+            std::process::id()
+        ));
+        fs::write(&path, b"probe").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions).unwrap();
+        assert_eq!(
+            require_backend(&path).unwrap_err().kind,
+            IsolationErrorKind::BackendUnavailable
+        );
+        assert_eq!(
+            require_runtime_helper(&path).unwrap_err().kind,
+            IsolationErrorKind::BackendUnavailable
+        );
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+        require_backend(&path).unwrap();
+        require_runtime_helper(&path).unwrap();
+        assert_eq!(
+            require_runtime_helper(Path::new("/definitely/not/a/tidex/helper"))
+                .unwrap_err()
+                .detail,
+            "resource_limit_helper_unavailable"
+        );
+        fs::remove_file(path).unwrap();
+
+        let request = request();
+        assert_eq!(
+            build_bwrap_arguments(&request, -1, 4).unwrap_err().detail,
+            "isolation_payload_descriptors_invalid"
+        );
+        assert_eq!(
+            build_bwrap_arguments(&request, 4, 4).unwrap_err().detail,
+            "isolation_payload_descriptors_invalid"
+        );
+    }
+
+    #[test]
+    fn staged_digest_and_reader_join_errors_are_typed() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tidex-digest-probe-{}-{unique}",
+            std::process::id()
+        ));
+        fs::write(&path, b"abc").unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(
+            digest_file_bounded(&mut file, 3).unwrap(),
+            Sha256Digest::digest_bytes(b"abc")
+        );
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(
+            digest_file_bounded(&mut file, 4).unwrap_err().detail,
+            "staged_payload_metadata_mismatch"
+        );
+        fs::remove_file(path).unwrap();
+
+        let panicked = thread::spawn(|| -> std::io::Result<BoundedRead> { panic!("reader panic") });
+        let panic_error = match join_reader(panicked) {
+            Err(error) => error,
+            Ok(_) => panic!("panicked reader unexpectedly succeeded"),
+        };
+        assert_eq!(panic_error.detail, "sandbox_output_reader_panicked");
+        let io_error = thread::spawn(|| -> std::io::Result<BoundedRead> {
+            Err(std::io::Error::other("reader io"))
+        });
+        let io_error = match join_reader(io_error) {
+            Err(error) => error,
+            Ok(_) => panic!("failing reader unexpectedly succeeded"),
+        };
+        assert!(io_error.detail.contains("sandbox_output_read_failed"));
+    }
+
+    #[test]
+    fn monitor_classifies_success_nonzero_timeout_and_output_limit() {
+        let base_request = request();
+        let request_digest = canonical_request_digest(&base_request).unwrap();
+
+        let child = Command::new("/usr/bin/printf")
+            .arg("ok")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard::new(child);
+        let report = monitor_child(&mut child, &base_request, request_digest.clone()).unwrap();
+        assert!(report.succeeded());
+        assert_eq!(report.stdout, b"ok");
+        assert_eq!(
+            report.payload_execution_evidence,
+            PayloadExecutionEvidence::EstablishedBySuccessfulExit
+        );
+        assert_eq!(bounded_stderr_detail(&report), "");
+
+        let child = Command::new("/usr/bin/false")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard::new(child);
+        let report = monitor_child(&mut child, &base_request, request_digest.clone()).unwrap();
+        assert_eq!(
+            report.termination,
+            ExecutionTermination::NonzeroBeforePayloadConfirmation
+        );
+        assert!(!report.succeeded());
+
+        let mut timeout_request = request();
+        timeout_request.limits.wall_millis = 1;
+        let child = Command::new("/usr/bin/sleep")
+            .arg("60")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard::new(child);
+        let report = monitor_child(&mut child, &timeout_request, request_digest.clone()).unwrap();
+        assert_eq!(report.termination, ExecutionTermination::TimedOut);
+
+        let mut limited = request();
+        limited.limits.output_bytes = 4;
+        let child = Command::new("/usr/bin/printf")
+            .arg("0123456789")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard::new(child);
+        let report = monitor_child(&mut child, &limited, request_digest).unwrap();
+        assert_eq!(
+            report.termination,
+            ExecutionTermination::OutputLimitExceeded
+        );
+        assert!(report.stdout_truncated);
+        assert_eq!(report.stdout.len(), 4);
+    }
+
+    #[test]
     fn authentication_rejects_a_false_identity() {
         let error = AuthenticatedBytes::authenticate(
             b"actual".to_vec(),
