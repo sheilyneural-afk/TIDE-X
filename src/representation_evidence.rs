@@ -19,7 +19,7 @@ use crate::digest::{
 use crate::error::{BrainError, BrainResult};
 use crate::identity::ObservationId;
 use crate::ledger;
-use crate::security::verify_private_root;
+use crate::security::verify_internal_private_root;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -534,7 +534,7 @@ pub fn record_representation_evidence(
     root: impl AsRef<Path>,
     source_payload_path: impl AsRef<Path>,
 ) -> BrainResult<RepresentationEvidenceReceipt> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     record_from_payload_path_at_root(&root, source_payload_path.as_ref())
 }
 
@@ -675,7 +675,7 @@ pub fn load_verified_representation_evidence_receipt(
     root: impl AsRef<Path>,
     receipt_path: impl AsRef<Path>,
 ) -> BrainResult<RepresentationEvidenceReceipt> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     load_verified_representation_evidence_receipt_at_root(&root, receipt_path.as_ref())
 }
 

@@ -17,7 +17,7 @@ use crate::error::{BrainError, BrainResult};
 use crate::identity::{ApertureId, CapabilityId, LearningTargetId, ObservationId, SessionId};
 use crate::ledger;
 use crate::linalg::{dot, norm, Matrix};
-use crate::security::verify_private_root;
+use crate::security::verify_internal_private_root;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1464,7 +1464,7 @@ pub fn start_persistent_adaptive_learning(
     target: &LearningTarget,
     policy: &AdaptiveLearningPolicy,
 ) -> BrainResult<LoadedAdaptiveLearningReceipt> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     start_persistent_adaptive_learning_under_root(&root, session_id, target, policy)
 }
 
@@ -1509,7 +1509,7 @@ pub fn issue_next_persistent_learning_aperture(
     root: impl AsRef<Path>,
     session_id: &str,
 ) -> BrainResult<LoadedAdaptiveLearningReceipt> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     issue_next_persistent_learning_aperture_under_root(&root, session_id)
 }
 
@@ -1618,7 +1618,7 @@ pub fn assimilate_persistent_learning_evidence(
     session_id: &str,
     evidence_path: impl AsRef<Path>,
 ) -> BrainResult<LoadedAdaptiveLearningReceipt> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     assimilate_persistent_learning_evidence_under_root(&root, session_id, evidence_path.as_ref())
 }
 
@@ -1626,7 +1626,7 @@ pub fn load_persistent_adaptive_learning_receipt(
     root: impl AsRef<Path>,
     session_id: &str,
 ) -> BrainResult<LoadedAdaptiveLearningReceipt> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     load_current_receipt_under_root(&root, session_id)
 }
 

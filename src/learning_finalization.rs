@@ -18,7 +18,7 @@ use crate::learning_orchestrator::{
 use crate::representation_evidence::{
     load_verified_representation_evidence_receipt, InstalledRepresentationEvidence,
 };
-use crate::security::verify_private_root;
+use crate::security::verify_internal_private_root;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
@@ -329,7 +329,7 @@ pub fn prepare_learning_finalization(
     session_id: &str,
     representation_evidence_receipt_path: impl AsRef<Path>,
 ) -> BrainResult<LearningFinalizationInput> {
-    let root = verify_private_root(root.as_ref())?;
+    let root = verify_internal_private_root(root.as_ref())?;
     let session_id = SessionId::parse(session_id)?;
     prepare_learning_finalization_under_root(
         &root,
@@ -437,5 +437,250 @@ mod tests {
             Sha256Digest::digest_bytes(&serde_json::to_vec(&observation).unwrap())
         );
         assert_ne!(canonical, Sha256Digest::digest_bytes(&staged_file_bytes));
+    }
+
+    use crate::authority::write_or_verify_immutable;
+    use crate::contracts::ExperimentLineage;
+    use crate::digest::ObservationRecordDigest;
+    use crate::identity::CapabilityId;
+    use crate::learning_orchestrator::{
+        assimilate_persistent_learning_evidence, issue_next_persistent_learning_aperture,
+        start_persistent_adaptive_learning, AdaptiveLearningPolicy, LearningExperimentEvidence,
+        LearningTarget,
+    };
+    use crate::linalg::dot;
+    use crate::representation_evidence::{
+        record_representation_evidence, RepresentationCapture,
+        RepresentationEvidenceInstallRequest, RepresentationEvidenceInstallTarget,
+        RepresentationShift, SealedRepresentationProtocol,
+    };
+
+    fn make_test_scenario(root: &Path, session_name: &str) -> (SessionId, PathBuf, PathBuf) {
+        crate::security::secure_dir(root).unwrap();
+        let target = LearningTarget {
+            target_id: LearningTargetId::parse("fin-target").unwrap(),
+            capability_ids: vec![
+                CapabilityId::parse("cap-1").unwrap(),
+                CapabilityId::parse("cap-2").unwrap(),
+            ],
+            candidate_budget: 2,
+            plan_steps: 2,
+            noise_variance: 0.1,
+            cost_weight: 0.0,
+            risk_weight: 0.0,
+        };
+        let policy = AdaptiveLearningPolicy {
+            schema: "cerebro.tidex.adaptive_learning_policy/v1".into(),
+            outcome_utility_weight: 1.0,
+            maximize_observed_value: true,
+        };
+        let started =
+            start_persistent_adaptive_learning(root, session_name, &target, &policy).unwrap();
+
+        let mut install_targets = Vec::new();
+        let mut first_obs_path = PathBuf::new();
+        let mut shifts = Vec::new();
+
+        for i in 1..=2 {
+            let issued = issue_next_persistent_learning_aperture(root, session_name).unwrap();
+            let step = issued.receipt.cycle.pending_step.as_ref().unwrap();
+
+            let layout_raw = br#"{"schema":"cerebro.tidex.parameter_layout/test"}"#.to_vec();
+            let layout_digest = Sha256Digest::digest_bytes(&layout_raw);
+            let layout_path = root
+                .join("state/parameter_layouts/by-sha")
+                .join(format!("{layout_digest}.json"));
+            write_or_verify_immutable(root, &layout_path, &layout_raw).unwrap();
+            let dense =
+                crate::artifact::create_content_addressed_dvec(root, &[0.25, -0.5]).unwrap();
+
+            let observation = DeltaObservation {
+                observation_id: ObservationId::parse(format!("obs-fin-{i}")).unwrap(),
+                from_checkpoint: "base".into(),
+                to_checkpoint: "candidate".into(),
+                generation: 1,
+                delta: vec![0.1 * i as f64, 0.2, 0.3],
+                functional_response: vec![0.5, -0.2 * i as f64],
+                confounders: Vec::new(),
+                reliability: 0.95,
+                independence_group: step.aperture_id.to_string(),
+                experiment_lineage: ExperimentLineage::default(),
+                dense_artifact: Some(dense),
+                parameter_layout_sha256: Some(layout_digest),
+                representation_artifact: None,
+                representation_protocol_sha256: None,
+                provenance_digest: crate::digest::ProvenanceDigest::from(
+                    Sha256Digest::digest_bytes(format!("fin-prov-{i}").as_bytes()),
+                ),
+            };
+            let observation_raw = serde_json::to_vec_pretty(&observation).unwrap();
+            let observation_digest = Sha256Digest::digest_bytes(&observation_raw);
+            let observation_path = root
+                .join("state/observations")
+                .join(format!("{}.json", observation.observation_id));
+            write_or_verify_immutable(root, &observation_path, &observation_raw).unwrap();
+            if i == 1 {
+                first_obs_path = observation_path.clone();
+            }
+
+            let support_path = root
+                .join("state/experiment_support")
+                .join(format!("{}.json", step.aperture_id));
+            let support_raw = format!(r#"{{"step":{i}}}"#).into_bytes();
+            write_or_verify_immutable(root, &support_path, &support_raw).unwrap();
+
+            let evidence = LearningExperimentEvidence {
+                schema: "cerebro.tidex.learning_experiment_evidence/v1".into(),
+                session_id: SessionId::parse(session_name).unwrap(),
+                target_digest: started.receipt.target_digest.clone(),
+                aperture_id: step.aperture_id.clone(),
+                observed_value: dot(&step.capability_weights, &observation.functional_response)
+                    .unwrap(),
+                observation_id: observation.observation_id.clone(),
+                observation: EvidenceReference {
+                    path: observation_path.clone(),
+                    sha256: observation_digest.clone(),
+                },
+                evidence_files: vec![EvidenceReference {
+                    path: support_path.clone(),
+                    sha256: Sha256Digest::digest_bytes(&support_raw),
+                }],
+            };
+            let evidence_path = root
+                .join("state/experiment_envelopes")
+                .join(format!("{}.json", step.aperture_id));
+            write_or_verify_immutable(
+                root,
+                &evidence_path,
+                &serde_json::to_vec_pretty(&evidence).unwrap(),
+            )
+            .unwrap();
+
+            assimilate_persistent_learning_evidence(root, session_name, &evidence_path).unwrap();
+
+            let destination_path = root
+                .join("state/representation_evidence/installed-observations")
+                .join(format!("obs-fin-{i}-installed.json"));
+
+            install_targets.push(RepresentationEvidenceInstallTarget {
+                observation_id: observation.observation_id.clone(),
+                source_observation_path: observation_path.to_string_lossy().into_owned(),
+                source_observation_sha256: ObservationRecordDigest::from(observation_digest),
+                destination_observation_path: destination_path.to_string_lossy().into_owned(),
+            });
+
+            shifts.push(RepresentationShift {
+                observation_id: observation.observation_id.clone(),
+                raw_dimension: 8,
+                shift: vec![0.1 * i as f64, -0.2 * i as f64, 0.3 * i as f64],
+            });
+        }
+
+        let capture = RepresentationCapture {
+            schema: crate::representation_evidence::REPRESENTATION_CAPTURE_SCHEMA.to_string(),
+            observations: shifts,
+        };
+        let protocol = SealedRepresentationProtocol {
+            schema: crate::representation_evidence::REPRESENTATION_PROTOCOL_SCHEMA.to_string(),
+            source_representation_sha256:
+                crate::representation_evidence::representation_capture_sha256(&capture).unwrap(),
+            probe_sha256: Sha256Digest::digest_bytes(b"probe"),
+            probe_text_sha256: Sha256Digest::digest_bytes(b"probe"),
+            forbidden_vocabulary_sha256: Sha256Digest::digest_bytes(b"vocab"),
+            task_labels_used: false,
+            probe_vocabulary_overlap: Vec::new(),
+            probe_count: 2,
+            layer_count: 2,
+            hidden_dim: 2,
+            raw_dimension_per_observation: 8,
+            sketch_dim: 3,
+            sketch_seed: 7,
+        };
+
+        let request = RepresentationEvidenceInstallRequest {
+            schema: crate::representation_evidence::REPRESENTATION_EVIDENCE_REQUEST_SCHEMA
+                .to_string(),
+            protocol,
+            capture,
+            installations: install_targets,
+        };
+        let request_path = root.join("state/rep-install-request.json");
+        write_or_verify_immutable(
+            root,
+            &request_path,
+            &serde_json::to_vec_pretty(&request).unwrap(),
+        )
+        .unwrap();
+
+        let rep_receipt = record_representation_evidence(root, &request_path).unwrap();
+        let rep_receipt_path = root
+            .join("state/representation_evidence/receipts/by-request-sha")
+            .join(format!("{}.json", rep_receipt.request_sha256));
+
+        (
+            SessionId::parse(session_name).unwrap(),
+            rep_receipt_path,
+            first_obs_path,
+        )
+    }
+
+    #[test]
+    fn prepare_and_verify_learning_finalization_succeeds_with_valid_receipts() {
+        let root = temporary_root();
+        let (session_id, rep_receipt_path, _) = make_test_scenario(&root, "session-valid");
+
+        let input =
+            prepare_learning_finalization(&root, session_id.as_str(), &rep_receipt_path).unwrap();
+        assert_eq!(input.schema, LEARNING_FINALIZATION_INPUT_SCHEMA);
+        assert_eq!(input.session_id, session_id);
+        assert_eq!(input.observations.len(), 2);
+        assert_eq!(input.representation_observation_bindings.len(), 2);
+        assert!(input.observations[0].representation_artifact.is_some());
+
+        let input_hash = learning_finalization_input_sha256(&input).unwrap();
+        assert_ne!(input_hash, Sha256Digest::zero());
+
+        let verified = verify_learning_finalization_input(&root, &input).unwrap();
+        assert_eq!(input, verified);
+
+        let mut invalid_schema = input.clone();
+        invalid_schema.schema = "invalid.schema/v0".into();
+        assert!(verify_learning_finalization_input(&root, &invalid_schema).is_err());
+
+        let mut tampered = input.clone();
+        tampered.session_id = SessionId::parse("session-other").unwrap();
+        assert!(verify_learning_finalization_input(&root, &tampered).is_err());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn finalization_rejects_incomplete_or_pending_adaptive_session() {
+        let root = temporary_root();
+        crate::security::secure_dir(&root).unwrap();
+        let target = LearningTarget {
+            target_id: LearningTargetId::parse("fin-pending-target").unwrap(),
+            capability_ids: vec![
+                CapabilityId::parse("cap-1").unwrap(),
+                CapabilityId::parse("cap-2").unwrap(),
+            ],
+            candidate_budget: 2,
+            plan_steps: 2,
+            noise_variance: 0.1,
+            cost_weight: 0.0,
+            risk_weight: 0.0,
+        };
+        let policy = AdaptiveLearningPolicy {
+            schema: "cerebro.tidex.adaptive_learning_policy/v1".into(),
+            outcome_utility_weight: 1.0,
+            maximize_observed_value: true,
+        };
+        let _started =
+            start_persistent_adaptive_learning(&root, "session-pending", &target, &policy).unwrap();
+        let dummy_receipt = root.join("dummy-receipt.json");
+        let err =
+            prepare_learning_finalization(&root, "session-pending", &dummy_receipt).unwrap_err();
+        assert!(matches!(err, BrainError::Integrity(msg) if msg.contains("incomplete_or_pending")));
+        fs::remove_dir_all(&root).unwrap();
     }
 }
