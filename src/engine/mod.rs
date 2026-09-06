@@ -638,4 +638,236 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn recover_no_incomplete_transition() {
+        let root = isolated_engine_root("recover-none");
+        let engine = BrainEngine {
+            root: root.clone(),
+            config: BrainConfig::default(),
+        };
+        let recovery = engine.recover_incomplete_corpus_transition().unwrap();
+        assert_eq!(
+            recovery.outcome,
+            CorpusTransitionRecoveryOutcome::NoIncompleteTransition
+        );
+        assert!(recovery.operation_key.is_none());
+        assert!(recovery.phase.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recover_restores_archived_prior_corpus() {
+        let root = isolated_engine_root("recover-archive");
+        let engine = BrainEngine {
+            root: root.clone(),
+            config: BrainConfig::default(),
+        };
+        let operation_key = Sha256Digest::digest_bytes(b"recover-archive-op");
+        let inflight = root
+            .join("state/corpus_transitions/inflight")
+            .join(operation_key.as_str());
+        fs::create_dir_all(&inflight).unwrap();
+
+        let intent = LearningCorpusTransitionIntent {
+            schema: "cerebro.tidex.learning_corpus_transition_intent/v1".into(),
+            operation_key: operation_key.clone(),
+            session_id: SessionId::parse("session-archive-rec").unwrap(),
+            adaptive_receipt_sha256: Sha256Digest::digest_bytes(b"adaptive"),
+            learning_finalization_input_sha256: Sha256Digest::digest_bytes(b"input"),
+            representation_evidence_receipt: PrivateFileReference::new(
+                root.join("state/representation.json"),
+                Sha256Digest::digest_bytes(b"evidence"),
+            ),
+            representation_protocol_sha256: Sha256Digest::digest_bytes(b"protocol"),
+            representation_observation_bindings_sha256: Sha256Digest::digest_bytes(b"bindings"),
+            prior_corpus_digest: Sha256Digest::digest_bytes(b"prior-archived"),
+            prior_observation_count: 2,
+            new_corpus_digest: Sha256Digest::digest_bytes(b"new"),
+            new_observation_count: 4,
+            archive_dir: root
+                .join("state/corpus_transitions/by-operation")
+                .join(operation_key.as_str()),
+        };
+        fs::write(
+            inflight.join("intent.json"),
+            serialize_pretty_line(&intent).unwrap(),
+        )
+        .unwrap();
+
+        let valid_obs = sample_observation("obs-1", vec![1.0, 0.0]);
+        engine.persist_observations(&[valid_obs]).unwrap();
+        // Move live observations to archive
+        let archive_dir = root
+            .join("state/corpus_transitions/by-operation")
+            .join(operation_key.as_str());
+        fs::create_dir_all(&archive_dir).unwrap();
+        let archive_obs = archive_dir.join("observations");
+        fs::rename(root.join("state/observations"), &archive_obs).unwrap();
+
+        let recovery = engine.recover_incomplete_corpus_transition().unwrap();
+        assert_eq!(
+            recovery.outcome,
+            CorpusTransitionRecoveryOutcome::RestoredPriorCorpus
+        );
+        assert_eq!(recovery.operation_key.as_ref(), Some(&operation_key));
+        // Verify live observations directory was restored
+        assert!(root.join("state/observations").exists());
+        assert!(!archive_obs.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recover_requires_replay_when_new_corpus_already_published() {
+        let root = isolated_engine_root("recover-replay");
+        let engine = BrainEngine {
+            root: root.clone(),
+            config: BrainConfig::default(),
+        };
+        let observations = vec![
+            sample_observation("obs-a", vec![1.0, 0.0]),
+            sample_observation("obs-b", vec![0.0, 1.0]),
+        ];
+        engine.persist_observations(&observations).unwrap();
+        let live_digest = observation_set_digest(&observations).unwrap();
+
+        let operation_key = Sha256Digest::digest_bytes(b"recover-replay-op");
+        let inflight = root
+            .join("state/corpus_transitions/inflight")
+            .join(operation_key.as_str());
+        fs::create_dir_all(&inflight).unwrap();
+
+        let intent = LearningCorpusTransitionIntent {
+            schema: "cerebro.tidex.learning_corpus_transition_intent/v1".into(),
+            operation_key: operation_key.clone(),
+            session_id: SessionId::parse("session-replay-rec").unwrap(),
+            adaptive_receipt_sha256: Sha256Digest::digest_bytes(b"adaptive"),
+            learning_finalization_input_sha256: Sha256Digest::digest_bytes(b"input"),
+            representation_evidence_receipt: PrivateFileReference::new(
+                root.join("state/representation.json"),
+                Sha256Digest::digest_bytes(b"evidence"),
+            ),
+            representation_protocol_sha256: Sha256Digest::digest_bytes(b"protocol"),
+            representation_observation_bindings_sha256: Sha256Digest::digest_bytes(b"bindings"),
+            prior_corpus_digest: Sha256Digest::digest_bytes(b"prior-dummy"),
+            prior_observation_count: 1,
+            new_corpus_digest: Sha256Digest::parse(live_digest.as_str()).unwrap(),
+            new_observation_count: 2,
+            archive_dir: root
+                .join("state/corpus_transitions/by-operation")
+                .join(operation_key.as_str()),
+        };
+        fs::write(
+            inflight.join("intent.json"),
+            serialize_pretty_line(&intent).unwrap(),
+        )
+        .unwrap();
+
+        let recovery = engine.recover_incomplete_corpus_transition().unwrap();
+        assert_eq!(
+            recovery.outcome,
+            CorpusTransitionRecoveryOutcome::RequiresOriginalFinalizationReplay
+        );
+        assert_eq!(recovery.operation_key.as_ref(), Some(&operation_key));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sleep_cycle_and_commit_finalization_fail_closed_on_guards() {
+        let root = isolated_engine_root("sleep-commit-guards");
+        let non_canonical_config = BrainConfig {
+            require_structured_geometry_for_promotion: false,
+            ..BrainConfig::default()
+        };
+        let non_canonical_engine = BrainEngine {
+            root: root.clone(),
+            config: non_canonical_config,
+        };
+
+        // 1. Non-canonical config fails closed on both entrypoints
+        let err = non_canonical_engine.sleep_cycle().unwrap_err();
+        assert!(
+            matches!(err, BrainError::Integrity(ref m) if m.contains("noncanonical_runtime_config_forbidden"))
+        );
+
+        let dummy_input = LearningFinalizationInput {
+            schema: "cerebro.tidex.learning_finalization_input/v1".into(),
+            session_id: SessionId::parse("session-guard").unwrap(),
+            adaptive_receipt_sha256: Sha256Digest::zero(),
+            target_id: crate::identity::LearningTargetId::parse("t-1").unwrap(),
+            target_digest: Sha256Digest::zero(),
+            policy_digest: Sha256Digest::zero(),
+            completed_evidence_sha256: vec![],
+            representation_evidence_receipt: PrivateFileReference::new(
+                root.join("evidence.json"),
+                Sha256Digest::zero(),
+            ),
+            representation_protocol_sha256: Sha256Digest::zero(),
+            representation_installations_sha256: Sha256Digest::zero(),
+            representation_observation_bindings: vec![],
+            observations: vec![],
+        };
+
+        let err = non_canonical_engine
+            .commit_finalized_learning_session(&dummy_input)
+            .unwrap_err();
+        assert!(
+            matches!(err, BrainError::Integrity(ref m) if m.contains("noncanonical_runtime_config_forbidden"))
+        );
+
+        let canonical_engine = BrainEngine {
+            root: root.clone(),
+            config: BrainConfig::default(),
+        };
+
+        // 2. Canonical engine with 0 observations fails sleep_cycle
+        let err = canonical_engine.sleep_cycle().unwrap_err();
+        assert!(
+            matches!(err, BrainError::Invalid(ref m) if m.contains("sleep_requires_persisted_observations"))
+        );
+
+        // 3. Inflight transition prevents sleep_cycle
+        let inflight = root
+            .join("state/corpus_transitions/inflight")
+            .join("dummy-key");
+        fs::create_dir_all(&inflight).unwrap();
+        let err = canonical_engine.sleep_cycle().unwrap_err();
+        assert!(
+            matches!(err, BrainError::Integrity(ref m) if m.contains("learning_corpus_transition_incomplete"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn commit_finalized_session_reconstruction_validation() {
+        let root = isolated_engine_root("commit-fin-val");
+        let prev = std::env::var("TIDEX_PRIVATE_ROOT").ok();
+        std::env::set_var("TIDEX_PRIVATE_ROOT", &root);
+
+        let (session_id, rep_receipt, _) =
+            crate::learning_finalization::tests::make_test_scenario(&root, "session-comm-val");
+        let input = crate::learning_finalization::prepare_learning_finalization(
+            &root,
+            session_id.as_str(),
+            &rep_receipt,
+        )
+        .unwrap();
+
+        let engine = BrainEngine::open(&root, BrainConfig::default()).unwrap();
+        let err = engine
+            .commit_finalized_learning_session(&input)
+            .unwrap_err();
+        assert!(
+            matches!(err, BrainError::Invalid(ref m) if m.contains("minimum_six_observations"))
+        );
+
+        match prev {
+            Some(ref p) => std::env::set_var("TIDEX_PRIVATE_ROOT", p),
+            None => std::env::remove_var("TIDEX_PRIVATE_ROOT"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 }

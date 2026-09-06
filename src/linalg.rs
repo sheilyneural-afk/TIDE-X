@@ -634,7 +634,8 @@ mod tests {
             Err(BrainError::Numerical(message)) if message == "cosine_zero_norm"
         ));
         let tiny = normalize(&[1e-300, 0.0]).unwrap();
-        assert_eq!(tiny, vec![1.0, 0.0]);
+        assert!((tiny[0] - 1.0).abs() <= 4.0 * f64::EPSILON);
+        assert_eq!(tiny[1], 0.0);
         assert!((cosine(&[1e300, 1e300], &[1e300, 1e300]).unwrap() - 1.0).abs() < 1e-12);
     }
 

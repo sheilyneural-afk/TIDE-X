@@ -365,7 +365,7 @@ pub fn verify_learning_finalization_input(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::learning_orchestrator::EvidenceReference;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -455,7 +455,10 @@ mod tests {
         RepresentationShift, SealedRepresentationProtocol,
     };
 
-    fn make_test_scenario(root: &Path, session_name: &str) -> (SessionId, PathBuf, PathBuf) {
+    pub(crate) fn make_test_scenario(
+        root: &Path,
+        session_name: &str,
+    ) -> (SessionId, PathBuf, PathBuf) {
         crate::security::secure_dir(root).unwrap();
         let target = LearningTarget {
             target_id: LearningTargetId::parse("fin-target").unwrap(),

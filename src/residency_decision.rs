@@ -2129,4 +2129,244 @@ mod tests {
             .insert("caller_override".into(), serde_json::json!(true));
         assert!(serde_json::from_value::<ResidencyDecision>(value).is_err());
     }
+
+    #[test]
+    fn semantic_parsers_and_ranks_behave_exhaustively() {
+        assert_eq!(
+            parse_requirements(CLOSED_COMPUTATION_VALUE),
+            Some(ExecutionRequirements::ClosedComputation)
+        );
+        assert_eq!(
+            parse_requirements(BOUNDARY_RUNTIME_VALUE),
+            Some(ExecutionRequirements::BoundaryRuntime)
+        );
+        assert_eq!(
+            parse_requirements(SOFTWARE_RUNTIME_VALUE),
+            Some(ExecutionRequirements::SoftwareRuntime)
+        );
+        assert_eq!(
+            parse_requirements(UNKNOWN_SEMANTICS_VALUE),
+            Some(ExecutionRequirements::Unknown)
+        );
+        assert_eq!(parse_requirements("invalid_req"), None);
+
+        assert_eq!(
+            parse_effects(PURE_EFFECTS_VALUE),
+            Some(EffectSemantics::Pure)
+        );
+        assert_eq!(
+            parse_effects(BOUNDARY_EFFECTS_VALUE),
+            Some(EffectSemantics::BoundaryEffects)
+        );
+        assert_eq!(
+            parse_effects(SOFTWARE_EFFECTS_VALUE),
+            Some(EffectSemantics::SoftwareEffects)
+        );
+        assert_eq!(
+            parse_effects(UNKNOWN_SEMANTICS_VALUE),
+            Some(EffectSemantics::Unknown)
+        );
+        assert_eq!(parse_effects("invalid_eff"), None);
+
+        assert_eq!(
+            parse_external_state(NO_EXTERNAL_STATE_VALUE),
+            Some(ExternalStateSemantics::None)
+        );
+        assert_eq!(
+            parse_external_state(BOUNDARY_MANAGED_STATE_VALUE),
+            Some(ExternalStateSemantics::BoundaryManaged)
+        );
+        assert_eq!(
+            parse_external_state(SOFTWARE_AUTHORITATIVE_STATE_VALUE),
+            Some(ExternalStateSemantics::SoftwareAuthoritative)
+        );
+        assert_eq!(
+            parse_external_state(UNKNOWN_SEMANTICS_VALUE),
+            Some(ExternalStateSemantics::Unknown)
+        );
+        assert_eq!(parse_external_state("invalid_state"), None);
+
+        assert_eq!(
+            parse_observability(WEIGHT_COMPLETE_OBSERVABILITY_VALUE),
+            Some(ObservabilitySemantics::WeightComplete)
+        );
+        assert_eq!(
+            parse_observability(BOUNDARY_COMPLETE_OBSERVABILITY_VALUE),
+            Some(ObservabilitySemantics::BoundaryComplete)
+        );
+        assert_eq!(
+            parse_observability(SOFTWARE_COMPLETE_OBSERVABILITY_VALUE),
+            Some(ObservabilitySemantics::SoftwareComplete)
+        );
+        assert_eq!(
+            parse_observability(UNKNOWN_SEMANTICS_VALUE),
+            Some(ObservabilitySemantics::Unknown)
+        );
+        assert_eq!(parse_observability("invalid_obs"), None);
+
+        assert_eq!(
+            requirement_rank(ExecutionRequirements::ClosedComputation),
+            0
+        );
+        assert_eq!(requirement_rank(ExecutionRequirements::BoundaryRuntime), 1);
+        assert_eq!(requirement_rank(ExecutionRequirements::SoftwareRuntime), 2);
+        assert_eq!(requirement_rank(ExecutionRequirements::Unknown), 2);
+
+        assert_eq!(effect_rank(EffectSemantics::Pure), 0);
+        assert_eq!(effect_rank(EffectSemantics::BoundaryEffects), 1);
+        assert_eq!(effect_rank(EffectSemantics::SoftwareEffects), 2);
+        assert_eq!(effect_rank(EffectSemantics::Unknown), 2);
+
+        assert_eq!(external_state_rank(ExternalStateSemantics::None), 0);
+        assert_eq!(
+            external_state_rank(ExternalStateSemantics::BoundaryManaged),
+            1
+        );
+        assert_eq!(
+            external_state_rank(ExternalStateSemantics::SoftwareAuthoritative),
+            2
+        );
+        assert_eq!(external_state_rank(ExternalStateSemantics::Unknown), 2);
+
+        assert_eq!(
+            observability_rank(ObservabilitySemantics::WeightComplete),
+            0
+        );
+        assert_eq!(
+            observability_rank(ObservabilitySemantics::BoundaryComplete),
+            1
+        );
+        assert_eq!(
+            observability_rank(ObservabilitySemantics::SoftwareComplete),
+            2
+        );
+        assert_eq!(observability_rank(ObservabilitySemantics::Unknown), 2);
+
+        assert_eq!(candidate_for_rank(0), ResidencyCandidate::Weights);
+        assert_eq!(candidate_for_rank(1), ResidencyCandidate::Hybrid);
+        assert_eq!(candidate_for_rank(2), ResidencyCandidate::Software);
+        assert_eq!(candidate_for_rank(99), ResidencyCandidate::Software);
+    }
+
+    #[test]
+    fn getters_and_accessors_contract_verification() {
+        let policy = policy();
+        assert_eq!(policy.version(), 1);
+        assert_eq!(policy.digest(), &policy.digest);
+
+        let precommit = precommit_with_paths(
+            &policy,
+            "/authority/state/capability_bundles/by-sha/bundle.json",
+            "/authority/state/knowledge_engine/states/by-sha/state.json",
+        );
+        assert_eq!(precommit.round_id().as_str(), "round.v1");
+        assert_eq!(precommit.inquiry_id().as_str(), "residency-inquiry.v1");
+        assert_eq!(precommit.target_id().as_str(), "target-a.v1");
+        assert_eq!(precommit.policy_digest(), &policy.digest);
+        assert_eq!(precommit.capability_bundle_reference().sha256, sha(1));
+        assert_eq!(precommit.knowledge_state_reference().sha256, sha(2));
+        assert_eq!(precommit.digest(), precommit.digest());
+
+        let assessment = CandidateAssessment {
+            candidate: ResidencyCandidate::Weights,
+            eligible: true,
+            rejections: BTreeSet::new(),
+        };
+        assert_eq!(assessment.candidate(), ResidencyCandidate::Weights);
+        assert!(assessment.is_eligible());
+        assert!(assessment.rejections().is_empty());
+
+        let basis = ResidencySelectionBasis {
+            minimum_candidate: ResidencyCandidate::Weights,
+            forced_by: BTreeSet::new(),
+            candidates: vec![assessment],
+        };
+        assert_eq!(basis.minimum_candidate(), ResidencyCandidate::Weights);
+        assert!(basis.forced_by().is_empty());
+        assert_eq!(basis.candidates().len(), 1);
+
+        let pred = KnowledgePredicate::BoolEquals {
+            key: crate::knowledge_engine::ObservationKey::parse("test_key").unwrap(),
+            expected: true,
+        };
+        let evidence_fact = ResidencyFactEvidence {
+            kind: ResidencyFactKind::Requirements,
+            claim_id: KnowledgeClaimId::parse("claim-1.v1").unwrap(),
+            predicate: pred.clone(),
+            witnesses: BTreeSet::new(),
+            established_fact: ResidencyFact::Requirements {
+                value: ExecutionRequirements::ClosedComputation,
+            },
+        };
+        assert_eq!(evidence_fact.kind(), ResidencyFactKind::Requirements);
+        assert_eq!(evidence_fact.claim_id().as_str(), "claim-1.v1");
+        assert_eq!(evidence_fact.predicate(), &pred);
+        assert!(evidence_fact.witnesses().is_empty());
+        assert_eq!(
+            evidence_fact.established_fact(),
+            &ResidencyFact::Requirements {
+                value: ExecutionRequirements::ClosedComputation
+            }
+        );
+
+        let mut record = ResidencyDecisionRecord {
+            schema: ResidencySchema::Current,
+            authority_root: typed_digest(4),
+            round_id: precommit.round_id.clone(),
+            inquiry_id: precommit.inquiry_id.clone(),
+            target_id: precommit.target_id.clone(),
+            residency_policy: policy.digest.clone(),
+            knowledge_policy: typed_digest(5),
+            precommit: precommit.manifest_digest.clone(),
+            precommit_reference: reference("/unresolved/precommit.json", 3),
+            capability_bundle: typed_digest(6),
+            capability_bundle_reference: precommit.capability_bundle_reference.clone(),
+            knowledge_state: typed_digest(7),
+            knowledge_state_reference: precommit.knowledge_state_reference.clone(),
+            knowledge_state_revision: 9,
+            decision: ResidencyDecision::Software {},
+            evidence: vec![evidence_fact],
+            selection_basis: Some(basis),
+            manifest_digest: ResidencyDecisionDigest::draft_marker(),
+        };
+        record.manifest_digest = record.calculate_digest().unwrap();
+        assert_eq!(record.round_id().as_str(), "round.v1");
+        assert_eq!(record.inquiry_id().as_str(), "residency-inquiry.v1");
+        assert_eq!(record.target_id().as_str(), "target-a.v1");
+        assert_eq!(record.decision(), &ResidencyDecision::Software {});
+        assert_eq!(record.evidence().len(), 1);
+        assert!(record.selection_basis().is_some());
+        assert_eq!(record.knowledge_state_revision(), 9);
+        assert_eq!(record.digest(), &record.manifest_digest);
+    }
+
+    #[test]
+    fn residency_decision_authority_lifecycle_fail_closed() {
+        let root = fixture_root("auth-lifecycle");
+        let prev = std::env::var("TIDEX_PRIVATE_ROOT").ok();
+        std::env::set_var("TIDEX_PRIVATE_ROOT", &root);
+
+        let engine = KnowledgeEngine::open_with_authority_instance(
+            &root,
+            crate::knowledge_engine::AuthorityInstanceId::parse("test-auth-inst.v1").unwrap(),
+        )
+        .unwrap();
+
+        let authority = ResidencyDecisionAuthority::current(&root, &engine).unwrap();
+        assert_eq!(authority.policy().digest(), policy().digest());
+
+        // Calling decide on non-existent reference fails closed
+        let dummy_ref = reference("/nonexistent.json", 99);
+        assert!(authority.decide(&dummy_ref).is_err());
+
+        // Calling authenticate_decision on bogus reference fails closed
+        let round = ResidencyDecisionRoundId::parse("round.v1").unwrap();
+        assert!(authority.authenticate_decision(&dummy_ref, &round).is_err());
+
+        match prev {
+            Some(ref p) => std::env::set_var("TIDEX_PRIVATE_ROOT", p),
+            None => std::env::remove_var("TIDEX_PRIVATE_ROOT"),
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

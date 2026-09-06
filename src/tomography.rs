@@ -531,4 +531,139 @@ mod tests {
             }
         }
     }
+
+    fn test_field(
+        id: &str,
+        dir: Vec<f64>,
+        ev_keys: &[&[u8]],
+        persistence: f64,
+        coherence: f64,
+    ) -> SkillField {
+        use crate::digest::{ObservationRecordDigest, Sha256Digest};
+        use crate::identity::{LineageId, ReconstructionId, SkillId};
+        let digests = ev_keys
+            .iter()
+            .map(|k| ObservationRecordDigest::from(Sha256Digest::digest_bytes(k)))
+            .collect::<Vec<_>>();
+        SkillField {
+            skill_id: SkillId::parse(id).unwrap(),
+            reconstruction_id: ReconstructionId::parse("recon-1").unwrap(),
+            lineage_id: LineageId::parse(format!("lineage-{id}")).unwrap(),
+            generation_created: 1,
+            direction: dir,
+            structured_geometry: None,
+            dense_materialization: None,
+            parameter_layout_sha256: None,
+            representation_signature: vec![],
+            singular_value: 1.0,
+            explained_variance: 0.5,
+            persistence,
+            coherence,
+            uncertainty: 0.1,
+            evidence_support_digests: digests.clone(),
+            support: digests.len(),
+            functional_signature: vec![1.0],
+            parent_skill_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn align_incoming_identities_preserves_prior_and_aligns_sign() {
+        let f1 = test_field("f1", vec![1.0, 0.0], &[b"ev1"], 0.8, 0.9);
+        let bank = SkillBank {
+            generation: 1,
+            fields: vec![f1],
+        };
+        // Incoming field with opposite sign
+        let incoming_neg = test_field("temp-id", vec![-1.0, 0.0], &[b"ev1"], 0.8, 0.9);
+        let aligned = align_incoming_identities(&bank, &[incoming_neg], 0.8).unwrap();
+        assert_eq!(aligned.len(), 1);
+        assert_eq!(aligned[0].skill_id.as_str(), "f1");
+        assert!((aligned[0].direction[0] - 1.0).abs() < 1e-10);
+        assert!((aligned[0].direction[1] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn assimilate_bank_replaces_on_exact_evidence_match() {
+        let f1 = test_field("f1", vec![1.0, 0.0], &[b"ev1"], 0.8, 0.9);
+        let mut bank = SkillBank {
+            generation: 1,
+            fields: vec![f1],
+        };
+        let incoming = test_field("f1-new", vec![0.99, 0.1], &[b"ev1"], 0.85, 0.95);
+        assimilate_bank(&mut bank, &[incoming], 0.8).unwrap();
+        assert_eq!(bank.generation, 2);
+        assert_eq!(bank.fields.len(), 1);
+        assert_eq!(bank.fields[0].skill_id.as_str(), "f1");
+        assert_eq!(bank.fields[0].support, 1);
+    }
+
+    #[test]
+    fn assimilate_bank_rejects_partial_evidence_overlap() {
+        let f1 = test_field("f1", vec![1.0, 0.0], &[b"ev1", b"ev2"], 0.8, 0.9);
+        let mut bank = SkillBank {
+            generation: 1,
+            fields: vec![f1],
+        };
+        let incoming = test_field("f1-overlap", vec![1.0, 0.0], &[b"ev2", b"ev3"], 0.8, 0.9);
+        let err = assimilate_bank(&mut bank, &[incoming], 0.8).unwrap_err();
+        assert!(
+            matches!(err, BrainError::Integrity(ref m) if m.contains("skill_evidence_partial_overlap"))
+        );
+    }
+
+    #[test]
+    fn assimilate_bank_merges_disjoint_evidence_and_adds_unmatched() {
+        let f1 = test_field("f1", vec![1.0, 0.0], &[b"ev1"], 0.8, 0.9);
+        let mut bank = SkillBank {
+            generation: 1,
+            fields: vec![f1],
+        };
+        let f1_incoming = test_field("f1-incoming", vec![1.0, 0.0], &[b"ev2"], 0.8, 0.9);
+        let f2_incoming = test_field("f2", vec![0.0, 1.0], &[b"ev3"], 0.8, 0.9);
+        assimilate_bank(&mut bank, &[f1_incoming, f2_incoming], 0.8).unwrap();
+        assert_eq!(bank.generation, 2);
+        assert_eq!(bank.fields.len(), 2);
+        let f1_merged = bank
+            .fields
+            .iter()
+            .find(|f| f.skill_id.as_str() == "f1")
+            .unwrap();
+        assert_eq!(f1_merged.support, 2);
+        assert_eq!(f1_merged.evidence_support_digests.len(), 2);
+        let f2_new = bank
+            .fields
+            .iter()
+            .find(|f| f.skill_id.as_str() == "f2")
+            .unwrap();
+        assert_eq!(f2_new.support, 1);
+    }
+
+    #[test]
+    fn reconcile_full_corpus_decays_or_drops_unassigned_priors() {
+        let f1 = test_field("f1", vec![1.0, 0.0], &[b"ev1"], 0.8, 0.9);
+        let f2_decaying = test_field("f2", vec![0.0, 1.0], &[b"ev2"], 0.5, 0.5);
+        let f3_dropping = test_field(
+            "f3",
+            vec![
+                -std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+            ],
+            &[b"ev3"],
+            0.15,
+            0.15,
+        );
+        let mut bank = SkillBank {
+            generation: 1,
+            fields: vec![f1, f2_decaying, f3_dropping],
+        };
+        // incoming only matches f1
+        let incoming = vec![test_field("f1-match", vec![1.0, 0.0], &[b"ev1"], 0.9, 0.9)];
+        reconcile_full_corpus(&mut bank, &incoming, 0.8).unwrap();
+        assert_eq!(bank.generation, 2);
+        // f1 is matched, f2 decayed (0.5 * 0.85 = 0.425 >= 0.15), f3 dropped (0.15 * 0.85 = 0.1275 < 0.15)
+        assert!(bank.fields.iter().any(|f| f.skill_id.as_str() == "f1"));
+        assert!(bank.fields.iter().any(|f| f.skill_id.as_str() == "f2"));
+        assert!(!bank.fields.iter().any(|f| f.skill_id.as_str() == "f3"));
+    }
 }

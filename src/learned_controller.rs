@@ -1779,4 +1779,205 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&outside).unwrap();
     }
+
+    fn sample_field_with_dir(id: &str, dir: Vec<f64>) -> SkillField {
+        SkillField {
+            skill_id: SkillId::parse(id).unwrap(),
+            reconstruction_id: "r1".into(),
+            lineage_id: "l1".into(),
+            generation_created: 1,
+            direction: dir,
+            structured_geometry: None,
+            dense_materialization: None,
+            parameter_layout_sha256: None,
+            representation_signature: vec![],
+            singular_value: 1.0,
+            explained_variance: 1.0,
+            persistence: 1.0,
+            coherence: 1.0,
+            uncertainty: 0.0,
+            evidence_support_digests: vec![],
+            support: 1,
+            functional_signature: vec![1.0],
+            parent_skill_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn execute_learned_program_execution_and_contracts() {
+        // state_dim = 2, operator_dim = 4
+        let f1 = sample_field_with_dir("f1", vec![1.0, 0.0, 0.0, 0.0]);
+        let f2 = sample_field_with_dir("f2", vec![0.0, 0.0, 0.0, 1.0]);
+        let fields = vec![f1, f2];
+
+        // feature_dim for state_dim=2, obs_dim=1 is 1 + 2 + 1 + 2 = 6
+        let controller = LearnedController {
+            schema: "cerebro.tidex.learned_controller/v1".into(),
+            state_dim: 2,
+            observation_dim: 1,
+            coefficient_dim: 2,
+            feature_dim: 6,
+            weights: vec![
+                vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            observation_min: vec![0.0],
+            observation_max: vec![1.0],
+            ood_margin_fraction: 0.5,
+            training_rms: 0.01,
+            grouped_cv_r2: 0.99,
+            training_groups: 3,
+        };
+
+        let initial_state = vec![1.0, 0.0];
+        let observations = vec![vec![0.5], vec![0.2]];
+        let exec =
+            execute_learned_program(&fields, &controller, &initial_state, &observations).unwrap();
+        assert_eq!(exec.steps.len(), 2);
+        assert_eq!(exec.final_state_index, 0);
+
+        // Contract errors: wrong number of fields
+        assert!(
+            execute_learned_program(&fields[..1], &controller, &initial_state, &observations)
+                .is_err()
+        );
+        // Contract errors: wrong initial state dim
+        assert!(execute_learned_program(&fields, &controller, &[1.0], &observations).is_err());
+    }
+
+    #[test]
+    fn execute_learned_winner_take_all_execution_and_contracts() {
+        // for WTA, field direction len must match state_dim = 2
+        let f1 = sample_field_with_dir("f1", vec![2.0, 0.0]);
+        let f2 = sample_field_with_dir("f2", vec![0.0, 2.0]);
+        let fields = vec![f1, f2];
+
+        let controller = LearnedController {
+            schema: "cerebro.tidex.learned_controller/v1".into(),
+            state_dim: 2,
+            observation_dim: 1,
+            coefficient_dim: 2,
+            feature_dim: 6,
+            weights: vec![
+                vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            observation_min: vec![0.0],
+            observation_max: vec![1.0],
+            ood_margin_fraction: 0.5,
+            training_rms: 0.01,
+            grouped_cv_r2: 0.99,
+            training_groups: 3,
+        };
+
+        let initial_state = vec![1.0, 0.0];
+        let observations = vec![vec![0.5]];
+        let exec =
+            execute_learned_winner_take_all(&fields, &controller, &initial_state, &observations)
+                .unwrap();
+        assert_eq!(exec.steps.len(), 1);
+        assert_eq!(exec.final_state_index, 0);
+        assert_eq!(exec.final_state, vec![1.0, 0.0]);
+
+        // Contract error: field direction dimension mismatch
+        let bad_field = sample_field_with_dir("bad", vec![1.0, 0.0, 0.0]);
+        assert!(execute_learned_winner_take_all(
+            &[bad_field, fields[1].clone()],
+            &controller,
+            &initial_state,
+            &observations
+        )
+        .is_err());
+        // Contract error: initial state mismatch
+        assert!(
+            execute_learned_winner_take_all(&fields, &controller, &[1.0], &observations).is_err()
+        );
+    }
+
+    #[test]
+    fn controller_group_summary_and_equality_helpers() {
+        let examples = vec![
+            ControllerExample {
+                state_before: vec![1.0],
+                observation: vec![0.5],
+                target_coefficients: vec![1.0],
+                reliability: 1.0,
+                independence_group: "grp-a".into(),
+            },
+            ControllerExample {
+                state_before: vec![1.0],
+                observation: vec![0.6],
+                target_coefficients: vec![1.0],
+                reliability: 1.0,
+                independence_group: "grp-a".into(),
+            },
+            ControllerExample {
+                state_before: vec![1.0],
+                observation: vec![0.7],
+                target_coefficients: vec![1.0],
+                reliability: 1.0,
+                independence_group: "grp-b".into(),
+            },
+        ];
+        let summary = controller_group_summary(&examples);
+        assert_eq!(summary.get("grp-a"), Some(&2));
+        assert_eq!(summary.get("grp-b"), Some(&1));
+
+        assert!(same_supervision_coefficients(
+            &[1.0, 2.0],
+            &[1.00000000001, 2.0]
+        ));
+        assert!(!same_supervision_coefficients(&[1.0, 2.0], &[1.1, 2.0]));
+        assert!(!same_supervision_coefficients(&[1.0], &[1.0, 2.0]));
+
+        assert!(same_controller_float(1.0, 1.00000000001));
+        assert!(!same_controller_float(1.0, 2.0));
+        assert!(same_controller_vector(&[1.0, 2.0], &[1.0, 2.0]));
+        assert!(!same_controller_vector(&[1.0], &[1.0, 2.0]));
+    }
+
+    #[test]
+    fn learned_controller_decide_and_training_validation_errors() {
+        let controller = LearnedController {
+            schema: "cerebro.tidex.learned_controller/v1".into(),
+            state_dim: 1,
+            observation_dim: 1,
+            coefficient_dim: 1,
+            feature_dim: 4,
+            weights: vec![vec![0.0; 4]],
+            observation_min: vec![0.0],
+            observation_max: vec![1.0],
+            ood_margin_fraction: 0.25,
+            training_rms: 0.01,
+            grouped_cv_r2: 0.99,
+            training_groups: 3,
+        };
+        // Dimension mismatch
+        assert!(controller.decide(&[1.0, 2.0], &[0.5]).is_err());
+        assert!(controller.decide(&[1.0], &[0.5, 0.2]).is_err());
+        // Non-finite values
+        assert!(controller.decide(&[f64::NAN], &[0.5]).is_err());
+        assert!(controller.decide(&[1.0], &[f64::INFINITY]).is_err());
+        // OOD error
+        assert!(controller.decide(&[1.0], &[2.0]).is_err());
+
+        // train_learned_controller errors
+        assert!(train_learned_controller(&[], 1e-8, 0.25).is_err());
+        let bad_ex = vec![ControllerExample {
+            state_before: vec![f64::NAN],
+            observation: vec![0.0],
+            target_coefficients: vec![1.0],
+            reliability: 1.0,
+            independence_group: "g1".into(),
+        }];
+        assert!(train_learned_controller(&bad_ex, 1e-8, 0.25).is_err());
+        let neg_ridge_ex = vec![ControllerExample {
+            state_before: vec![1.0],
+            observation: vec![0.0],
+            target_coefficients: vec![1.0],
+            reliability: 1.0,
+            independence_group: "g1".into(),
+        }];
+        assert!(train_learned_controller(&neg_ridge_ex, -1.0, 0.25).is_err());
+    }
 }

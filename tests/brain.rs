@@ -246,3 +246,95 @@ fn mvdr_minimizes_interference_under_unit_constraint() {
     assert!((constraint - 1.0).abs() < 1e-9);
     assert!(w[0] < w[1]);
 }
+
+#[test]
+fn sleep_cycle_unpromoted_and_idempotent_lifecycle() {
+    let root = test_private_root().clone();
+    let engine = BrainEngine::open(&root, BrainConfig::default()).unwrap();
+    let phantom = cognitive_phantom().unwrap();
+    let layout = cerebro_tidex::block_tomography::ParameterBlockLayout::from_shapes(&[
+        cerebro_tidex::block_tomography::BlockShapeSpec {
+            name: "block_1".into(),
+            shape: vec![18],
+            count: 18,
+        },
+    ])
+    .unwrap();
+    let mut layout_bytes = serde_json::to_vec_pretty(&layout).unwrap();
+    layout_bytes.push(b'\n');
+    let layout_digest = cerebro_tidex::digest::Sha256Digest::digest_bytes(&layout_bytes);
+    let layout_dir = root.join("state/parameter_layouts/by-sha");
+    std::fs::create_dir_all(&layout_dir).unwrap();
+    cerebro_tidex::security::secure_dir(&layout_dir).unwrap();
+    let layout_path = layout_dir.join(format!("{layout_digest}.json"));
+    std::fs::write(&layout_path, &layout_bytes).unwrap();
+    cerebro_tidex::security::secure_file(&layout_path).unwrap();
+
+    let writer = cerebro_tidex::artifact::ArtifactWriteAuthority::open(&root).unwrap();
+
+    let protocol = serde_json::json!({
+        "schema": "cerebro.tidex.representation_protocol/v1",
+        "source_representation_sha256": cerebro_tidex::digest::Sha256Digest::digest_bytes(b"sleep-capture"),
+        "probe_sha256": cerebro_tidex::digest::Sha256Digest::digest_bytes(b"sleep-probe"),
+        "probe_text_sha256": cerebro_tidex::digest::Sha256Digest::digest_bytes(b"sleep-probe"),
+        "forbidden_vocabulary_sha256": cerebro_tidex::digest::Sha256Digest::digest_bytes(b"sleep-forbidden"),
+        "task_labels_used": false,
+        "probe_vocabulary_overlap": [],
+        "probe_count": 1,
+        "layer_count": 1,
+        "hidden_dim": 3,
+        "raw_dimension_per_observation": 3,
+        "sketch_dim": 3,
+        "sketch_seed": 17
+    });
+    let protocol_bytes = serde_json::to_vec(&protocol).unwrap();
+    let protocol_digest = cerebro_tidex::digest::Sha256Digest::digest_bytes(&protocol_bytes);
+    let protocol_dir = root.join("state/representation_protocols/by-sha");
+    std::fs::create_dir_all(&protocol_dir).unwrap();
+    cerebro_tidex::security::secure_dir(&root.join("state")).unwrap();
+    cerebro_tidex::security::secure_dir(&root.join("state/representation_protocols")).unwrap();
+    cerebro_tidex::security::secure_dir(&protocol_dir).unwrap();
+    let protocol_path = protocol_dir.join(format!("{protocol_digest}.json"));
+    std::fs::write(&protocol_path, &protocol_bytes).unwrap();
+    cerebro_tidex::security::secure_file(&protocol_path).unwrap();
+
+    let obs_dir = root.join("state/observations");
+    std::fs::create_dir_all(&obs_dir).unwrap();
+    cerebro_tidex::security::secure_dir(&obs_dir).unwrap();
+    for (idx, obs) in phantom.observations.iter().enumerate() {
+        let mut obs = obs.clone();
+        let dense = writer
+            .create_content_addressed_dvec(&[(idx + 1) as f32 * 0.01; 18])
+            .unwrap();
+        let representation = writer
+            .create_content_addressed_f64(&[idx as f64 + 0.1, idx as f64 + 0.2, idx as f64 + 0.3])
+            .unwrap();
+        obs.parameter_layout_sha256 = Some(layout_digest.clone());
+        obs.dense_artifact = Some(dense);
+        obs.representation_artifact = Some(representation);
+        obs.representation_protocol_sha256 = Some(
+            cerebro_tidex::digest::RepresentationProtocolDigest::from(protocol_digest.clone()),
+        );
+        let pretty = serde_json::to_string_pretty(&obs).unwrap() + "\n";
+        let parsed: cerebro_tidex::contracts::DeltaObservation =
+            serde_json::from_str(&pretty).unwrap();
+        let canonical_bytes = serde_json::to_vec(&parsed).unwrap();
+        let digest =
+            cerebro_tidex::digest::Sha256Digest::digest_bytes(&canonical_bytes).to_string();
+        let name = format!("{}-{}.json", parsed.observation_id, &digest[..16]);
+        let path = obs_dir.join(name);
+        std::fs::write(&path, pretty).unwrap();
+        cerebro_tidex::security::secure_file(&path).unwrap();
+    }
+
+    let report = engine.sleep_cycle().unwrap();
+    assert_eq!(report.observation_count, phantom.observations.len());
+    assert!(!report.promoted);
+    assert!(!report.idempotent);
+
+    // Second call is idempotent
+    let report2 = engine.sleep_cycle().unwrap();
+    assert!(report2.idempotent);
+    assert_eq!(report.corpus_digest, report2.corpus_digest);
+    assert_eq!(report.memory_digest, report2.memory_digest);
+}
