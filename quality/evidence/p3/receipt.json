@@ -1,0 +1,96 @@
+{
+  "checkout_manifest_sha256": "e3d13c54a49802fc7b978bfeadde43fea40f94519f6d08ee24539d352237f5e7",
+  "checkout_metadata_sha256": "aff3458f2d378f8c43d88fc910ec79f17d91b46b68e91022f6efcb87f8bad902",
+  "duration_seconds": 3412,
+  "evidence_sha256": {
+    "gate2_log": "2374f77e70da5d9fbd7e334f2d84e32fbcd36e4f3b8756bdd4101f8244df7d3b",
+    "gate2_script": "6ba56d1ab3d4fe4f524fca7b96ddd99ae4157981654d6217653b09978b00f662",
+    "gate3_script": "5f966b07ddcdfb887d29d3dda0a032248d6401ef907e0b69514d598bdedceb7e",
+    "p3_tests_log": "0bcfd3f23dc209d18780fd49b51adbd0d78750c9d93c1091694c06f181e54678"
+  },
+  "finished_epoch": 1788718540,
+  "gate": "P3",
+  "head_commit": "c8bbb6e8694ecf41df7b82c4962ddfedeeed3dda",
+  "limitations": [
+    "bounded deterministic state-machine model checking",
+    "not a universal proof of kernel/filesystem/hardware behavior",
+    "loom not added without an offline reproducible pinned dependency"
+  ],
+  "p2_coverage": {
+    "critical": {
+      "src/digest.rs": {
+        "functions": 98.18,
+        "lines": 98.97,
+        "regions": 98.5
+      },
+      "src/engine/analysis.rs": {
+        "functions": 79.69,
+        "lines": 85.3,
+        "regions": 86.37
+      },
+      "src/engine/runtime.rs": {
+        "functions": 77.12,
+        "lines": 80.18,
+        "regions": 81.49
+      },
+      "src/engine/support.rs": {
+        "functions": 81.4,
+        "lines": 83.77,
+        "regions": 85.71
+      },
+      "src/engine/transition.rs": {
+        "functions": 70.0,
+        "lines": 75.8,
+        "regions": 76.4
+      },
+      "src/isolated_execution.rs": {
+        "functions": 82.86,
+        "lines": 87.33,
+        "regions": 89.25
+      }
+    },
+    "global": {
+      "functions": 80.24,
+      "lines": 86.97,
+      "regions": 87.62
+    }
+  },
+  "p3_model_scope": {
+    "canonical_head_lock_modes": [
+      "locked",
+      "deliberately_unlocked_negative_control"
+    ],
+    "canonical_head_writers": 2,
+    "explicit_crash_phases_without_receipt": 5,
+    "receipt_sealed_path": "authenticated_receipt_recovery",
+    "unsealed_recovery_state_combinations": 8
+  },
+  "required_assurance_tests": [
+    "engine::tests::model_check_engine_authority_lock_prevents_canonical_head_forks",
+    "engine::tests::concurrent_engine_authority_serializes_real_canonical_head_advances",
+    "engine::tests::model_check_corpus_recovery_is_total_and_fail_closed_for_every_crash_phase",
+    "authority::tests::concurrent_directory_moves_never_replace_the_winner",
+    "authority::tests::concurrent_idempotent_writers_install_one_complete_object",
+    "authority::tests::concurrent_conflicting_writers_never_replace_the_winner",
+    "authority::tests::atomic_pointer_replacement_rejects_postrename_inode_substitution",
+    "authority::tests::replacement_after_open_fails_closed_without_accepting_replacement_bytes",
+    "authority::tests::mutation_race_on_the_open_inode_fails_closed",
+    "authority::tests::transactional_move_never_overwrites_and_recovers_its_own_link",
+    "engine::tests::recover_rolls_back_an_intent_that_never_retired_the_prior_corpus",
+    "engine::tests::recover_restores_archived_prior_corpus",
+    "engine::tests::recover_requires_replay_when_new_corpus_already_published",
+    "knowledge_engine::tests::canonical_head_rejects_double_advance_concurrently",
+    "ledger::tests::duplicate_v2_payload_key_is_ambiguous_not_first_match",
+    "engine::tests::support_controller_execution_receipt_and_ledger_invariants",
+    "engine::tests::transition_commit_after_verified_corpus_transition_invariants"
+  ],
+  "result": "passed",
+  "schema": "cerebro.tidex.quality_assurance_receipt/v1",
+  "started_epoch": 1788715128,
+  "toolchains": {
+    "nightly_rustc_vv": "rustc 1.100.0-nightly (0ed41eb41 2026-09-04)\nbinary: rustc\ncommit-hash: 0ed41eb4142dda2df61eb1145a312c1a9d62eb56\ncommit-date: 2026-09-04\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.1",
+    "stable_rustc_vv": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0\nLLVM version: 22.1.2"
+  },
+  "working_diff_sha256": "56620a07f30baca4c46ccd15634c27be973784861dbd492a0448241c9bcdd81e",
+  "working_status_sha256": "6f01386e9face1601c6fd39494a5f595c18bf60dc804cc33568352f7f800ac67"
+}

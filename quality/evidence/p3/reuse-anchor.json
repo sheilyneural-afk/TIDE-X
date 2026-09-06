@@ -1,0 +1,76 @@
+{
+  "frozen_snapshot_commit": "43588d43d76269258efd6928b098369030f049cb",
+  "frozen_snapshot_parent": "c8bbb6e8694ecf41df7b82c4962ddfedeeed3dda",
+  "frozen_snapshot_tree": "434ced73aab3e29082f755e46a4158fd3b9effbb",
+  "gate2_script_sha256": "6ba56d1ab3d4fe4f524fca7b96ddd99ae4157981654d6217653b09978b00f662",
+  "gate3_script_sha256": "5f966b07ddcdfb887d29d3dda0a032248d6401ef907e0b69514d598bdedceb7e",
+  "ignored_snapshot_files": [
+    {
+      "path": ".agent-cache/.gitignore",
+      "sha256": "cdbcae15105d6b781e620813c79c7e868740d4e9cc53ce6f5fcbbc12387adf4b"
+    },
+    {
+      "path": ".agent-cache/index.json",
+      "sha256": "cc30ba56af6e75f283f01e68a4484733495c4b2fb58aec1b4584a2241e5bcd12"
+    },
+    {
+      "path": ".kilo/.gitignore",
+      "sha256": "1ff25b005585f501edf16194863ece8eef55d50d46eed6322095aabdf6eafb40"
+    },
+    {
+      "path": ".kilocode/.gitignore",
+      "sha256": "1ff25b005585f501edf16194863ece8eef55d50d46eed6322095aabdf6eafb40"
+    }
+  ],
+  "limitations": [
+    "reuse is allowed only when the closed P0-P3 input set is byte-identical to the frozen P3 snapshot",
+    "historical ignored-file hashes are used only to reconstruct and bind the original full-checkout receipt manifest",
+    "release-only documentation and P4 tooling are outside the reusable P0-P3 input set"
+  ],
+  "p2_coverage": {
+    "critical": {
+      "src/digest.rs": {
+        "functions": 98.18,
+        "lines": 98.97,
+        "regions": 98.5
+      },
+      "src/engine/analysis.rs": {
+        "functions": 79.69,
+        "lines": 85.3,
+        "regions": 86.37
+      },
+      "src/engine/runtime.rs": {
+        "functions": 77.12,
+        "lines": 80.18,
+        "regions": 81.49
+      },
+      "src/engine/support.rs": {
+        "functions": 81.4,
+        "lines": 83.77,
+        "regions": 85.71
+      },
+      "src/engine/transition.rs": {
+        "functions": 70.0,
+        "lines": 75.8,
+        "regions": 76.4
+      },
+      "src/isolated_execution.rs": {
+        "functions": 82.86,
+        "lines": 87.33,
+        "regions": 89.25
+      }
+    },
+    "global": {
+      "functions": 80.24,
+      "lines": 86.97,
+      "regions": 87.62
+    }
+  },
+  "receipt_checkout_manifest_sha256": "e3d13c54a49802fc7b978bfeadde43fea40f94519f6d08ee24539d352237f5e7",
+  "receipt_sha256": "adabc3c946d7139ff249e02b2b8194433cefe730f592f9dd2262f5610b6d026d",
+  "required_assurance_tests": 17,
+  "reusable_input_file_count": 101,
+  "reusable_inputs_domain": "CEREBRO:TIDEX:P3-REUSABLE-INPUTS:v1\\0",
+  "reusable_inputs_sha256": "33369800e83b4e7261a6eedc0449e650cd7dbec8ab093c46a979185a5162bfdc",
+  "schema": "cerebro.tidex.p3_reuse_anchor/v1"
+}
