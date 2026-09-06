@@ -1,5 +1,37 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnsealedCorpusRecoveryDecision {
+    RequiresOriginalFinalizationReplay,
+    RejectUnrecognizedLiveCorpus,
+    RejectLiveAndArchiveBothPresent,
+    RestorePriorCorpus,
+    RollBackIntent,
+}
+
+pub(super) fn classify_unsealed_corpus_recovery(
+    live_digest: Option<&CorpusDigest>,
+    prior_corpus_digest: &Sha256Digest,
+    new_corpus_digest: &Sha256Digest,
+    archive_has_observations: bool,
+) -> UnsealedCorpusRecoveryDecision {
+    if live_digest.map(CorpusDigest::as_digest) == Some(new_corpus_digest) {
+        return UnsealedCorpusRecoveryDecision::RequiresOriginalFinalizationReplay;
+    }
+    if live_digest.is_some_and(|digest| digest.as_digest() != prior_corpus_digest) {
+        return UnsealedCorpusRecoveryDecision::RejectUnrecognizedLiveCorpus;
+    }
+    if archive_has_observations {
+        if live_digest.is_some() {
+            UnsealedCorpusRecoveryDecision::RejectLiveAndArchiveBothPresent
+        } else {
+            UnsealedCorpusRecoveryDecision::RestorePriorCorpus
+        }
+    } else {
+        UnsealedCorpusRecoveryDecision::RollBackIntent
+    }
+}
+
 impl BrainEngine {
     pub(super) fn incomplete_transition_operation_key(&self) -> BrainResult<Option<Sha256Digest>> {
         let inflight = self.root.join("state/corpus_transitions/inflight");
@@ -50,7 +82,12 @@ impl BrainEngine {
         let journal = self.load_transition_journal(&operation_key)?;
         let phase = journal.as_ref().map(|value| value.phase);
         let receipt_path = learning_finalization_receipt_path(&self.root, &operation_key);
-        if fs::symlink_metadata(&receipt_path).is_ok() {
+        let receipt_exists = match fs::symlink_metadata(&receipt_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if receipt_exists {
             let bytes = read_untrusted_private_file_bounded(
                 &self.root,
                 &receipt_path,
@@ -87,22 +124,6 @@ impl BrainEngine {
                 Some(observation_set_digest(&observations)?)
             }
         };
-        if live_digest.as_ref().map(CorpusDigest::as_digest) == Some(&intent.new_corpus_digest) {
-            return Ok(CorpusTransitionRecovery::new(
-                CorpusTransitionRecoveryOutcome::RequiresOriginalFinalizationReplay,
-                Some(operation_key),
-                phase.or(Some(CorpusTransitionPhase::NewCorpusPublished)),
-            ));
-        }
-        if live_digest
-            .as_ref()
-            .is_some_and(|digest| digest.as_digest() != &intent.prior_corpus_digest)
-        {
-            return Err(BrainError::Integrity(
-                "recovery_live_corpus_unrecognized".into(),
-            ));
-        }
-
         let archive = learning_finalization_archive_dir(&self.root, &operation_key);
         let archive_observations = archive.join("observations");
         let archive_has_observations = match fs::symlink_metadata(&archive_observations) {
@@ -110,29 +131,45 @@ impl BrainEngine {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
-        if archive_has_observations {
-            if live_digest.is_some() {
-                return Err(BrainError::Integrity(
-                    "recovery_live_and_archive_both_present".into(),
-                ));
+        match classify_unsealed_corpus_recovery(
+            live_digest.as_ref(),
+            &intent.prior_corpus_digest,
+            &intent.new_corpus_digest,
+            archive_has_observations,
+        ) {
+            UnsealedCorpusRecoveryDecision::RequiresOriginalFinalizationReplay => {
+                Ok(CorpusTransitionRecovery::new(
+                    CorpusTransitionRecoveryOutcome::RequiresOriginalFinalizationReplay,
+                    Some(operation_key),
+                    phase.or(Some(CorpusTransitionPhase::NewCorpusPublished)),
+                ))
             }
-            self.restore_archived_prior_corpus(&operation_key)?;
-            self.abort_inflight_transition(&operation_key)?;
-            self.advance_canonical_engine_head(HeadIncomplete::Clear, None, None)?;
-            return Ok(CorpusTransitionRecovery::new(
-                CorpusTransitionRecoveryOutcome::RestoredPriorCorpus,
-                Some(operation_key),
-                phase.or(Some(CorpusTransitionPhase::PriorArchived)),
-            ));
+            UnsealedCorpusRecoveryDecision::RejectUnrecognizedLiveCorpus => Err(
+                BrainError::Integrity("recovery_live_corpus_unrecognized".into()),
+            ),
+            UnsealedCorpusRecoveryDecision::RejectLiveAndArchiveBothPresent => Err(
+                BrainError::Integrity("recovery_live_and_archive_both_present".into()),
+            ),
+            UnsealedCorpusRecoveryDecision::RestorePriorCorpus => {
+                self.restore_archived_prior_corpus(&operation_key)?;
+                self.abort_inflight_transition(&operation_key)?;
+                self.advance_canonical_engine_head(HeadIncomplete::Clear, None, None)?;
+                Ok(CorpusTransitionRecovery::new(
+                    CorpusTransitionRecoveryOutcome::RestoredPriorCorpus,
+                    Some(operation_key),
+                    phase.or(Some(CorpusTransitionPhase::PriorArchived)),
+                ))
+            }
+            UnsealedCorpusRecoveryDecision::RollBackIntent => {
+                self.abort_inflight_transition(&operation_key)?;
+                self.advance_canonical_engine_head(HeadIncomplete::Clear, None, None)?;
+                Ok(CorpusTransitionRecovery::new(
+                    CorpusTransitionRecoveryOutcome::RolledBackIntent,
+                    Some(operation_key),
+                    phase.or(Some(CorpusTransitionPhase::IntentRecorded)),
+                ))
+            }
         }
-
-        self.abort_inflight_transition(&operation_key)?;
-        self.advance_canonical_engine_head(HeadIncomplete::Clear, None, None)?;
-        Ok(CorpusTransitionRecovery::new(
-            CorpusTransitionRecoveryOutcome::RolledBackIntent,
-            Some(operation_key),
-            phase.or(Some(CorpusTransitionPhase::IntentRecorded)),
-        ))
     }
 
     pub(super) fn restore_archived_prior_corpus(

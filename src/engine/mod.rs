@@ -160,10 +160,16 @@ impl BrainEngine {
 mod tests {
     use super::*;
     use crate::digest::{ParameterLayoutDigest, ProvenanceDigest, Sha256Digest};
+    use crate::engine::store::canonical_head_compare_and_swap_matches;
+    use crate::engine::transition::{
+        classify_unsealed_corpus_recovery, UnsealedCorpusRecoveryDecision,
+    };
     use crate::engine_head::CorpusTransitionRecoveryOutcome;
     use crate::identity::{LineageId, ObservationId, ReconstructionId, SessionId, SkillId};
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn sample_observation(id: &str, delta: Vec<f64>) -> DeltaObservation {
         DeltaObservation {
@@ -671,6 +677,308 @@ mod tests {
             matches!(err, BrainError::Integrity(message) if message.contains("compare_and_swap"))
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_check_engine_authority_lock_prevents_canonical_head_forks() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Stage {
+            Acquire,
+            Snapshot,
+            Compare,
+            Replace,
+            Release,
+            Done,
+        }
+
+        #[derive(Clone, Debug)]
+        struct Writer {
+            stage: Stage,
+            expected: Option<CanonicalEngineHead>,
+            next: Option<CanonicalEngineHead>,
+            published: bool,
+        }
+
+        #[derive(Clone, Debug)]
+        struct Model {
+            current: Option<CanonicalEngineHead>,
+            lock_owner: Option<usize>,
+            writers: [Writer; 2],
+        }
+
+        fn successor(parent: Option<&CanonicalEngineHead>, writer: usize) -> CanonicalEngineHead {
+            CanonicalEngineHead {
+                schema: CANONICAL_ENGINE_HEAD_SCHEMA.into(),
+                revision: parent.map_or(0, |head| head.revision + 1),
+                parent_revision: parent.map(|head| head.revision),
+                parent_digest: parent.map(|head| head.manifest_digest.clone()),
+                corpus_digest: None,
+                observation_count: 0,
+                active_bank_sha256: None,
+                memory_sha256: None,
+                sleep_state_sha256: None,
+                evidence_bundle_sha256: None,
+                reconstruction_report_sha256: None,
+                certification_status: None,
+                incomplete_transition: Some(Sha256Digest::digest_bytes(
+                    format!("model-writer-{writer}").as_bytes(),
+                )),
+                manifest_digest: CanonicalEngineHeadDigest::from(Sha256Digest::zero()),
+            }
+            .seal()
+            .unwrap()
+        }
+
+        fn initial_writer(stage: Stage) -> Writer {
+            Writer {
+                stage,
+                expected: None,
+                next: None,
+                published: false,
+            }
+        }
+
+        fn explore(model: Model, with_lock: bool, terminal: &mut Vec<Model>) {
+            if model
+                .writers
+                .iter()
+                .all(|writer| writer.stage == Stage::Done)
+            {
+                terminal.push(model);
+                return;
+            }
+            for writer_id in 0..2 {
+                let stage = model.writers[writer_id].stage;
+                let allowed = match stage {
+                    Stage::Acquire => !with_lock || model.lock_owner.is_none(),
+                    Stage::Snapshot | Stage::Compare | Stage::Replace | Stage::Release => {
+                        !with_lock || model.lock_owner == Some(writer_id)
+                    }
+                    Stage::Done => false,
+                };
+                if !allowed {
+                    continue;
+                }
+                let mut next_model = model.clone();
+                match stage {
+                    Stage::Acquire => {
+                        if with_lock {
+                            next_model.lock_owner = Some(writer_id);
+                        }
+                        next_model.writers[writer_id].stage = Stage::Snapshot;
+                    }
+                    Stage::Snapshot => {
+                        let expected = next_model.current.clone();
+                        let proposal = successor(expected.as_ref(), writer_id);
+                        next_model.writers[writer_id].expected = expected;
+                        next_model.writers[writer_id].next = Some(proposal);
+                        next_model.writers[writer_id].stage = Stage::Compare;
+                    }
+                    Stage::Compare => {
+                        let observed = next_model.current.clone();
+                        let compare_allowed = canonical_head_compare_and_swap_matches(
+                            next_model.writers[writer_id].expected.as_ref(),
+                            observed.as_ref(),
+                        );
+                        next_model.writers[writer_id].stage = if compare_allowed {
+                            Stage::Replace
+                        } else {
+                            Stage::Release
+                        };
+                    }
+                    Stage::Replace => {
+                        next_model.current = next_model.writers[writer_id].next.clone();
+                        next_model.writers[writer_id].published = true;
+                        next_model.writers[writer_id].stage = Stage::Release;
+                    }
+                    Stage::Release => {
+                        if with_lock {
+                            next_model.lock_owner = None;
+                        }
+                        next_model.writers[writer_id].stage = Stage::Done;
+                    }
+                    Stage::Done => unreachable!(),
+                }
+                explore(next_model, with_lock, terminal);
+            }
+        }
+
+        let locked_initial = Model {
+            current: None,
+            lock_owner: None,
+            writers: [
+                initial_writer(Stage::Acquire),
+                initial_writer(Stage::Acquire),
+            ],
+        };
+        let mut locked_terminal = Vec::new();
+        explore(locked_initial, true, &mut locked_terminal);
+        assert!(!locked_terminal.is_empty());
+        for state in &locked_terminal {
+            assert_eq!(
+                state
+                    .writers
+                    .iter()
+                    .filter(|writer| writer.published)
+                    .count(),
+                2
+            );
+            let head = state.current.as_ref().unwrap();
+            assert_eq!(head.revision, 1);
+            assert_eq!(head.parent_revision, Some(0));
+            assert!(head.parent_digest.is_some());
+            head.authenticate().unwrap();
+        }
+
+        // The same publish algorithm without the engine authority lock has a
+        // concrete lost-update schedule: both writers can snapshot/check the
+        // same genesis absence before either pointer replacement occurs.
+        let unlocked_initial = Model {
+            current: None,
+            lock_owner: None,
+            writers: [
+                initial_writer(Stage::Acquire),
+                initial_writer(Stage::Acquire),
+            ],
+        };
+        let mut unlocked_terminal = Vec::new();
+        explore(unlocked_initial, false, &mut unlocked_terminal);
+        assert!(unlocked_terminal.iter().any(|state| {
+            state.writers.iter().all(|writer| writer.published)
+                && state
+                    .current
+                    .as_ref()
+                    .is_some_and(|head| head.revision == 0)
+        }));
+    }
+
+    #[test]
+    fn concurrent_engine_authority_serializes_real_canonical_head_advances() {
+        let root = isolated_engine_root("engine-authority-real-concurrent-head");
+        ensure_private_directory(&root, &root.join("state")).unwrap();
+        let engine = Arc::new(BrainEngine {
+            root: root.clone(),
+            config: BrainConfig::default(),
+        });
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                engine.with_engine_authority(|| {
+                    engine.advance_canonical_engine_head(HeadIncomplete::Clear, None, None)
+                })
+            }));
+        }
+        barrier.wait();
+        let mut heads = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        heads.sort_by_key(|head| head.revision);
+        assert_eq!(heads[0].revision, 0);
+        assert_eq!(heads[0].parent_revision, None);
+        assert_eq!(heads[1].revision, 1);
+        assert_eq!(heads[1].parent_revision, Some(0));
+        assert_eq!(
+            heads[1].parent_digest.as_ref(),
+            Some(&heads[0].manifest_digest)
+        );
+        let current = engine.verify_current_canonical_engine_head().unwrap();
+        assert_eq!(current, heads[1]);
+        assert!(engine
+            .canonical_engine_head_history_path(&heads[0].manifest_digest)
+            .is_file());
+        assert!(engine
+            .canonical_engine_head_history_path(&heads[1].manifest_digest)
+            .is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_check_corpus_recovery_is_total_and_fail_closed_for_every_crash_phase() {
+        let prior = Sha256Digest::digest_bytes(b"model-prior-corpus");
+        let new = Sha256Digest::digest_bytes(b"model-new-corpus");
+        let other = CorpusDigest::from(Sha256Digest::digest_bytes(b"model-foreign-corpus"));
+        let prior_live = CorpusDigest::from(prior.clone());
+        let new_live = CorpusDigest::from(new.clone());
+
+        let live_states = [
+            ("absent", None),
+            ("prior", Some(&prior_live)),
+            ("new", Some(&new_live)),
+            ("foreign", Some(&other)),
+        ];
+        let mut explored = 0usize;
+        for (label, live) in live_states {
+            for archive_has_observations in [false, true] {
+                explored += 1;
+                let decision =
+                    classify_unsealed_corpus_recovery(live, &prior, &new, archive_has_observations);
+                match label {
+                    "new" => assert_eq!(
+                        decision,
+                        UnsealedCorpusRecoveryDecision::RequiresOriginalFinalizationReplay
+                    ),
+                    "foreign" => assert_eq!(
+                        decision,
+                        UnsealedCorpusRecoveryDecision::RejectUnrecognizedLiveCorpus
+                    ),
+                    "prior" if archive_has_observations => assert_eq!(
+                        decision,
+                        UnsealedCorpusRecoveryDecision::RejectLiveAndArchiveBothPresent
+                    ),
+                    "absent" if archive_has_observations => {
+                        assert_eq!(decision, UnsealedCorpusRecoveryDecision::RestorePriorCorpus)
+                    }
+                    _ => assert_eq!(decision, UnsealedCorpusRecoveryDecision::RollBackIntent),
+                }
+            }
+        }
+        assert_eq!(explored, 8);
+
+        let crash_phases = [
+            (
+                CorpusTransitionPhase::IntentRecorded,
+                Some(&prior_live),
+                false,
+                UnsealedCorpusRecoveryDecision::RollBackIntent,
+            ),
+            (
+                CorpusTransitionPhase::PriorArchived,
+                None,
+                true,
+                UnsealedCorpusRecoveryDecision::RestorePriorCorpus,
+            ),
+            (
+                CorpusTransitionPhase::NewCorpusStaged,
+                None,
+                true,
+                UnsealedCorpusRecoveryDecision::RestorePriorCorpus,
+            ),
+            (
+                CorpusTransitionPhase::NewCorpusPublished,
+                Some(&new_live),
+                true,
+                UnsealedCorpusRecoveryDecision::RequiresOriginalFinalizationReplay,
+            ),
+            (
+                CorpusTransitionPhase::CommitSealed,
+                Some(&new_live),
+                true,
+                UnsealedCorpusRecoveryDecision::RequiresOriginalFinalizationReplay,
+            ),
+        ];
+        for (phase, live, archive, expected) in crash_phases {
+            let actual = classify_unsealed_corpus_recovery(live, &prior, &new, archive);
+            assert_eq!(actual, expected, "phase={phase:?}");
+        }
+        // ReceiptSealed is intentionally handled before this classifier: an
+        // authenticated receipt dominates heuristic inspection and closes the
+        // inflight marker through the receipt verifier.
+        assert!(CorpusTransitionPhase::ReceiptSealed > CorpusTransitionPhase::CommitSealed);
     }
 
     fn dense_analysis_fixture(

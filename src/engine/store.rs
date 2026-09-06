@@ -1,5 +1,16 @@
 use super::*;
 
+pub(super) fn canonical_head_compare_and_swap_matches(
+    expected: Option<&CanonicalEngineHead>,
+    current: Option<&CanonicalEngineHead>,
+) -> bool {
+    match (expected, current) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => expected.manifest_digest == actual.manifest_digest,
+        _ => false,
+    }
+}
+
 impl BrainEngine {
     pub(super) fn canonical_engine_head_path(&self) -> PathBuf {
         self.root.join("state/canonical_engine_head.json")
@@ -187,20 +198,10 @@ impl BrainEngine {
     ) -> BrainResult<()> {
         next.authenticate()?;
         let current = self.load_canonical_head_if_present()?;
-        match (expected, current.as_ref()) {
-            (None, Some(_)) | (Some(_), None) => {
-                return Err(BrainError::Integrity(
-                    "canonical_engine_head_compare_and_swap_conflict".into(),
-                ))
-            }
-            (Some(expected), Some(actual))
-                if actual.manifest_digest != expected.manifest_digest =>
-            {
-                return Err(BrainError::Integrity(
-                    "canonical_engine_head_compare_and_swap_conflict".into(),
-                ))
-            }
-            _ => {}
+        if !canonical_head_compare_and_swap_matches(expected, current.as_ref()) {
+            return Err(BrainError::Integrity(
+                "canonical_engine_head_compare_and_swap_conflict".into(),
+            ));
         }
         if let Some(current) = current.as_ref() {
             self.persist_canonical_engine_head_history(current)?;

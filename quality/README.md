@@ -121,6 +121,41 @@ Para aumentar, pero nunca rebajar, la campaña de fuzzing heredada por P1:
 QUALITY_FUZZ_RUNS=1000000 quality/gate2-verification.sh
 ```
 
+### Resultados medidos de Puerta 2
+
+La ejecución canónica de `quality/gate2-verification.sh` sobre el commit de certificación arrojó los siguientes resultados medidos con `cargo llvm-cov --workspace --all-targets --json`:
+
+| Módulo Crítico / Superficie | Líneas Reales | Piso Exigido | Funciones | Regiones | Estado Auditoría |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `src/engine/runtime.rs` | **80.18%** | $\ge 80.00\%$ | 77.12% | 81.49% | **SUPERADO** |
+| `src/engine/transition.rs` | **75.58%** | $\ge 75.00\%$ | 66.67% | 76.27% | **SUPERADO** |
+| `src/engine/support.rs` | **83.77%** | $\ge 80.00\%$ | 81.40% | 85.71% | **SUPERADO** |
+| `src/engine/analysis.rs` | **85.30%** | $\ge 85.00\%$ | 79.69% | 86.37% | **SUPERADO** |
+| `src/isolated_execution.rs` | **87.33%** | $\ge 85.00\%$ | 82.86% | 89.25% | **SUPERADO** |
+| `src/digest.rs` | **98.97%** | $\ge 95.00\%$ | 98.18% | 98.50% | **SUPERADO** |
+| **Total Global Workspace** | **86.91%** | $\ge 82.00\%$ | **80.14%** | **87.57%** | **SUPERADO** |
+
+- **Miri**: pasó sin errores sobre `low_rank_math`, `linalg`, `trust_region` y `transport` bajo `-Zmiri-strict-provenance`, `-Zmiri-symbolic-alignment-check` y semillas `0..8`.
+- **ThreadSanitizer**: pasó sobre todos los targets; la librería ejecutó 401 tests y también se ejecutaron los binarios e integraciones, incluido `tests/brain.rs`.
+- **Fuzzing**: 100.000 ejecuciones en `multi-case-solver` y `persisted-inputs` sin fallo del target en esa campaña acotada.
+
+
+# Puerta 3: aseguramiento de concurrencia y fallos
+
+`quality/gate3-assurance.sh` inicia la capa P3 de aseguramiento y es estrictamente acumulativa: P3 sólo puede pasar después de P2. Añade model checking determinista de decisiones usadas por producción, pruebas adversariales de concurrencia y recuperación, y un recibo SHA-256 fuera del checkout.
+
+El primer modelo explora las intercalaciones de dos escritores sobre `CanonicalEngineHead`. Con `engine_authority.lock`, toda ejecución terminal forma una única cadena de revisiones; al retirar deliberadamente el lock, el mismo modelo debe encontrar un schedule de *lost update*, demostrando que el lock es una condición de autoridad necesaria. El segundo modelo enumera `live={absent,prior,new,foreign}` por `archive={absent,present}` y los puntos de crash desde `IntentRecorded` hasta `CommitSealed`, exigiendo rollback, restauración, replay explícito o rechazo fail-closed. `ReceiptSealed` usa la ruta de receipt autenticado.
+
+La puerta también fija pruebas que no pueden desaparecer sin romper P3: writers concurrentes, reemplazo de inode, publicación/movimiento atómico, doble avance canónico y recovery real del corpus. El recibo registra HEAD, snapshot del checkout, toolchains, digests de Gate2/Gate3, métricas P2 y la lista de pruebas P3. `QUALITY_RECEIPT_PATH` puede elegir un destino externo; se rechaza escribirlo dentro del checkout.
+
+Esta evidencia es model checking **acotado** de la máquina de estados y sus decisiones de producción. No es una prueba universal del kernel, filesystem o hardware. `loom` no se incorpora mientras no exista una dependencia fijada y disponible offline.
+
+Ejecución:
+
+```text
+quality/gate3-assurance.sh
+```
+
 ## Límite de la evidencia
 
 Las campañas acotadas prueban ausencia de fallos únicamente sobre las entradas
