@@ -190,6 +190,21 @@ bash quality/gate3-assurance.sh
 
 P3 es acumulativa sobre P2 y añade model checking determinista acotado, pruebas concurrentes/recovery obligatorias y un recibo de aseguramiento SHA-256 externo al checkout. El snapshot que la superó está congelado en `43588d43d76269258efd6928b098369030f049cb`. Esta evidencia no debe describirse como “verificación formal universal”.
 
+## Firma de release (P4)
+
+La frontera de firma está en `quality/sign-release.sh`. Opera únicamente sobre un directorio de release fuera del checkout, exige `release-manifest.json` y `SHA256SUMS`, verifica primero todos los checksums y después crea firmas OpenPGP detached ASCII-armored para ambos ficheros.
+
+La clave nunca se selecciona de forma implícita. Debe indicarse con su fingerprint completo de 40 hexadecimales:
+
+```bash
+export TIDEX_RELEASE_GPG_KEY=<fingerprint-completo>
+quality/sign-release.sh /ruta/al/release
+```
+
+El fingerprint debe corresponder a una clave o subclave secreta con capacidad de firma disponible en el `GNUPGHOME` activo. Si la clave necesita passphrase en automatización, puede proporcionarse mediante un fichero externo al checkout con permisos `0600` o `0400` usando `TIDEX_RELEASE_GPG_PASSPHRASE_FILE`. El script no genera claves, no elige una por defecto, no firma artefactos con checksums inválidos y no sustituye una firma preexistente que no verifique con la clave autorizada.
+
+La infraestructura de firma no decide la licencia legal del producto. `Cargo.toml` continúa sin declarar `license`/`license-file`; una distribución pública debe resolver esa decisión por separado.
+
 ## Dependencias y licencias
 
 `deny.toml` controla las licencias y fuentes permitidas de dependencias. La allowlist actual incluye Apache-2.0, Apache-2.0 WITH LLVM-exception, MIT, Unicode-3.0 y Unlicense. El paquete raíz no declara actualmente un campo `license` en `Cargo.toml`; por tanto no debe inferirse una licencia del propio producto a partir de la política de dependencias.

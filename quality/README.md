@@ -153,6 +153,16 @@ Ejecución:
 quality/gate3-assurance.sh
 ```
 
+## P4: frontera de firma disponible
+
+Como primera pieza de Release Readiness, `quality/sign-release.sh` implementa una frontera OpenPGP fail-closed. Rechaza releases dentro del checkout, symlinks en la ruta de release, manifests/checksums no regulares, rutas no canónicas o escapadas en `SHA256SUMS`, subjects no regulares, checksum mismatch, fingerprint ambiguo/no completo y claves secretas sin capacidad de firma.
+
+La selección de autoridad es explícita mediante `TIDEX_RELEASE_GPG_KEY=<fingerprint de 40 hex>`. Las firmas se publican como `SHA256SUMS.asc` y `release-manifest.json.asc` sólo después de verificarlas contra el mismo fingerprint. Una firma ya existente se acepta únicamente si vuelve a verificar para el subject exacto y la clave autorizada. No existe generación automática ni fallback a otra clave.
+
+La implementación fue probada con una clave secreta efímera creada en un `GNUPGHOME` temporal: rechazo sin clave, firma real, verificación exacta de ambas firmas, replay idempotente y rechazo tras alterar un payload protegido por `SHA256SUMS`. Esa prueba de desarrollo no es una firma de distribución; una release pública requiere una clave autorizada persistente configurada por el propietario del proyecto.
+
+P4 todavía no está superada: faltan el bundle de los ocho binarios, manifiesto/SBOM definitivos, instalación/activación/rollback/desinstalación aislados y la puerta acumulativa `gate4`.
+
 ## Límite de la evidencia
 
 Las campañas acotadas prueban ausencia de fallos únicamente sobre las entradas
