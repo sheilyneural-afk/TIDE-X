@@ -93,6 +93,9 @@ if set(sums)!=expected_subjects:
     print('release verification rejected: checksum_subject_set_invalid',file=sys.stderr); raise SystemExit(2)
 allowed_files=expected_subjects|{'SHA256SUMS','SHA256SUMS.asc','release-manifest.json.asc'}
 allowed_dirs={'bin'}
+root_mode=stat.S_IMODE(os.lstat(root).st_mode)
+if root_mode & 0o022:
+    print(f'release verification rejected: release_root_writable_by_others:{root_mode:o}',file=sys.stderr); raise SystemExit(2)
 for candidate in root.rglob('*'):
     rel=candidate.relative_to(root).as_posix()
     st=os.lstat(candidate)
@@ -101,9 +104,15 @@ for candidate in root.rglob('*'):
     if stat.S_ISDIR(st.st_mode):
         if rel not in allowed_dirs:
             print(f'release verification rejected: release_tree_extra_directory:{rel}',file=sys.stderr); raise SystemExit(2)
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            print(f'release verification rejected: release_directory_writable_by_others:{rel}',file=sys.stderr); raise SystemExit(2)
     elif stat.S_ISREG(st.st_mode):
         if rel not in allowed_files:
             print(f'release verification rejected: release_tree_extra_file:{rel}',file=sys.stderr); raise SystemExit(2)
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            print(f'release verification rejected: release_file_writable_by_others:{rel}',file=sys.stderr); raise SystemExit(2)
+        if rel.startswith('bin/') and not (stat.S_IMODE(st.st_mode) & 0o111):
+            print(f'release verification rejected: release_binary_not_executable:{rel}',file=sys.stderr); raise SystemExit(2)
     else:
         print(f'release verification rejected: release_tree_special_file:{rel}',file=sys.stderr); raise SystemExit(2)
 for rel,digest in sums.items():
