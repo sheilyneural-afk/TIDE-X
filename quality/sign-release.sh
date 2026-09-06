@@ -6,7 +6,7 @@ umask 077
 QUALITY_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 usage() {
-    echo 'usage: TIDEX_RELEASE_GPG_KEY=<40-hex-fingerprint> quality/sign-release.sh <release-directory>' >&2
+    echo 'usage: TIDEX_RELEASE_GPG_KEY=<40-hex-fingerprint> quality/sign-release.sh <release-directory> [release-archive]' >&2
 }
 
 fail() {
@@ -14,7 +14,7 @@ fail() {
     exit 2
 }
 
-[[ $# -eq 1 ]] || { usage; exit 2; }
+[[ $# -eq 1 || $# -eq 2 ]] || { usage; exit 2; }
 command -v gpg >/dev/null 2>&1 || fail 'gpg_not_available'
 command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum_not_available'
 command -v python3 >/dev/null 2>&1 || fail 'python3_not_available'
@@ -27,8 +27,6 @@ case "$RELEASE_DIR/" in
     "$QUALITY_ROOT/"*) fail 'release_directory_inside_checkout' ;;
 esac
 
-# Reject symlink traversal in the release directory itself. Signing through an
-# alias would make the authenticated filesystem object ambiguous.
 python3 - "$RELEASE_DIR" <<'PY' || exit 2
 import os
 import stat
@@ -55,8 +53,24 @@ for path in "$MANIFEST" "$SUMS"; do
     [[ -f "$path" && ! -L "$path" ]] || fail "required_regular_file_missing:$(basename "$path")"
 done
 
-# Restrict the checksum manifest to normalized relative paths inside the release
-# directory before asking sha256sum to open anything.
+RELEASE_BASENAME=$(basename "$RELEASE_DIR")
+python3 - "$MANIFEST" "$RELEASE_BASENAME" <<'PY' || exit 2
+import json
+import sys
+path, expected = sys.argv[1:]
+try:
+    manifest = json.load(open(path, encoding='utf-8'))
+except Exception as error:
+    print(f"release signing rejected: release_manifest_invalid:{error}", file=sys.stderr)
+    raise SystemExit(2)
+if manifest.get('schema') != 'cerebro.tidex.release_manifest/v1':
+    print('release signing rejected: release_manifest_schema_invalid', file=sys.stderr)
+    raise SystemExit(2)
+if manifest.get('release_id') != expected:
+    print('release signing rejected: release_manifest_id_mismatch', file=sys.stderr)
+    raise SystemExit(2)
+PY
+
 python3 - "$SUMS" "$RELEASE_DIR" <<'PY' || exit 2
 import os
 import re
@@ -105,6 +119,25 @@ PY
     sha256sum --strict -c SHA256SUMS >/dev/null
 ) || fail 'checksum_verification_failed'
 
+ARCHIVE=''
+ARCHIVE_SUM=''
+if [[ $# -eq 2 ]]; then
+    ARCHIVE_INPUT=$2
+    [[ -f "$ARCHIVE_INPUT" && ! -L "$ARCHIVE_INPUT" ]] || fail 'release_archive_invalid'
+    ARCHIVE=$(cd -- "$(dirname -- "$ARCHIVE_INPUT")" && pwd -P)/$(basename -- "$ARCHIVE_INPUT")
+    case "$ARCHIVE" in
+        "$QUALITY_ROOT"/*) fail 'release_archive_inside_checkout' ;;
+    esac
+    [[ "$(dirname -- "$ARCHIVE")" == "$(dirname -- "$RELEASE_DIR")" ]] || fail 'release_archive_not_sibling_of_release_directory'
+    [[ "$(basename -- "$ARCHIVE")" == "${RELEASE_BASENAME}.tar.zst" ]] || fail 'release_archive_name_mismatch'
+    ARCHIVE_SUM="${ARCHIVE}.sha256"
+    [[ -f "$ARCHIVE_SUM" && ! -L "$ARCHIVE_SUM" ]] || fail 'release_archive_checksum_missing'
+    (
+        cd "$(dirname -- "$ARCHIVE")"
+        sha256sum --strict -c "$(basename -- "$ARCHIVE_SUM")" >/dev/null
+    ) || fail 'release_archive_checksum_invalid'
+fi
+
 KEY=${TIDEX_RELEASE_GPG_KEY:-}
 [[ "$KEY" =~ ^[0-9A-Fa-f]{40}$ ]] || fail 'TIDEX_RELEASE_GPG_KEY_must_be_full_40_hex_fingerprint'
 KEY=${KEY^^}
@@ -149,7 +182,7 @@ sign_subject() {
         return 0
     fi
 
-    temporary=$(mktemp "$RELEASE_DIR/.signature.XXXXXX")
+    temporary=$(mktemp "$(dirname -- "$subject")/.signature.XXXXXX")
     trap 'rm -f -- "$temporary"' EXIT
     gpg "${GPG_SECRET_ARGS[@]}" --armor --detach-sign --output "$temporary" "$subject"
     verify_signature "$temporary" "$subject"
@@ -161,6 +194,15 @@ sign_subject() {
 
 sign_subject "$SUMS"
 sign_subject "$MANIFEST"
+if [[ -n "$ARCHIVE" ]]; then
+    sign_subject "$ARCHIVE"
+    sign_subject "$ARCHIVE_SUM"
+fi
 
-printf 'SIGNED fingerprint=%s checksums=%s manifest=%s\n' \
+printf 'SIGNED fingerprint=%s checksums=%s manifest=%s' \
     "$KEY" "$(basename "${SUMS}.asc")" "$(basename "${MANIFEST}.asc")"
+if [[ -n "$ARCHIVE" ]]; then
+    printf ' archive=%s archive_checksum=%s' \
+        "$(basename "${ARCHIVE}.asc")" "$(basename "${ARCHIVE_SUM}.asc")"
+fi
+printf '\n'

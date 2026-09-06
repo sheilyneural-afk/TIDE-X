@@ -192,13 +192,13 @@ P3 es acumulativa sobre P2 y añade model checking determinista acotado, pruebas
 
 ## Firma de release (P4)
 
-La frontera de firma está en `quality/sign-release.sh`. Opera únicamente sobre un directorio de release fuera del checkout, exige `release-manifest.json` y `SHA256SUMS`, verifica primero todos los checksums y después crea firmas OpenPGP detached ASCII-armored para ambos ficheros.
+La frontera de firma está en `quality/sign-release.sh`. Opera únicamente sobre un directorio de release fuera del checkout, exige `release-manifest.json` y `SHA256SUMS`, verifica primero todos los checksums y crea firmas OpenPGP detached ASCII-armored para ambos ficheros. Cuando se proporciona además el `.tar.zst` generado por P4, verifica su checksum externo y firma también el archive y su fichero `.sha256`.
 
 La clave nunca se selecciona de forma implícita. Debe indicarse con su fingerprint completo de 40 hexadecimales:
 
 ```bash
 export TIDEX_RELEASE_GPG_KEY=<fingerprint-completo>
-quality/sign-release.sh /ruta/al/release
+quality/sign-release.sh /ruta/al/release /ruta/al/release.tar.zst
 ```
 
 El fingerprint debe corresponder a una clave o subclave secreta con capacidad de firma disponible en el `GNUPGHOME` activo. Si la clave necesita passphrase en automatización, puede proporcionarse mediante un fichero externo al checkout con permisos `0600` o `0400` usando `TIDEX_RELEASE_GPG_PASSPHRASE_FILE`. El script no genera claves, no elige una por defecto, no firma artefactos con checksums inválidos y no sustituye una firma preexistente que no verifique con la clave autorizada.
