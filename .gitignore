@@ -3,3 +3,19 @@
 /models/
 /state/
 /target/
+
+# Reproducible quality-tool outputs. Seeds and harnesses remain versioned.
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz-*.log
+
+# Build and runtime residue from any integration must stay outside the checkout.
+**/target/
+**/.venv/
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.py[cod]

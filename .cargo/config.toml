@@ -3,3 +3,7 @@ offline = true
 
 [build]
 incremental = false
+# Cargo manual (check/test/build/clippy) no puede materializar ./target
+# dentro del checkout. Las puertas quality/ siguen aislando cada corrida
+# con CARGO_TARGET_DIR temporales bajo /tmp.
+target-dir = "/tmp/tidex-cargo-target"

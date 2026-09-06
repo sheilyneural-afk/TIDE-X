@@ -3,10 +3,11 @@ use cerebro_tidex::authority::{
     ensure_private_parent, existing_regular_file_under_root, root_relative_path,
     write_or_verify_immutable,
 };
+use cerebro_tidex::identity::ProbeId;
 use cerebro_tidex::protected_map::{
     build_protected_cortex_map, load_protected_cortex, persist_protected_map, SensitivityEvidence,
 };
-use cerebro_tidex::security::{verify_private_root, PRIVATE_ROOT};
+use cerebro_tidex::security::configured_private_root;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
@@ -27,7 +28,7 @@ struct Payload {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = verify_private_root(Path::new(PRIVATE_ROOT))?;
+    let root = configured_private_root()?;
     let args = std::env::args().collect::<Vec<_>>();
     let evidence_path = args
         .get(1)
@@ -57,8 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|row| {
             Ok(SensitivityEvidence {
-                probe_id: row.probe_id.clone(),
-                sensitivity: read_dvec_f32(&row.artifact)?
+                probe_id: ProbeId::parse(&row.probe_id)?,
+                sensitivity: read_dvec_f32(&root, &row.artifact)?
                     .into_iter()
                     .map(f64::from)
                     .collect(),

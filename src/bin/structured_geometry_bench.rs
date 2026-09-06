@@ -4,6 +4,7 @@ use cerebro_tidex::block_tomography::{
 };
 use cerebro_tidex::contracts::{BrainConfig, DeltaObservation};
 use cerebro_tidex::engine::ReconstructionReport;
+use cerebro_tidex::security::configured_private_root;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -22,6 +23,7 @@ struct TrainingManifest {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = configured_private_root()?;
     let args = std::env::args().collect::<Vec<_>>();
     if args.len() != 5 {
         return Err("usage: structured_geometry_bench <observations.json> <training_manifest.json> <module_specs.json> <tidex_report.json>".into());
@@ -42,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(StructuredSource {
                 observation_id: observation.observation_id.clone(),
                 artifact: artifacts
-                    .get(&observation.observation_id)
+                    .get(observation.observation_id.as_str())
                     .cloned()
                     .ok_or_else(|| {
                         format!("artifact missing for {}", observation.observation_id)
@@ -53,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<Vec<_>, String>>()?;
     let layout = ParameterBlockLayout::from_shapes(&shapes)?;
     let geometry = reconstruct_structured_geometry(
+        &root,
         &report.fields,
         &report.skill_source_mixtures,
         &sources,

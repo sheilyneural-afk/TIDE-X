@@ -1,5 +1,5 @@
 use cerebro_tidex::representation_evidence::record_representation_evidence;
-use cerebro_tidex::security::PRIVATE_ROOT;
+use cerebro_tidex::security::configured_private_root;
 use std::path::Path;
 
 fn main() {
@@ -16,8 +16,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(2).is_some() {
         return Err("usage: record_representation_evidence <sealed-install-request.json>".into());
     }
-    let receipt =
-        record_representation_evidence(Path::new(PRIVATE_ROOT), Path::new(&source_payload))?;
+    let private_root = configured_private_root()?;
+    let receipt = record_representation_evidence(&private_root, Path::new(&source_payload))?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(())
 }

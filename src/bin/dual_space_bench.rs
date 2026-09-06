@@ -1,5 +1,7 @@
 use cerebro_tidex::contracts::{BrainConfig, DeltaObservation};
-use cerebro_tidex::dual_space::{analyze_dual_space, DualSpaceModel, RepresentationObservation};
+use cerebro_tidex::dual_space::{
+    analyze_dual_space, DualSpaceAnalysisConfig, DualSpaceModel, RepresentationObservation,
+};
 use cerebro_tidex::engine::ReconstructionReport;
 use serde::Deserialize;
 use serde_json::json;
@@ -51,10 +53,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &model,
         &observations,
         &representations.observations,
-        cfg.ridge,
-        cfg.min_independent_apertures,
-        cfg.min_representation_match_accuracy,
-        cfg.min_representation_match_margin,
+        DualSpaceAnalysisConfig {
+            ridge: cfg.ridge,
+            minimum_independence_groups: cfg.min_independent_apertures,
+            minimum_representation_cv_r2: cfg.min_representation_cv_r2,
+            minimum_match_accuracy: cfg.min_representation_match_accuracy,
+            minimum_match_margin: cfg.min_representation_match_margin,
+        },
     )?;
     println!(
         "{}",

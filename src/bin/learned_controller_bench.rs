@@ -1,4 +1,5 @@
 use cerebro_tidex::contracts::SkillField;
+use cerebro_tidex::identity::SkillId;
 use cerebro_tidex::learned_controller::{
     execute_learned_winner_take_all, train_learned_controller, ControllerExample,
 };
@@ -6,11 +7,11 @@ use cerebro_tidex::linalg::norm;
 use cerebro_tidex::parametric_program::{compile_operator_to_fields, compose_skill_fields};
 use serde_json::json;
 
-fn field(id: &str, direction: Vec<f64>) -> SkillField {
-    SkillField {
-        skill_id: id.into(),
-        reconstruction_id: String::new(),
-        lineage_id: String::new(),
+fn field(id: &str, direction: Vec<f64>) -> Result<SkillField, Box<dyn std::error::Error>> {
+    Ok(SkillField {
+        skill_id: SkillId::parse(id)?,
+        reconstruction_id: Default::default(),
+        lineage_id: Default::default(),
         generation_created: 1,
         direction,
         structured_geometry: None,
@@ -26,15 +27,15 @@ fn field(id: &str, direction: Vec<f64>) -> SkillField {
         support: 4,
         functional_signature: Vec::new(),
         parent_skill_ids: Vec::new(),
-    }
+    })
 }
 
-fn fields() -> Vec<SkillField> {
+fn fields() -> Result<Vec<SkillField>, Box<dyn std::error::Error>> {
     // Non-orthogonal field basis spanning direct next-state logits [state0,state1].
-    vec![
-        field("field-a", vec![1.0, 0.25]),
-        field("field-b", vec![0.30, 1.0]),
-    ]
+    Ok(vec![
+        field("field-a", vec![1.0, 0.25])?,
+        field("field-b", vec![0.30, 1.0])?,
+    ])
 }
 
 fn state(index: usize) -> Vec<f64> {
@@ -149,7 +150,7 @@ fn blind_sequences() -> Vec<Vec<Vec<f64>>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let fields = fields();
+    let fields = fields()?;
     let examples = training_examples(&fields);
     let controller = train_learned_controller(&examples, 1e-8, 0.25)?;
     let observation_only =

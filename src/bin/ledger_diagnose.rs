@@ -1,13 +1,12 @@
 use cerebro_tidex::ledger::{self, LedgerEvent};
-use cerebro_tidex::security::PRIVATE_ROOT;
+use cerebro_tidex::security::configured_private_root;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = Path::new(PRIVATE_ROOT);
-    let status = ledger::verify(root)?;
+    let root = configured_private_root()?;
+    let status = ledger::verify(&root)?;
     let path = root.join("state/ledger.jsonl");
     let file = fs::File::open(&path)?;
     let mut parsed = 0u64;

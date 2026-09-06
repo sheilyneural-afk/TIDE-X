@@ -307,7 +307,10 @@ pub struct RelationalTransportMap {
 pub struct RelationalTransplant {
     pub target_coefficients: Vec<f64>,
     pub predicted_target_signature: Vec<f64>,
-    pub source_projection_cosine: f64,
+    /// Undefined when the learned anchor projection has zero norm. `None` is
+    /// evidence that the query lies outside represented source geometry; it
+    /// must not be replaced by a fabricated zero cosine.
+    pub source_projection_cosine: Option<f64>,
     pub coefficient_norm: f64,
     pub within_training_support: bool,
     pub resolved: bool,
@@ -490,12 +493,17 @@ impl RelationalTransportMap {
         let source_prediction = combine_anchors(&target_coefficients, &self.source_anchors)?;
         let predicted_target_signature =
             combine_anchors(&target_coefficients, &self.target_anchors)?;
-        let source_projection_cosine = cosine(&source_prediction, &normalized)?;
+        let source_projection_cosine = if norm(&source_prediction)? <= 1e-15 {
+            None
+        } else {
+            Some(cosine(&source_prediction, &normalized)?)
+        };
         let coefficient_norm = norm(&target_coefficients)?;
         let numerical_tolerance = f64::EPSILON.sqrt();
-        let within_training_support = source_projection_cosine + numerical_tolerance
-            >= self.min_loo_source_cosine
-            && coefficient_norm <= self.max_loo_coefficient_norm + numerical_tolerance;
+        let within_training_support = source_projection_cosine.is_some_and(|cosine| {
+            cosine + numerical_tolerance >= self.min_loo_source_cosine
+                && coefficient_norm <= self.max_loo_coefficient_norm + numerical_tolerance
+        });
         Ok(RelationalTransplant {
             target_coefficients,
             predicted_target_signature,
@@ -532,6 +540,7 @@ mod tests {
         assert!(valid.resolved);
         assert_eq!(valid.target_coefficients.len(), 5);
         let ood = map.transplant(&[0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(ood.source_projection_cosine, None);
         assert!(!ood.within_training_support);
         assert!(!ood.resolved);
     }

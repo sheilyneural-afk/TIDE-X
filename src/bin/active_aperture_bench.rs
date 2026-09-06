@@ -1,15 +1,11 @@
 use cerebro_tidex::active::plan_active_apertures;
 use cerebro_tidex::contracts::ApertureCandidate;
 use cerebro_tidex::engine::ReconstructionReport;
-use cerebro_tidex::linalg::{norm, Matrix};
+use cerebro_tidex::identity::ApertureId;
+use cerebro_tidex::linalg::{normalize, Matrix};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-
-fn normalize(values: &[f64]) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    let n = norm(values)?.max(1e-15);
-    Ok(values.iter().map(|value| value / n).collect())
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
@@ -17,15 +13,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: active_aperture_bench <tidex_report.json>")?;
     let report: ReconstructionReport = serde_json::from_slice(&fs::read(Path::new(&path))?)?;
     let covariance = Matrix::from_rows(&report.resolution_map.posterior_covariance)?;
-    if covariance.rows != report.fields.len()
+    if covariance.row_count() != report.fields.len()
         || report.field_coefficients.len() != report.observation_count
     {
         return Err("report posterior/field coefficient contract invalid".into());
     }
-    let mean_posterior_variance = (0..covariance.rows)
+    let mean_posterior_variance = (0..covariance.row_count())
         .map(|index| covariance.get(index, index))
         .sum::<f64>()
-        / covariance.rows as f64;
+        / covariance.row_count() as f64;
     let noise_variance = mean_posterior_variance.max(f64::EPSILON);
 
     let mut candidates = Vec::new();
@@ -33,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut direction = vec![0.0; report.fields.len()];
         direction[field_index] = 1.0;
         candidates.push(ApertureCandidate {
-            aperture_id: format!("isolate-field-{field_index}"),
+            aperture_id: ApertureId::parse(format!("isolate-field-{field_index}"))?,
             sensing_vector: direction,
             noise_variance,
             cost: 0.0,
@@ -42,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for (index, row) in report.field_coefficients.iter().enumerate() {
         candidates.push(ApertureCandidate {
-            aperture_id: format!("repeat-observed-direction-{index}"),
+            aperture_id: ApertureId::parse(format!("repeat-observed-direction-{index}"))?,
             sensing_vector: normalize(row)?,
             noise_variance,
             cost: 0.0,

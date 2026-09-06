@@ -1,15 +1,16 @@
 use cerebro_tidex::contracts::SkillField;
+use cerebro_tidex::identity::SkillId;
 use cerebro_tidex::parametric_program::{
     apply_parametric_transition, compile_operator_to_fields, compose_skill_fields,
     task_arithmetic_merge, ties_merge,
 };
 use serde_json::json;
 
-fn field(id: &str, direction: Vec<f64>) -> SkillField {
-    SkillField {
-        skill_id: id.into(),
-        reconstruction_id: String::new(),
-        lineage_id: String::new(),
+fn field(id: &str, direction: Vec<f64>) -> Result<SkillField, Box<dyn std::error::Error>> {
+    Ok(SkillField {
+        skill_id: SkillId::parse(id)?,
+        reconstruction_id: Default::default(),
+        lineage_id: Default::default(),
         generation_created: 1,
         direction,
         structured_geometry: None,
@@ -25,14 +26,14 @@ fn field(id: &str, direction: Vec<f64>) -> SkillField {
         support: 3,
         functional_signature: Vec::new(),
         parent_skill_ids: Vec::new(),
-    }
+    })
 }
 
-fn fields() -> Vec<SkillField> {
-    vec![
-        field("rotated-hold", vec![1.0, 0.35, 0.35, 1.0]),
-        field("rotated-toggle", vec![0.25, 1.0, 1.0, 0.25]),
-    ]
+fn fields() -> Result<Vec<SkillField>, Box<dyn std::error::Error>> {
+    Ok(vec![
+        field("rotated-hold", vec![1.0, 0.35, 0.35, 1.0])?,
+        field("rotated-toggle", vec![0.25, 1.0, 1.0, 0.25])?,
+    ])
 }
 
 fn operators() -> Vec<Vec<f64>> {
@@ -106,7 +107,7 @@ fn oracle_dynamic(tokens: &[usize], operators: &[Vec<f64>]) -> usize {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let fields = fields();
+    let fields = fields()?;
     let operators = operators();
     let task = task_arithmetic_merge(&operators, 0.5)?;
     let ties = ties_merge(&operators, 1.0)?;

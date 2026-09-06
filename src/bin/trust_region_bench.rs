@@ -1,9 +1,10 @@
 use cerebro_tidex::artifact::{read_dvec_f32, sha256_file};
 use cerebro_tidex::causal_credit::{certified_causal_priority_weights, CausalCreditReport};
 use cerebro_tidex::engine::ReconstructionReport;
+use cerebro_tidex::identity::SkillId;
 use cerebro_tidex::interaction::second_order_interactions;
 use cerebro_tidex::protected_map::{load_protected_cortex, ProtectedMapArtifactReport};
-use cerebro_tidex::security::PRIVATE_ROOT;
+use cerebro_tidex::security::configured_private_root;
 use cerebro_tidex::trust_region::apply_causal_priority_trust_region;
 use serde::Deserialize;
 use serde_json::json;
@@ -20,7 +21,7 @@ struct ProtectedWrapper {
 
 #[derive(Debug, Deserialize)]
 struct Assignment {
-    current_skill_id: String,
+    current_skill_id: SkillId,
     coefficient: f64,
     functional_cosine: f64,
 }
@@ -40,7 +41,7 @@ struct CausalCreditArtifact {
     replay_sha256: String,
     report_sha256: String,
     plan_sha256: String,
-    field_ids: Vec<String>,
+    field_ids: Vec<SkillId>,
     causal_credit: CausalCreditReport,
 }
 
@@ -84,8 +85,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("current trust-region input contract invalid".into());
     }
-    let root = Path::new(PRIVATE_ROOT);
-    let cortex = load_protected_cortex(root, &protected.map)?;
+    let root = configured_private_root()?;
+    let cortex = load_protected_cortex(&root, &protected.map)?;
     let dense_dim = cortex.parameter_importance.len();
     if dense_dim == 0 || protected.map.parameter_dimension != dense_dim {
         return Err("protected cortex dimension invalid".into());
@@ -110,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if reference.parameter_count != dense_dim as u64 {
             return Err("trust field dense dimension mismatch".into());
         }
-        let dense = read_dvec_f32(reference)?
+        let dense = read_dvec_f32(&root, reference)?
             .into_iter()
             .map(f64::from)
             .collect::<Vec<_>>();
@@ -139,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         diagonal_budget,
         &causal_priority_weights,
     )?;
-    let matrix = (0..interactions.rows)
+    let matrix = (0..interactions.row_count())
         .map(|row| interactions.row_vec(row))
         .collect::<Vec<_>>();
     println!(

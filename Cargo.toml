@@ -4,14 +4,22 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 publish = false
+autobins = false
+autotests = false
+autobenches = false
+autoexamples = false
+
+[features]
+default = []
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+rustix = { version = "=1.1.4", features = ["fs"] }
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "=0.10.9"
 
 [profile.release]
 lto = "thin"
@@ -19,5 +27,57 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+# Line tables preserve actionable backtraces without retaining the very large
+# full debug payload produced by the many test and diagnostic binaries.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [lints.rust]
 unsafe_code = "forbid"
+
+[[bin]]
+name = "cerebro-tidex"
+path = "src/main.rs"
+
+[[bin]]
+name = "acquire-system"
+path = "src/bin/acquire_system.rs"
+
+[[bin]]
+name = "adaptive-learning-cycle"
+path = "src/bin/adaptive_learning_cycle.rs"
+
+[[bin]]
+name = "autonomous-learning-plan"
+path = "src/bin/autonomous_learning_plan.rs"
+
+[[bin]]
+name = "ledger-diagnose"
+path = "src/bin/ledger_diagnose.rs"
+
+[[bin]]
+name = "pure-linear-runner"
+path = "src/bin/pure_linear_runner.rs"
+
+[[bin]]
+name = "record-representation-evidence"
+path = "src/bin/record_representation_evidence.rs"
+
+[[bin]]
+name = "tidex-finalize"
+path = "src/bin/tidex_finalize.rs"
+
+[[test]]
+name = "brain"
+path = "tests/brain.rs"
+
+[[test]]
+name = "production_surface"
+path = "tests/production_surface.rs"
+
+[[test]]
+name = "quality_properties"
+path = "tests/quality_properties.rs"

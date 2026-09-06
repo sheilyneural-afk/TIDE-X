@@ -1,0 +1,28 @@
+[package]
+name = "cerebro-tidex-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde = "=1.0.229"
+serde_json = "=1.0.151"
+cerebro-tidex = { path = "..", version = "=0.1.0" }
+
+[[bin]]
+name = "persisted-inputs"
+path = "fuzz_targets/persisted-inputs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multi-case-solver"
+path = "fuzz_targets/multi-case-solver.rs"
+test = false
+doc = false
+bench = false

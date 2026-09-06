@@ -10,7 +10,7 @@ use cerebro_tidex::learning_orchestrator::{
     load_persistent_adaptive_learning_receipt, start_persistent_adaptive_learning,
     AdaptiveLearningPolicy, LearningTarget,
 };
-use cerebro_tidex::security::{verify_private_root, PRIVATE_ROOT};
+use cerebro_tidex::security::configured_private_root;
 use serde_json::json;
 use std::error::Error;
 use std::fs;
@@ -29,7 +29,7 @@ fn read_confined_invocation(
 fn controller_compose(
     invocation_path: &str,
 ) -> Result<RecordedControllerExecution, Box<dyn Error>> {
-    let root = verify_private_root(Path::new(PRIVATE_ROOT))?;
+    let root = configured_private_root()?;
     let (_, invocation_raw) = read_confined_invocation(&root, invocation_path)?;
     let invocation: ControllerInvocation = serde_json::from_slice(&invocation_raw)?;
     let engine = BrainEngine::open(&root, BrainConfig::default())?;
@@ -91,40 +91,41 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Box<dyn st
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let command = arguments.first().map(String::as_str).ok_or_else(usage)?;
+    let root = configured_private_root()?;
     match command {
         "start" if arguments.len() == 4 => {
             let target: LearningTarget = read_json(&arguments[2])?;
             let policy: AdaptiveLearningPolicy = read_json(&arguments[3])?;
             print_receipt(start_persistent_adaptive_learning(
-                PRIVATE_ROOT,
+                &root,
                 &arguments[1],
                 &target,
                 &policy,
             )?)
         }
         "next" if arguments.len() == 2 => print_receipt(issue_next_persistent_learning_aperture(
-            PRIVATE_ROOT,
+            &root,
             &arguments[1],
         )?),
         "assimilate" if arguments.len() == 3 => print_receipt(
-            assimilate_persistent_learning_evidence(PRIVATE_ROOT, &arguments[1], &arguments[2])?,
+            assimilate_persistent_learning_evidence(&root, &arguments[1], &arguments[2])?,
         ),
         "show" if arguments.len() == 2 => print_receipt(load_persistent_adaptive_learning_receipt(
-            PRIVATE_ROOT,
+            &root,
             &arguments[1],
         )?),
         "controller-train" if arguments.len() == 4 => {
             let policy: LearnedControllerPolicy = read_json(&arguments[2])?;
             let binding: LearnedControllerBinding = read_json(&arguments[3])?;
             print_controller_receipt(train_persisted_runtime_learned_controller(
-                PRIVATE_ROOT,
+                &root,
                 &arguments[1],
                 &policy,
                 &binding,
             )?)
         }
         "controller-show" if arguments.len() == 2 => print_controller_receipt(
-            load_persisted_runtime_learned_controller(PRIVATE_ROOT, &arguments[1])?,
+            load_persisted_runtime_learned_controller(&root, &arguments[1])?,
         ),
         "controller-compose" if arguments.len() == 2 => {
             print_controller_execution(controller_compose(&arguments[1])?)

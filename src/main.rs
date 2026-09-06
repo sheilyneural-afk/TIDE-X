@@ -1,8 +1,10 @@
+use cerebro_tidex::authority::read_untrusted_private_file_bounded;
 use cerebro_tidex::contracts::{BrainConfig, DeltaObservation};
 use cerebro_tidex::engine::BrainEngine;
-use cerebro_tidex::security::PRIVATE_ROOT;
-use std::fs;
+use cerebro_tidex::security::configured_private_root;
 use std::path::Path;
+
+const MAX_ANALYZE_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 fn main() {
     if let Err(error) = run() {
@@ -20,21 +22,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.get(1).map(String::as_str).unwrap_or("status");
     match command {
         "status" => {
-            let engine = BrainEngine::open(PRIVATE_ROOT, BrainConfig::default())?;
+            let private_root = configured_private_root()?;
+            let engine = BrainEngine::open(&private_root, BrainConfig::default())?;
             println!("{}", serde_json::to_string_pretty(&engine.status()?)?);
         }
         "analyze" => {
             let observation_path = args.get(2).ok_or("observation JSON path required")?;
-            let observations: Vec<DeltaObservation> =
-                serde_json::from_slice(&fs::read(Path::new(observation_path))?)?;
-            let engine = BrainEngine::open(PRIVATE_ROOT, BrainConfig::default())?;
+            let private_root = configured_private_root()?;
+            let observations = load_analyze_observations(&private_root, Path::new(observation_path))?;
+            let engine = BrainEngine::open(&private_root, BrainConfig::default())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&engine.analyze(&observations)?)?
             );
         }
         "sleep" => {
-            let engine = BrainEngine::open(PRIVATE_ROOT, BrainConfig::default())?;
+            let private_root = configured_private_root()?;
+            let engine = BrainEngine::open(&private_root, BrainConfig::default())?;
             println!("{}", serde_json::to_string_pretty(&engine.sleep_cycle()?)?);
         }
         "commit" => {
@@ -62,4 +66,69 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn load_analyze_observations(
+    private_root: &Path,
+    observation_path: &Path,
+) -> Result<Vec<DeltaObservation>, Box<dyn std::error::Error>> {
+    let bytes = read_untrusted_private_file_bounded(
+        private_root,
+        observation_path,
+        MAX_ANALYZE_INPUT_BYTES,
+    )?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cerebro_tidex::security::{secure_dir, secure_file};
+    use std::fs;
+
+    fn private_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tidex-main-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        secure_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn analyze_input_is_confined_to_private_root_and_bounded() {
+        let root = private_root("input");
+        let input = root.join("observations.json");
+        fs::write(&input, b"[]").unwrap();
+        secure_file(&input).unwrap();
+        assert!(load_analyze_observations(&root, &input).unwrap().is_empty());
+
+        let outside = std::env::temp_dir().join(format!(
+            "tidex-main-outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&outside, b"[]").unwrap();
+        assert!(load_analyze_observations(&root, &outside).is_err());
+        let _ = fs::remove_file(outside);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyze_input_rejects_oversize_payload_before_json_parsing() {
+        let root = private_root("oversize");
+        let input = root.join("observations.json");
+        fs::write(&input, vec![b' '; MAX_ANALYZE_INPUT_BYTES as usize + 1]).unwrap();
+        secure_file(&input).unwrap();
+        assert!(load_analyze_observations(&root, &input).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

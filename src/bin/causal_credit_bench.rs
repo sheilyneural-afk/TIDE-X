@@ -1,7 +1,9 @@
 use cerebro_tidex::artifact::sha256_file;
 use cerebro_tidex::causal_credit::{estimate_causal_credit, CounterfactualEvaluation};
+use cerebro_tidex::identity::SkillId;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -10,7 +12,7 @@ struct ReplayPayload {
     schema: String,
     report_sha256: String,
     plan_sha256: String,
-    field_ids: Vec<String>,
+    field_ids: Vec<SkillId>,
     blind_data_accessed: bool,
     evaluations: Vec<CounterfactualEvaluation>,
 }
@@ -28,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || payload.report_sha256.len() != 64
         || payload.plan_sha256.len() != 64
         || payload.field_ids.is_empty()
+        || payload.field_ids.iter().collect::<BTreeSet<_>>().len() != payload.field_ids.len()
     {
         return Err("counterfactual replay contract invalid".into());
     }

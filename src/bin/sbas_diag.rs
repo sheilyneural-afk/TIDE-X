@@ -11,17 +11,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: sbas_diag <observations.json>")?;
     let obs: Vec<DeltaObservation> = serde_json::from_slice(&fs::read(Path::new(&path))?)?;
     let out = reconstruct_trajectory(&obs, 1e-6)?;
-    let first = &obs[0];
+    let first = obs
+        .first()
+        .ok_or("sbas_diag requires at least one observation")?;
     let i = out
         .checkpoint_order
         .iter()
         .position(|x| x == &first.from_checkpoint)
-        .unwrap();
+        .ok_or("reconstruction omitted the first source checkpoint")?;
     let j = out
         .checkpoint_order
         .iter()
         .position(|x| x == &first.to_checkpoint)
-        .unwrap();
+        .ok_or("reconstruction omitted the first destination checkpoint")?;
     let predicted = sub(&out.potentials[j], &out.potentials[i])?;
     println!(
         "{}",

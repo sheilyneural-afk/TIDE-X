@@ -4,6 +4,7 @@ use cerebro_tidex::cognitive_field::{
     CognitiveFieldConfig, CognitiveFieldDrive, DynamicCognitiveField,
 };
 use cerebro_tidex::engine::ReconstructionReport;
+use cerebro_tidex::identity::SkillId;
 use cerebro_tidex::linalg::Matrix;
 use serde::Deserialize;
 use serde_json::json;
@@ -14,7 +15,7 @@ use std::path::Path;
 struct TrustArtifact {
     schema: String,
     report_sha256: String,
-    field_ids: Vec<String>,
+    field_ids: Vec<SkillId>,
     interaction_matrix: Vec<Vec<f64>>,
 }
 
@@ -25,7 +26,7 @@ struct CausalArtifact {
     replay_sha256: String,
     report_sha256: String,
     plan_sha256: String,
-    field_ids: Vec<String>,
+    field_ids: Vec<SkillId>,
     causal_credit: CausalCreditReport,
 }
 
@@ -49,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|field| field.skill_id.clone())
         .collect::<Vec<_>>();
-    if report.schema != "cerebro.tidex.reconstruction/v6"
+    if report.schema != "cerebro.tidex.reconstruction/v7"
         || !report.promotion.allowed
         || report.fields.is_empty()
         || trust.schema != "cerebro.tidex.trust_region_benchmark/v3"
