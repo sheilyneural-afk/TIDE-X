@@ -44,7 +44,7 @@ for part in path.parts[1:]:
         raise SystemExit(2)
 PY
 
-mapfile -t RELEASE_META < <(python3 - "$RELEASE_DIR" "${EXPECTED_BINARIES[@]}" <<'PY'
+RELEASE_META_RAW=$(python3 - "$RELEASE_DIR" "${EXPECTED_BINARIES[@]}" <<'PY'
 import hashlib, json, os, re, stat, sys
 from pathlib import Path, PurePosixPath
 root=Path(sys.argv[1]); expected_bins=list(sys.argv[2:])
@@ -91,6 +91,21 @@ for line in lines:
 expected_subjects={'SBOM.spdx.json','release-manifest.json'}|{f'bin/{name}' for name in expected_bins}
 if set(sums)!=expected_subjects:
     print('release verification rejected: checksum_subject_set_invalid',file=sys.stderr); raise SystemExit(2)
+allowed_files=expected_subjects|{'SHA256SUMS','SHA256SUMS.asc','release-manifest.json.asc'}
+allowed_dirs={'bin'}
+for candidate in root.rglob('*'):
+    rel=candidate.relative_to(root).as_posix()
+    st=os.lstat(candidate)
+    if stat.S_ISLNK(st.st_mode):
+        print(f'release verification rejected: release_tree_symlink:{rel}',file=sys.stderr); raise SystemExit(2)
+    if stat.S_ISDIR(st.st_mode):
+        if rel not in allowed_dirs:
+            print(f'release verification rejected: release_tree_extra_directory:{rel}',file=sys.stderr); raise SystemExit(2)
+    elif stat.S_ISREG(st.st_mode):
+        if rel not in allowed_files:
+            print(f'release verification rejected: release_tree_extra_file:{rel}',file=sys.stderr); raise SystemExit(2)
+    else:
+        print(f'release verification rejected: release_tree_special_file:{rel}',file=sys.stderr); raise SystemExit(2)
 for rel,digest in sums.items():
     p=root.joinpath(*PurePosixPath(rel).parts)
     try: st=os.lstat(p)
@@ -117,7 +132,8 @@ print(manifest['target'])
 print('true' if manifest.get('license',{}).get('declared') is True else 'false')
 for rel in sorted(expected_subjects): print(rel)
 PY
-)
+) || exit 2
+mapfile -t RELEASE_META <<< "$RELEASE_META_RAW"
 [[ ${#RELEASE_META[@]} -ge 13 ]] || fail 'release_metadata_incomplete'
 RELEASE_ID=${RELEASE_META[0]}
 RELEASE_TARGET=${RELEASE_META[1]}
