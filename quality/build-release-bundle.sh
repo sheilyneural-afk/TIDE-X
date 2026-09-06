@@ -157,6 +157,8 @@ CARGO_LOCK_SHA256=$(sha256sum Cargo.lock | awk '{print $1}')
 CARGO_TOML_SHA256=$(sha256sum Cargo.toml | awk '{print $1}')
 BUILDER_SHA256=$(sha256sum quality/build-release-bundle.sh | awk '{print $1}')
 SIGNER_SHA256=$(sha256sum quality/sign-release.sh | awk '{print $1}')
+VERIFIER_SHA256=$(sha256sum quality/verify-release.sh | awk '{print $1}')
+INSTALL_MANAGER_SHA256=$(sha256sum quality/manage-release-installation.sh | awk '{print $1}')
 TAR_VERSION=$(tar --version | head -1)
 ZSTD_VERSION=$(zstd --version | head -1)
 
@@ -166,8 +168,8 @@ python3 - \
     "$HEAD_COMMIT" "$HEAD_TREE" "$SOURCE_DATE_EPOCH" "$SOURCE_TREE_DIGEST" \
     "$RUSTC_RELEASE" "$RUSTC_COMMIT" "$RUSTC_COMMIT_DATE" "$LLVM_VERSION" \
     "$CARGO_LOCK_SHA256" "$CARGO_TOML_SHA256" "$SYFT_VERSION" "$SBOM_SHA256" \
-    "$BUILDER_SHA256" "$SIGNER_SHA256" "$LICENSE_DECLARED" "$PACKAGE_LICENSE" \
-    "$PACKAGE_LICENSE_FILE" "$TAR_VERSION" "$ZSTD_VERSION" \
+    "$BUILDER_SHA256" "$SIGNER_SHA256" "$VERIFIER_SHA256" "$INSTALL_MANAGER_SHA256" \
+    "$LICENSE_DECLARED" "$PACKAGE_LICENSE" "$PACKAGE_LICENSE_FILE" "$TAR_VERSION" "$ZSTD_VERSION" \
     "${BINARIES[@]}" <<'PY'
 import hashlib
 import json
@@ -177,8 +179,8 @@ from pathlib import Path
 (
     out,package_name,version,target,commit,tree,epoch,source_digest,
     rustc_release,rustc_commit,rustc_date,llvm_version,cargo_lock_sha,cargo_toml_sha,
-    syft_version,sbom_sha,builder_sha,signer_sha,license_declared,license_expr,
-    license_file,tar_version,zstd_version,*binary_names
+    syft_version,sbom_sha,builder_sha,signer_sha,verifier_sha,install_manager_sha,
+    license_declared,license_expr,license_file,tar_version,zstd_version,*binary_names
 )=sys.argv[1:]
 root=Path(out).parent
 binaries=[]
@@ -227,6 +229,8 @@ manifest={
     'release_tooling':{
         'builder_sha256':builder_sha,
         'signer_sha256':signer_sha,
+        'verifier_sha256':verifier_sha,
+        'install_manager_sha256':install_manager_sha,
         'tar':tar_version,
         'zstd':zstd_version,
     },
