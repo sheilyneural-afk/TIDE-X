@@ -84,6 +84,7 @@ shellcheck -x \
     quality/verify-release.sh \
     quality/sign-release.sh \
     quality/manage-release-installation.sh \
+    quality/verify-p3-reuse.sh \
     quality/gate4-release-readiness.sh
 
 QUALITY_HEAD=$(git rev-parse HEAD)
@@ -104,11 +105,30 @@ snapshot_checkout "$QUALITY_TMP/checkout-before"
 QUALITY_CHECKOUT_SHA256=$(sha_file "$QUALITY_TMP/checkout-before.sha256")
 QUALITY_METADATA_SHA256=$(sha_file "$QUALITY_TMP/checkout-before.metadata")
 
-# P4 is cumulative. No release-readiness result is accepted without the full P3 chain.
-P3_RECEIPT="$QUALITY_TMP/p3-receipt.json"
-QUALITY_RECEIPT_PATH="$P3_RECEIPT" bash quality/gate3-assurance.sh 2>&1 | tee "$QUALITY_TMP/p3.log"
-sha256sum -c "${P3_RECEIPT}.sha256" >/dev/null
-P3_RECEIPT_SHA256=$(sha_file "$P3_RECEIPT")
+# P4 is cumulative by evidence, not by blind re-execution. P3 may be reused only
+# when verify-p3-reuse.sh proves that every closed P0-P3 input and both pinned
+# toolchains are byte-identical to the frozen P3 evidence snapshot.
+P3_SOURCE_RECEIPT="quality/evidence/p3/receipt.json"
+P3_REUSE_RECEIPT="$QUALITY_TMP/p3-reuse.json"
+if ! QUALITY_P3_REUSE_RECEIPT_PATH="$P3_REUSE_RECEIPT" \
+    quality/verify-p3-reuse.sh 2>&1 | tee "$QUALITY_TMP/p3-reuse.log"; then
+    fail 'P3 reusable evidence invalid; rerun Gate3 before Gate4'
+fi
+sha256sum -c "${P3_REUSE_RECEIPT}.sha256" >/dev/null
+P3_SOURCE_RECEIPT_SHA256=$(sha_file "$P3_SOURCE_RECEIPT")
+P3_REUSE_RECEIPT_SHA256=$(sha_file "$P3_REUSE_RECEIPT")
+
+# Cheap current-environment checks stay fresh even when the expensive P3
+# evidence is reused. They do not repeat tests, fuzzing, Miri or sanitizers.
+cargo fmt --all -- --check
+cargo metadata --offline --locked --format-version 1 --no-deps > "$QUALITY_TMP/root-metadata.json"
+cargo metadata --manifest-path fuzz/Cargo.toml --offline --locked --format-version 1 --no-deps > "$QUALITY_TMP/fuzz-metadata.json"
+cargo audit --no-fetch --deny warnings > "$QUALITY_TMP/root-audit.log"
+cargo audit --file fuzz/Cargo.lock --no-fetch --deny warnings > "$QUALITY_TMP/fuzz-audit.log"
+cargo deny --manifest-path Cargo.toml --config deny.toml --offline --locked \
+    check advisories bans licenses sources > "$QUALITY_TMP/root-deny.log"
+cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml --offline --locked \
+    check advisories bans licenses sources > "$QUALITY_TMP/fuzz-deny.log"
 
 # Build the current release twice. Each builder run itself also performs two
 # independent release builds, so this tests both binary and complete-bundle reproducibility.
@@ -284,6 +304,7 @@ QUALITY_BUILDER_SHA256=$(sha_file quality/build-release-bundle.sh)
 QUALITY_VERIFIER_SHA256=$(sha_file quality/verify-release.sh)
 QUALITY_SIGNER_SHA256=$(sha_file quality/sign-release.sh)
 QUALITY_INSTALLER_SHA256=$(sha_file quality/manage-release-installation.sh)
+QUALITY_P3_REUSE_VERIFIER_SHA256=$(sha_file quality/verify-p3-reuse.sh)
 CURRENT_MANIFEST_SHA256=$(sha_file "$CURRENT_RELEASE_A/release-manifest.json")
 CURRENT_SBOM_SHA256=$(sha_file "$CURRENT_RELEASE_A/SBOM.spdx.json")
 PREVIOUS_MANIFEST_SHA256=$(sha_file "$PREVIOUS_RELEASE/release-manifest.json")
@@ -296,18 +317,18 @@ PUBLIC_BLOCKERS_FILE="$QUALITY_TMP/public-blockers.txt"
 echo production_distribution_signature_not_performed >> "$PUBLIC_BLOCKERS_FILE"
 
 python3 - \
-    "$QUALITY_P4_RECEIPT_PATH" "$P3_RECEIPT" "$FINAL_ACTIVATION" "$PUBLIC_BLOCKERS_FILE" \
+    "$QUALITY_P4_RECEIPT_PATH" "$P3_REUSE_RECEIPT" "$FINAL_ACTIVATION" "$PUBLIC_BLOCKERS_FILE" \
     "$QUALITY_HEAD" "$QUALITY_PARENT" "$QUALITY_CHECKOUT_SHA256" "$QUALITY_METADATA_SHA256" \
-    "$QUALITY_START_EPOCH" "$QUALITY_END_EPOCH" "$P3_RECEIPT_SHA256" \
+    "$QUALITY_START_EPOCH" "$QUALITY_END_EPOCH" "$P3_SOURCE_RECEIPT_SHA256" "$P3_REUSE_RECEIPT_SHA256" \
     "$QUALITY_GATE4_SHA256" "$QUALITY_BUILDER_SHA256" "$QUALITY_VERIFIER_SHA256" \
-    "$QUALITY_SIGNER_SHA256" "$QUALITY_INSTALLER_SHA256" "$CURRENT_ID" "$CURRENT_ARCHIVE_SHA256" \
+    "$QUALITY_SIGNER_SHA256" "$QUALITY_INSTALLER_SHA256" "$QUALITY_P3_REUSE_VERIFIER_SHA256" "$CURRENT_ID" "$CURRENT_ARCHIVE_SHA256" \
     "$CURRENT_MANIFEST_SHA256" "$CURRENT_SBOM_SHA256" "$CURRENT_BUNDLE_INVENTORY_SHA256" \
     "$PREVIOUS_ID" "$PREVIOUS_ARCHIVE_SHA256" "$PREVIOUS_MANIFEST_SHA256" "$PREVIOUS_SBOM_SHA256" \
     "$P4_TEST_FINGERPRINT" "$STATE_SENTINEL_SHA256" <<'PY'
 import json, pathlib, sys
 (
     out,p3_path,activation_path,blockers_path,head,parent,checkout_sha,metadata_sha,
-    started,finished,p3_sha,gate4_sha,builder_sha,verifier_sha,signer_sha,installer_sha,
+    started,finished,p3_source_sha,p3_reuse_sha,gate4_sha,builder_sha,verifier_sha,signer_sha,installer_sha,p3_reuse_verifier_sha,
     current_id,current_archive_sha,current_manifest_sha,current_sbom_sha,current_inventory_sha,
     previous_id,previous_archive_sha,previous_manifest_sha,previous_sbom_sha,test_fingerprint,state_sha,
 )=sys.argv[1:]
@@ -330,9 +351,13 @@ receipt={
     'duration_seconds':int(finished)-int(started),
     'cumulative_p3':{
         'result':p3.get('result'),
-        'receipt_sha256':p3_sha,
+        'source_receipt_sha256':p3_source_sha,
+        'reuse_receipt_sha256':p3_reuse_sha,
+        'frozen_snapshot_commit':p3.get('frozen_snapshot_commit'),
+        'reusable_inputs_sha256':p3.get('reusable_inputs_sha256'),
+        'reusable_input_file_count':p3.get('reusable_input_file_count'),
         'p2_coverage':p3.get('p2_coverage'),
-        'required_assurance_tests':len(p3.get('required_assurance_tests',[])),
+        'required_assurance_tests':p3.get('required_assurance_tests'),
     },
     'release_tooling_sha256':{
         'gate4':gate4_sha,
@@ -340,6 +365,7 @@ receipt={
         'verifier':verifier_sha,
         'signer':signer_sha,
         'install_manager':installer_sha,
+        'p3_reuse_verifier':p3_reuse_verifier_sha,
     },
     'current_release':{
         'release_id':current_id,
@@ -378,6 +404,7 @@ receipt={
     'limitations':[
         'OpenPGP evidence uses an ephemeral test key, not a production distribution identity',
         'public promotion remains separate from technical release readiness',
+        'P3 is reused only after byte-identical closed-input and toolchain verification; any drift requires a fresh Gate3 run',
         'product licensing is not inferred or invented by the gate',
         'target portability is demonstrated for the host target exercised by this gate',
     ],

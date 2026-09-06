@@ -155,7 +155,11 @@ quality/gate3-assurance.sh
 
 ## Puerta 4: Release Readiness técnica
 
-`quality/gate4-release-readiness.sh` es acumulativa sobre P3. Sólo se ejecuta sobre Git limpio, toma un snapshot de modos/tamaños/SHA-256 del checkout y exige el mismo snapshot al terminar.
+`quality/gate4-release-readiness.sh` es acumulativa por evidencia sobre P3, no por reejecución ciega. Sólo se ejecuta sobre Git limpio, toma un snapshot de modos/tamaños/SHA-256 del checkout y exige el mismo snapshot al terminar. Antes de construir una release, `quality/verify-p3-reuse.sh` debe demostrar que el receipt P3 canónico sigue ligado a su snapshot histórico y que el conjunto cerrado de 101 inputs P0–P3 conserva exactamente el mismo digest y los mismos toolchains. Si cualquiera cambia, P4 falla con exigencia de rerun de Gate3; no inicia automáticamente otra campaña larga.
+
+La evidencia reutilizable está versionada en `quality/evidence/p3/`: `receipt.json` conserva el receipt P3, `receipt.sha256` su identidad y `reuse-anchor.json` fija `43588d43d76269258efd6928b098369030f049cb`, su parent P2, el manifiesto histórico completo y el digest `33369800e83b4e7261a6eedc0449e650cd7dbec8ab093c46a979185a5162bfdc` de los 101 inputs reutilizables. El verificador reconstruye el manifiesto original desde objetos Git más los cuatro hashes ignorados históricos; no depende de `/tmp`.
+
+Cuando P3 se reutiliza, Gate4 mantiene comprobaciones frescas y baratas: `cargo fmt --check`, metadata offline/locked, `cargo audit --no-fetch` para raíz y fuzz, y `cargo deny` para ambas políticas. No repite tests, 100k fuzz, Miri ni sanitizadores mientras los inputs P0–P3 sigan idénticos.
 
 La producción del artefacto usa `quality/build-release-bundle.sh`. Cada invocación realiza dos builds independientes de los ocho binarios con Cargo offline/locked y falla si cualquier ejecutable difiere byte a byte. Después genera un SBOM SPDX 2.3 normalizado, `release-manifest.json`, `SHA256SUMS` y un `.tar.zst` determinista. El manifest liga commit/tree Git, `TIDEX_SOURCE_TREE_DIGEST`, toolchain, `Cargo.toml`, `Cargo.lock`, hashes de los ocho binarios, SBOM y hashes del builder, signer, verifier y gestor de instalación. Gate4 ejecuta el builder dos veces más y compara el contenedor completo, incluidos modos y SHA-256, para comprobar reproducibilidad a nivel de bundle.
 
