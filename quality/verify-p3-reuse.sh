@@ -186,6 +186,6 @@ result={
 if output_path:
     out=pathlib.Path(output_path)
     out.write_text(json.dumps(result,sort_keys=True,indent=2)+'\n')
-    pathlib.Path(str(out)+'.sha256').write_text(hashlib.sha256(out.read_bytes()).hexdigest()+'  '+out.name+'\n')
+    pathlib.Path(str(out)+'.sha256').write_text(hashlib.sha256(out.read_bytes()).hexdigest()+'  '+str(out)+'\n')
 print('P3_REUSE_VERIFIED current_head='+result['current_head']+' inputs='+current_digest+' files='+str(len(current_rows)))
 PY
