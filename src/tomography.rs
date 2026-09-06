@@ -428,7 +428,13 @@ pub fn assimilate_bank(
         }
     }
     next.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
-    bank.generation = bank.generation.saturating_add(1);
+    let next_revision = bank.generation.saturating_add(1);
+    let newest_field_generation = next
+        .iter()
+        .map(|field| field.generation_created)
+        .max()
+        .unwrap_or(next_revision);
+    bank.generation = next_revision.max(newest_field_generation);
     bank.fields = next;
     Ok(())
 }
@@ -477,7 +483,13 @@ pub fn reconcile_full_corpus(
         }
     }
     next.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
-    bank.generation = bank.generation.saturating_add(1);
+    let next_revision = bank.generation.saturating_add(1);
+    let newest_field_generation = next
+        .iter()
+        .map(|field| field.generation_created)
+        .max()
+        .unwrap_or(next_revision);
+    bank.generation = next_revision.max(newest_field_generation);
     bank.fields = next;
     Ok(())
 }
@@ -620,9 +632,14 @@ mod tests {
             fields: vec![f1],
         };
         let f1_incoming = test_field("f1-incoming", vec![1.0, 0.0], &[b"ev2"], 0.8, 0.9);
-        let f2_incoming = test_field("f2", vec![0.0, 1.0], &[b"ev3"], 0.8, 0.9);
+        let mut f2_incoming = test_field("f2", vec![0.0, 1.0], &[b"ev3"], 0.8, 0.9);
+        f2_incoming.generation_created = 9;
         assimilate_bank(&mut bank, &[f1_incoming, f2_incoming], 0.8).unwrap();
-        assert_eq!(bank.generation, 2);
+        assert_eq!(bank.generation, 9);
+        assert!(bank
+            .fields
+            .iter()
+            .all(|field| field.generation_created <= bank.generation));
         assert_eq!(bank.fields.len(), 2);
         let f1_merged = bank
             .fields
@@ -657,13 +674,35 @@ mod tests {
             generation: 1,
             fields: vec![f1, f2_decaying, f3_dropping],
         };
-        // incoming only matches f1
-        let incoming = vec![test_field("f1-match", vec![1.0, 0.0], &[b"ev1"], 0.9, 0.9)];
+        // Incoming matches durable f1. Its later reconstruction generation must
+        // not rewrite the original capability-creation generation.
+        let mut incoming_field = test_field("f1-match", vec![1.0, 0.0], &[b"ev1"], 0.9, 0.9);
+        incoming_field.generation_created = 36;
+        let incoming = vec![incoming_field];
         reconcile_full_corpus(&mut bank, &incoming, 0.8).unwrap();
         assert_eq!(bank.generation, 2);
+        assert_eq!(
+            bank.fields
+                .iter()
+                .find(|field| field.skill_id.as_str() == "f1")
+                .unwrap()
+                .generation_created,
+            1
+        );
         // f1 is matched, f2 decayed (0.5 * 0.85 = 0.425 >= 0.15), f3 dropped (0.15 * 0.85 = 0.1275 < 0.15)
         assert!(bank.fields.iter().any(|f| f.skill_id.as_str() == "f1"));
         assert!(bank.fields.iter().any(|f| f.skill_id.as_str() == "f2"));
         assert!(!bank.fields.iter().any(|f| f.skill_id.as_str() == "f3"));
+    }
+    #[test]
+    fn reconcile_full_corpus_bootstrap_tracks_new_field_generation() {
+        let mut bank = SkillBank::default();
+        let mut incoming = test_field("future-field", vec![1.0, 0.0], &[b"ev-future"], 0.9, 0.9);
+        incoming.generation_created = 36;
+        reconcile_full_corpus(&mut bank, &[incoming], 0.8).unwrap();
+        assert_eq!(bank.generation, 36);
+        assert_eq!(bank.fields.len(), 1);
+        assert_eq!(bank.fields[0].generation_created, 36);
+        assert!(bank.fields[0].generation_created <= bank.generation);
     }
 }

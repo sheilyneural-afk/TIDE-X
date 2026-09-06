@@ -12,6 +12,21 @@ pub(super) fn serialize_pretty_line<T: Serialize>(value: &T) -> BrainResult<Vec<
     Ok(bytes)
 }
 
+pub(super) fn normalize_reconstruction_report_wire(
+    report: &ReconstructionReport,
+) -> BrainResult<(ReconstructionReport, Vec<u8>)> {
+    let first_bytes = serialize_pretty_line(report)?;
+    let normalized: ReconstructionReport = serde_json::from_slice(&first_bytes)?;
+    let canonical_bytes = serialize_pretty_line(&normalized)?;
+    let stable: ReconstructionReport = serde_json::from_slice(&canonical_bytes)?;
+    if stable != normalized {
+        return Err(BrainError::Integrity(
+            "reconstruction_report_wire_representation_unstable".into(),
+        ));
+    }
+    Ok((normalized, canonical_bytes))
+}
+
 pub(super) fn read_private_json<T: DeserializeOwned>(
     root: &Path,
     path: &Path,
@@ -390,24 +405,66 @@ pub(super) fn attach_evidence_support(
                 field.skill_id
             )));
         }
-        let mut digests = indices
+        let mut support_pairs = indices
             .into_iter()
             .map(|index| {
-                Ok(ObservationRecordDigest::from(Sha256Digest::parse(
-                    digest_json(&observations[index])?,
-                )?))
+                Ok((
+                    ObservationRecordDigest::from(Sha256Digest::parse(digest_json(
+                        &observations[index],
+                    )?)?),
+                    mixture[index],
+                ))
             })
             .collect::<BrainResult<Vec<_>>>()?;
-        digests.sort();
-        digests.dedup();
-        if digests.is_empty() {
+        support_pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        if support_pairs.is_empty() || support_pairs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(BrainError::Integrity(format!(
                 "field_evidence_support_invalid:{}",
                 field.skill_id
             )));
         }
+        let digests = support_pairs
+            .iter()
+            .map(|(digest, _)| digest.clone())
+            .collect::<Vec<_>>();
         field.support = digests.len();
         field.evidence_support_digests = digests;
+
+        let reconstruction_unassigned = field.reconstruction_id.is_unassigned();
+        let lineage_unassigned = field.lineage_id.is_unassigned();
+        if reconstruction_unassigned != lineage_unassigned {
+            return Err(BrainError::Integrity(format!(
+                "field_reconstruction_identity_partial:{}",
+                field.skill_id
+            )));
+        }
+        if reconstruction_unassigned {
+            let mut reconstruction = Sha256::new();
+            reconstruction.update(b"CEREBRO:TIDEX:SPECTRAL-RECONSTRUCTION:v1\0");
+            reconstruction.update((field.skill_id.as_str().len() as u64).to_be_bytes());
+            reconstruction.update(field.skill_id.as_str().as_bytes());
+            reconstruction.update(field.generation_created.to_be_bytes());
+            reconstruction.update((support_pairs.len() as u64).to_be_bytes());
+            for (digest, coefficient) in &support_pairs {
+                reconstruction.update(digest.as_str().as_bytes());
+                reconstruction.update(coefficient.to_bits().to_be_bytes());
+            }
+            for values in [&field.direction, &field.functional_signature] {
+                reconstruction.update((values.len() as u64).to_be_bytes());
+                for value in values {
+                    reconstruction.update(value.to_bits().to_be_bytes());
+                }
+            }
+            let reconstruction_digest = format!("{:x}", reconstruction.finalize());
+            field.reconstruction_id =
+                ReconstructionId::parse(format!("recon-{reconstruction_digest}"))?;
+
+            let mut lineage = Sha256::new();
+            lineage.update(b"CEREBRO:TIDEX:SPECTRAL-LINEAGE:v1\0");
+            lineage.update(reconstruction_digest.as_bytes());
+            let lineage_digest = format!("{:x}", lineage.finalize());
+            field.lineage_id = LineageId::parse(format!("lineage-{}", &lineage_digest[..32]))?;
+        }
     }
     Ok(())
 }
@@ -1421,6 +1478,8 @@ pub fn load_verified_governed_composition_receipt(
     let source = receipt.source_observation_sha256.as_str();
     engine.require_current_observation_digest(source)?;
     let recomposed = engine.compose(&receipt.requested_activation)?;
+    let expected_trust: TrustRegionResult =
+        serde_json::from_slice(&serde_json::to_vec(&recomposed.trust_region)?)?;
     let expected_protection = GovernedCompositionProtection {
         damage_ratio: recomposed.protection.damage_ratio,
         allowed: recomposed.protection.allowed,
@@ -1428,8 +1487,9 @@ pub fn load_verified_governed_composition_receipt(
         protected_rank: recomposed.protection.protected_rank,
         max_weighted_residual: recomposed.protection.max_weighted_residual,
     };
-    if recomposed.trust_region != receipt.trust_region || expected_protection != receipt.protection
-    {
+    let expected_protection: GovernedCompositionProtection =
+        serde_json::from_slice(&serde_json::to_vec(&expected_protection)?)?;
+    if expected_trust != receipt.trust_region || expected_protection != receipt.protection {
         return Err(BrainError::Integrity(
             "governed_composition_receipt_recomposition_mismatch".into(),
         ));
@@ -1617,12 +1677,13 @@ pub(super) fn load_verified_learning_finalization_receipt_under_root(
             "learning_finalization_receipt_report_corpus_invalid".into(),
         ));
     }
-    let mut rederived_report = engine.analyze_canonical(&input_observations)?;
+    let rederived_report = engine.analyze_canonical(&input_observations)?;
     if !rederived_report.promotion.allowed {
         return Err(BrainError::Integrity(
             "learning_finalization_receipt_rederived_report_not_promotable".into(),
         ));
     }
+    let (mut rederived_report, _) = normalize_reconstruction_report_wire(&rederived_report)?;
     let mut recorded_report_without_dense = report.clone();
     for field in &mut recorded_report_without_dense.fields {
         field.dense_materialization = None;

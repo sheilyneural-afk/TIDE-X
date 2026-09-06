@@ -72,7 +72,7 @@ pub(super) use crate::engine_head::{
 pub(super) use crate::error::{BrainError, BrainResult};
 pub(super) use crate::functional::{attach_signatures, fit_functional_map};
 pub(super) use crate::identifiability::{resolution_map, ResolutionMap};
-pub(super) use crate::identity::{SessionId, SkillId};
+pub(super) use crate::identity::{LineageId, ReconstructionId, SessionId, SkillId};
 pub(super) use crate::learned_controller::{
     load_persisted_runtime_learned_controller, RuntimeLearnedController,
 };
@@ -242,6 +242,39 @@ mod tests {
         attach_evidence_support(&mut fields, &[vec![1.0, 0.0]], &observations).unwrap();
         assert_eq!(fields[0].support, 1);
         assert_eq!(fields[0].evidence_support_digests.len(), 1);
+
+        let mut spectral_a = sample_field("spectral-alpha");
+        spectral_a.reconstruction_id = ReconstructionId::unassigned();
+        spectral_a.lineage_id = LineageId::unassigned();
+        let mut spectral_b = spectral_a.clone();
+        attach_evidence_support(
+            std::slice::from_mut(&mut spectral_a),
+            &[vec![0.75, 0.25]],
+            &observations,
+        )
+        .unwrap();
+        attach_evidence_support(
+            std::slice::from_mut(&mut spectral_b),
+            &[vec![0.75, 0.25]],
+            &observations,
+        )
+        .unwrap();
+        assert!(!spectral_a.reconstruction_id.is_unassigned());
+        assert!(!spectral_a.lineage_id.is_unassigned());
+        assert_eq!(spectral_a.reconstruction_id, spectral_b.reconstruction_id);
+        assert_eq!(spectral_a.lineage_id, spectral_b.lineage_id);
+
+        let mut partial_identity = sample_field("spectral-partial");
+        partial_identity.lineage_id = LineageId::unassigned();
+        assert!(matches!(
+            attach_evidence_support(
+                std::slice::from_mut(&mut partial_identity),
+                &[vec![1.0, 0.0]],
+                &observations,
+            ),
+            Err(BrainError::Integrity(message))
+                if message.contains("field_reconstruction_identity_partial")
+        ));
 
         let mut invalid_fields = vec![sample_field("skill-alpha")];
         let err =
@@ -2010,119 +2043,177 @@ mod tests {
 
         let mut c = base.clone();
         c.min_independent_apertures = 1;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_independent_apertures = MAX_ENGINE_INDEPENDENCE_GROUPS + 1;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_observations = 3;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_observations = MAX_ENGINE_OBSERVATIONS + 1;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.max_rank = 0;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.max_rank = MAX_ENGINE_SKILL_FIELDS + 1;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.target_explained_variance = -0.1;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.target_explained_variance = 1.1;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.ridge = 0.0;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.huber_delta = 0.0;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.irls_rounds = 0;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.irls_rounds = MAX_ENGINE_IRLS_ROUNDS + 1;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.skill_match_cosine = -0.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.skill_match_cosine = 1.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_functional_cv_r2 = 1.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.max_cycle_rms = -0.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_skill_coherence = -0.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_skill_coherence = 1.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_skill_persistence = -0.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_skill_persistence = 1.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_field_explained_variance = -0.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_field_explained_variance = 1.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.max_condition_estimate = 0.99;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.max_spectral_normalized_reconstruction_rms = -0.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_identifiability_signal_to_noise = 0.0;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_representation_match_accuracy = -0.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_representation_match_accuracy = 1.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_representation_match_margin = -0.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
 
         let mut c = base.clone();
         c.min_representation_cv_r2 = 1.01;
-        assert!(matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid"));
+        assert!(
+            matches!(validate_brain_config(&c), Err(BrainError::Invalid(m)) if m == "brain_config_invalid")
+        );
     }
 
     #[test]
@@ -2359,7 +2450,8 @@ mod tests {
                 shape: vec![2],
                 count: 2,
             },
-        ]).unwrap();
+        ])
+        .unwrap();
         let mut layout_bytes = serde_json::to_vec_pretty(&layout).unwrap();
         layout_bytes.push(b'\n');
         let layout_sha = Sha256Digest::digest_bytes(&layout_bytes);
@@ -2403,7 +2495,9 @@ mod tests {
 
         // 4. Dense count mismatch
         let writer = crate::artifact::ArtifactWriteAuthority::for_internal_root(&root).unwrap();
-        let dense_wrong_count = writer.create_content_addressed_dvec(&[1.0, 2.0, 3.0]).unwrap();
+        let dense_wrong_count = writer
+            .create_content_addressed_dvec(&[1.0, 2.0, 3.0])
+            .unwrap();
         let mut f5 = sample_field("skill-5");
         f5.parameter_layout_sha256 = Some(layout_sha.clone());
         f5.structured_geometry = Some(geom.clone());
@@ -2417,7 +2511,32 @@ mod tests {
             Err(BrainError::Integrity(m)) if m.contains("runtime_composition_dense_count_mismatch")
         ));
 
-        // 5. Valid dense matching layout count = 2
+        // 5. A syntactically valid dense identity bound to a non-authority path
+        // must be rejected by the root-bound descriptor verifier.
+        let mut invalid_path_field = sample_field("skill-invalid-path");
+        invalid_path_field.parameter_layout_sha256 = Some(layout_sha.clone());
+        invalid_path_field.structured_geometry = Some(crate::contracts::SkillSubspaceGeometry {
+            skill_id: invalid_path_field.skill_id.clone(),
+            source_support_indices: vec![0],
+            blocks: vec![],
+            max_local_rank: 1,
+            mean_effective_rank: 1.0,
+        });
+        invalid_path_field.dense_materialization = Some(crate::artifact::DeltaArtifactRef {
+            path: root.join("state/not-an-authorized-delta.dvec"),
+            sha256: Sha256Digest::digest_bytes(b"not-authorized"),
+            parameter_count: 2,
+        });
+        let invalid_path_bank = SkillBank {
+            generation: 1,
+            fields: vec![invalid_path_field],
+        };
+        assert!(matches!(
+            engine.verify_runtime_composition_bank(&invalid_path_bank),
+            Err(BrainError::Integrity(m)) if m.contains("runtime_composition_dense_invalid")
+        ));
+
+        // 6. Valid dense matching layout count = 2
         let dense_valid = writer.create_content_addressed_dvec(&[1.0, 2.0]).unwrap();
         let mut f6 = sample_field("skill-6");
         f6.parameter_layout_sha256 = Some(layout_sha);
@@ -2518,6 +2637,300 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn install_revoked_sleep_fixture(
+        label: &str,
+        bank_bytes: Option<&[u8]>,
+        evidence_bytes: Option<&[u8]>,
+    ) -> (PathBuf, BrainEngine, SleepReceipt, Value) {
+        let root = isolated_engine_root(label);
+        let engine = BrainEngine {
+            root: root.clone(),
+            config: BrainConfig::default(),
+        };
+        for directory in [
+            root.join("state/reports"),
+            root.join("state/memory/by-sha"),
+            root.join("state/sleep/by-sha"),
+            root.join("state/sleep_receipts"),
+            root.join("state/skill_banks/by-sha"),
+            root.join("state/sleep_evidence/by-sha"),
+        ] {
+            ensure_private_directory(&root, &directory).unwrap();
+        }
+
+        let report_bytes = format!("report:{label}\n").into_bytes();
+        let memory_bytes = format!("memory:{label}\n").into_bytes();
+        let report_sha256 = ReportDigest::from(Sha256Digest::digest_bytes(&report_bytes));
+        let memory_sha256 = MemoryDigest::from(Sha256Digest::digest_bytes(&memory_bytes));
+        let active_bank_sha256 =
+            bank_bytes.map(|bytes| SkillBankDigest::from(Sha256Digest::digest_bytes(bytes)));
+        let evidence_bundle_sha256 = evidence_bytes
+            .map(|bytes| EvidenceBundleDigest::from(Sha256Digest::digest_bytes(bytes)));
+        let analysis_key =
+            Sha256Digest::digest_bytes(format!("analysis:{label}").as_bytes()).into_string();
+        let operation_key = sleep_operation_key(
+            &analysis_key,
+            evidence_bundle_sha256.as_deref(),
+            CertificationStatus::Revoked,
+            active_bank_sha256.as_deref(),
+        );
+        let corpus_digest = CorpusDigest::from(Sha256Digest::digest_bytes(
+            format!("corpus:{label}").as_bytes(),
+        ));
+        let source_tree_digest = SourceTreeDigest::from(Sha256Digest::digest_bytes(
+            format!("source:{label}").as_bytes(),
+        ));
+        let config_digest = ConfigDigest::from(Sha256Digest::digest_bytes(
+            format!("config:{label}").as_bytes(),
+        ));
+        let analysis_version_digest = AnalysisVersionDigest::from(Sha256Digest::digest_bytes(
+            format!("analysis-version:{label}").as_bytes(),
+        ));
+        let state = json!({
+            "schema":"cerebro.tidex.sleep_state/v5",
+            "operation_key":operation_key,
+            "analysis_key":analysis_key,
+            "corpus_digest":corpus_digest,
+            "source_tree_digest":source_tree_digest,
+            "config_digest":config_digest,
+            "analysis_version_digest":analysis_version_digest,
+            "report_sha256":report_sha256,
+            "promoted":false,
+            "certification_status":"revoked",
+            "active_generation":0,
+            "active_skill_count":if active_bank_sha256.is_some() { 1 } else { 0 },
+            "active_bank_sha256":active_bank_sha256,
+            "memory_digest":memory_sha256,
+            "evidence_bundle_sha256":evidence_bundle_sha256,
+            "evidence_verification":{"verified":false,"reasons":["test-revoked"]},
+            "diagnostics":{}
+        });
+        let state_bytes = serialize_pretty_line(&state).unwrap();
+        let state_sha256 = sha256_bytes(&state_bytes);
+
+        write_new_private(&root, &root.join("state/sleep_state.json"), &state_bytes).unwrap();
+        write_new_private(
+            &root,
+            &root
+                .join("state/reports")
+                .join(format!("{report_sha256}.json")),
+            &report_bytes,
+        )
+        .unwrap();
+        write_new_private(
+            &root,
+            &memory_artifact_path(&root, &memory_sha256),
+            &memory_bytes,
+        )
+        .unwrap();
+        write_new_private(
+            &root,
+            &root.join("state/memory/current.json"),
+            &memory_bytes,
+        )
+        .unwrap();
+        write_new_private(
+            &root,
+            &root
+                .join("state/sleep/by-sha")
+                .join(format!("{state_sha256}.json")),
+            &state_bytes,
+        )
+        .unwrap();
+        if let (Some(bytes), Some(sha)) = (bank_bytes, active_bank_sha256.as_ref()) {
+            write_new_private(
+                &root,
+                &root
+                    .join("state/skill_banks/by-sha")
+                    .join(format!("{sha}.json")),
+                bytes,
+            )
+            .unwrap();
+            write_new_private(&root, &engine.bank_path(), bytes).unwrap();
+        }
+        if let (Some(bytes), Some(sha)) = (evidence_bytes, evidence_bundle_sha256.as_ref()) {
+            write_new_private(
+                &root,
+                &root
+                    .join("state/sleep_evidence/by-sha")
+                    .join(format!("{sha}.json")),
+                bytes,
+            )
+            .unwrap();
+            write_new_private(
+                &root,
+                &root.join("state/sleep_evidence/current.json"),
+                bytes,
+            )
+            .unwrap();
+        }
+
+        let event = ledger::append(
+            &root,
+            "sleep_transaction",
+            json!({
+                "schema":"cerebro.tidex.sleep_transaction/v1",
+                "operation_key":operation_key,
+                "analysis_key":analysis_key,
+                "corpus_digest":corpus_digest,
+                "analysis_version_digest":analysis_version_digest,
+                "config_digest":config_digest,
+                "report_sha256":report_sha256,
+                "memory_sha256":memory_sha256,
+                "active_bank_sha256":active_bank_sha256,
+                "sleep_state_sha256":state_sha256,
+                "evidence_bundle_sha256":evidence_bundle_sha256,
+                "evidence_verified":false,
+                "certification_status":"revoked",
+                "promoted":false,
+            }),
+        )
+        .unwrap();
+        let receipt = SleepReceipt {
+            schema: "cerebro.tidex.sleep_receipt/v1".into(),
+            operation_key,
+            analysis_key,
+            report_sha256,
+            memory_sha256,
+            active_bank_sha256,
+            evidence_bundle_sha256,
+            sleep_state_sha256: state_sha256,
+            ledger_event_hash: event.event_hash,
+        };
+        write_new_private(
+            &root,
+            &root
+                .join("state/sleep_receipts")
+                .join(format!("{}.json", receipt.operation_key)),
+            &serialize_pretty_line(&receipt).unwrap(),
+        )
+        .unwrap();
+        (root, engine, receipt, state)
+    }
+
+    #[test]
+    fn transition_sleep_installation_and_bootstrap_fail_closed_matrix() {
+        let (root, engine, receipt, state) =
+            install_revoked_sleep_fixture("sleep-bankless-valid", None, None);
+        engine
+            .verify_current_sleep_installation(&receipt, &state)
+            .unwrap();
+        engine.authorize_empty_bank_bootstrap(true, &state).unwrap();
+        assert!(matches!(
+            engine.snapshot_revoked_prior_runtime_artifacts(),
+            Err(BrainError::Integrity(message))
+                if message == "learning_finalization_prior_active_bank_missing"
+        ));
+
+        let report_path = root
+            .join("state/reports")
+            .join(format!("{}.json", receipt.report_sha256));
+        let report_bytes = fs::read(&report_path).unwrap();
+        fs::remove_file(&report_path).unwrap();
+        assert!(matches!(
+            engine.verify_current_sleep_installation(&receipt, &state),
+            Err(BrainError::Integrity(message))
+                if message == "sleep_installation_report_history_mismatch"
+        ));
+        write_new_private(&root, &report_path, &report_bytes).unwrap();
+
+        let memory_current = root.join("state/memory/current.json");
+        let memory_bytes = fs::read(&memory_current).unwrap();
+        fs::remove_file(&memory_current).unwrap();
+        assert!(matches!(
+            engine.verify_current_sleep_installation(&receipt, &state),
+            Err(BrainError::Integrity(message))
+                if message == "sleep_installation_current_memory_mismatch"
+        ));
+        write_new_private(&root, &memory_current, &memory_bytes).unwrap();
+
+        write_new_private(&root, &engine.bank_path(), b"unexpected-bank").unwrap();
+        assert!(matches!(
+            engine.verify_current_sleep_installation(&receipt, &state),
+            Err(BrainError::Integrity(message))
+                if message == "sleep_installation_unexpected_active_bank"
+        ));
+        fs::remove_file(engine.bank_path()).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        let (root, engine, receipt, state) = install_revoked_sleep_fixture(
+            "sleep-bank-evidence-valid",
+            Some(b"bank-authority"),
+            Some(b"evidence-authority"),
+        );
+        engine
+            .verify_current_sleep_installation(&receipt, &state)
+            .unwrap();
+        let bank_sha = receipt.active_bank_sha256.as_ref().unwrap();
+        let bank_history = root
+            .join("state/skill_banks/by-sha")
+            .join(format!("{bank_sha}.json"));
+        let bank_bytes = fs::read(&bank_history).unwrap();
+        fs::remove_file(&bank_history).unwrap();
+        assert!(matches!(
+            engine.verify_current_sleep_installation(&receipt, &state),
+            Err(BrainError::Integrity(message))
+                if message == "sleep_installation_current_bank_mismatch"
+        ));
+        write_new_private(&root, &bank_history, &bank_bytes).unwrap();
+
+        let evidence_sha = receipt.evidence_bundle_sha256.as_ref().unwrap();
+        let evidence_history = root
+            .join("state/sleep_evidence/by-sha")
+            .join(format!("{evidence_sha}.json"));
+        let evidence_bytes = fs::read(&evidence_history).unwrap();
+        fs::remove_file(&evidence_history).unwrap();
+        assert!(matches!(
+            engine.verify_current_sleep_installation(&receipt, &state),
+            Err(BrainError::Integrity(message))
+                if message == "sleep_installation_current_evidence_mismatch"
+        ));
+        write_new_private(&root, &evidence_history, &evidence_bytes).unwrap();
+
+        let evidence_current = root.join("state/sleep_evidence/current.json");
+        fs::remove_file(&evidence_current).unwrap();
+        assert!(matches!(
+            engine.verify_current_sleep_installation(&receipt, &state),
+            Err(BrainError::Integrity(message))
+                if message == "sleep_evidence_current_pointer_missing"
+        ));
+        write_new_private(&root, &evidence_current, b"evidence-authority").unwrap();
+        assert_eq!(
+            engine
+                .snapshot_revoked_prior_runtime_artifacts()
+                .unwrap()
+                .len(),
+            4
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        let (root, engine, receipt, state) =
+            install_revoked_sleep_fixture("sleep-bank-no-evidence", Some(b"bank-only"), None);
+        assert!(matches!(
+            engine.snapshot_revoked_prior_runtime_artifacts(),
+            Err(BrainError::Integrity(message))
+                if message == "learning_finalization_prior_sleep_evidence_missing"
+        ));
+        let receipt_path = root
+            .join("state/sleep_receipts")
+            .join(format!("{}.json", receipt.operation_key));
+        let mut invalid_receipt = receipt.clone();
+        invalid_receipt.active_bank_sha256 = Some(SkillBankDigest::from(
+            Sha256Digest::digest_bytes(b"different-bank"),
+        ));
+        fs::write(
+            &receipt_path,
+            serialize_pretty_line(&invalid_receipt).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.authorize_empty_bank_bootstrap(true, &state),
+            Err(BrainError::Integrity(message))
+                if message == "empty_bank_bootstrap_prior_state_not_explicitly_revoked"
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn transition_authorize_empty_bank_bootstrap_invariants() {
         let root = isolated_engine_root("empty-bank-invariants");
@@ -2609,7 +3022,8 @@ mod tests {
 
         // 5. Uncertified runtime fails closed with composition_requires_certified_runtime
         let layout_sha = Sha256Digest::digest_bytes(b"layout");
-        let mut field = runtime_field_with_artifact(&root, &layout_sha, "search-skill", &[1.0, 2.0]);
+        let mut field =
+            runtime_field_with_artifact(&root, &layout_sha, "search-skill", &[1.0, 2.0]);
         field.structured_geometry = None;
         field.parameter_layout_sha256 = None;
         field.dense_materialization = None;
@@ -2692,7 +3106,9 @@ mod tests {
             inhibition: vec![0.0],
             risk: vec![0.0],
         };
-        let err = engine.cognitive_route_from_drive(&[1.0], &drive, 1, 0.1).unwrap_err();
+        let err = engine
+            .cognitive_route_from_drive(&[1.0], &drive, 1, 0.1)
+            .unwrap_err();
         assert!(matches!(
             err,
             BrainError::Integrity(m) if m.starts_with("runtime_execution_not_authorized")
@@ -2721,8 +3137,13 @@ mod tests {
             session_id: invocation.session_id.clone(),
             invocation_sha256: Sha256Digest::parse(digest_json(&invocation).unwrap()).unwrap(),
             controller_receipt_sha256: Sha256Digest::digest_bytes(b"ctrl-receipt"),
-            state_before_sha256: Sha256Digest::parse(digest_json(&invocation.state_before).unwrap()).unwrap(),
-            promoted_observation_semantic_sha256: invocation.promoted_observation_semantic_sha256.clone(),
+            state_before_sha256: Sha256Digest::parse(
+                digest_json(&invocation.state_before).unwrap(),
+            )
+            .unwrap(),
+            promoted_observation_semantic_sha256: invocation
+                .promoted_observation_semantic_sha256
+                .clone(),
             governed_composition_receipt_sha256: Sha256Digest::digest_bytes(b"gov-comp"),
             invocation: invocation.clone(),
         };
@@ -2902,7 +3323,9 @@ mod tests {
         ));
 
         // 2. Contains disallowed label
-        receipt.archived_artifact_sha256.insert("disallowed_label.json".into(), Sha256Digest::zero());
+        receipt
+            .archived_artifact_sha256
+            .insert("disallowed_label.json".into(), Sha256Digest::zero());
         assert!(matches!(
             verify_learning_finalization_archive(&root, &receipt, &dummy_intent_dir),
             Err(BrainError::Integrity(m)) if m == "learning_finalization_archive_manifest_contract_invalid"
@@ -2921,7 +3344,9 @@ mod tests {
 
         // 1. Observations don't meet minimum observation requirements -> fail closed
         let few_obs = vec![sample_observation("obs-1", vec![1.0, 0.0])];
-        assert!(engine.commit_after_verified_corpus_transition(&few_obs).is_err());
+        assert!(engine
+            .commit_after_verified_corpus_transition(&few_obs)
+            .is_err());
 
         // 2. Non-canonical runtime config fails closed
         let noncanonical = BrainEngine {
@@ -2939,4 +3364,3 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 }
-

@@ -273,7 +273,11 @@ impl BrainEngine {
                 "commit_observation_set_digest_mismatch".into(),
             ));
         }
-        let report_bytes = serialize_pretty_line(&report)?;
+        // The persisted report is the authority for every artifact derived from
+        // this commit. Normalize once through the shared exact wire boundary.
+        let normalized = normalize_reconstruction_report_wire(&report)?;
+        report = normalized.0;
+        let report_bytes = normalized.1;
         let report_sha256 = ReportDigest::from(Sha256Digest::digest_bytes(&report_bytes));
         let operation_key = commit_operation_key(&batch_digest, &report, &report_sha256);
         let generation = obs
@@ -774,7 +778,7 @@ impl BrainEngine {
             &prospective_mixtures,
             &observations,
         )?;
-        let prospective_report_bytes = serialize_pretty_line(&prospective)?;
+        let (_, prospective_report_bytes) = normalize_reconstruction_report_wire(&prospective)?;
         let prospective_report_sha256 = Sha256Digest::digest_bytes(&prospective_report_bytes);
 
         let operation_key = learning_finalization_operation_key(
@@ -1240,7 +1244,11 @@ impl BrainEngine {
             let mixtures = reconstruction.skill_source_mixtures.clone();
             self.materialize_dense_fields(&mut reconstruction.fields, &mixtures, &observations)?;
         }
-        let report_bytes = serialize_pretty_line(&reconstruction)?;
+        // Sleep and learning-finalization must assign one exact identity to the
+        // same canonical reconstruction. Use the shared exact wire authority.
+        let normalized = normalize_reconstruction_report_wire(&reconstruction)?;
+        reconstruction = normalized.0;
+        let report_bytes = normalized.1;
         let report_sha256 = ReportDigest::from(Sha256Digest::digest_bytes(&report_bytes));
         let corpus_digest = reconstruction.observation_set_digest.clone();
         let analysis_key = sleep_analysis_key(&corpus_digest, &reconstruction);
@@ -1374,25 +1382,45 @@ impl BrainEngine {
             certification_status,
             active_bank_sha256.as_deref(),
         );
-        let state = json!({
-            "schema":"cerebro.tidex.sleep_state/v5",
-            "operation_key":operation_key,
-            "analysis_key":analysis_key,
-            "corpus_digest":corpus_digest,
-            "source_tree_digest":reconstruction.source_tree_digest,
-            "config_digest":reconstruction.config_digest,
-            "analysis_version_digest":reconstruction.analysis_version_digest,
-            "report_sha256":report_sha256,
-            "promoted":promoted,
-            "certification_status":certification_status,
-            "active_generation":bank.generation,
-            "active_skill_count":bank.fields.len(),
-            "active_bank_sha256":active_bank_sha256,
-            "memory_digest":memory_sha256,
-            "evidence_bundle_sha256":evidence_bundle_sha256,
-            "evidence_verification":evidence_verification,
-            "diagnostics":diagnostics,
-        });
+        // `promoted` describes what this invocation did. The persisted sleep
+        // state, however, is part of the immutable transaction identified by
+        // `operation_key`. Replaying that exact operation must preserve the
+        // original state bytes (including promotion and pre-promotion
+        // diagnostics) so receipt recovery and idempotency cannot manufacture a
+        // sibling state under one operation identity.
+        let replaying_same_operation =
+            previous.get("operation_key").and_then(Value::as_str) == Some(operation_key.as_str());
+        let transaction_promoted = if replaying_same_operation {
+            previous
+                .get("promoted")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| BrainError::Integrity("sleep_state_promoted_invalid".into()))?
+        } else {
+            promoted
+        };
+        let state = if replaying_same_operation {
+            previous.clone()
+        } else {
+            json!({
+                "schema":"cerebro.tidex.sleep_state/v5",
+                "operation_key":operation_key,
+                "analysis_key":analysis_key,
+                "corpus_digest":corpus_digest,
+                "source_tree_digest":reconstruction.source_tree_digest,
+                "config_digest":reconstruction.config_digest,
+                "analysis_version_digest":reconstruction.analysis_version_digest,
+                "report_sha256":report_sha256,
+                "promoted":transaction_promoted,
+                "certification_status":certification_status,
+                "active_generation":bank.generation,
+                "active_skill_count":bank.fields.len(),
+                "active_bank_sha256":active_bank_sha256,
+                "memory_digest":memory_sha256,
+                "evidence_bundle_sha256":evidence_bundle_sha256,
+                "evidence_verification":evidence_verification,
+                "diagnostics":diagnostics,
+            })
+        };
         let state_bytes = serialize_pretty_line(&state)?;
         let state_sha256 = sha256_bytes(&state_bytes);
 
@@ -1514,7 +1542,7 @@ impl BrainEngine {
             evidence_bundle_sha256: evidence_bundle_sha256.clone(),
             evidence_verified: evidence_verification.verified,
             certification_status,
-            promoted,
+            promoted: transaction_promoted,
         };
         let transaction_exists = match fs::symlink_metadata(&transaction_dir) {
             Ok(_) => true,
@@ -1581,7 +1609,7 @@ impl BrainEngine {
                     "evidence_bundle_sha256":evidence_bundle_sha256,
                     "evidence_verified":evidence_verification.verified,
                     "certification_status":certification_status,
-                    "promoted":promoted,
+                    "promoted":transaction_promoted,
                 }),
             )?;
             verify_sleep_transaction_ledger_binding(&event, &intent)?;
@@ -1656,7 +1684,7 @@ impl BrainEngine {
             corpus_digest,
             observation_count: observations.len(),
             promoted,
-            idempotent: false,
+            idempotent: replaying_same_operation,
             active_skill_count: bank.fields.len(),
             memory_digest: memory_sha256,
             evidence_bundle_sha256,

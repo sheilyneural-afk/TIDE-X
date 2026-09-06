@@ -58,11 +58,11 @@ de esa referencia exige una revisión explícita de Miri, sanitizadores y de las
 advertencias de incompatibilidad futura. Miri conserva su aislamiento y explora
 varias semillas sobre pruebas existentes del núcleo matemático. La puerta
 impide que la cobertura demostrada retroceda: líneas 74 %, funciones 70 % y
-regiones 75 %. El siguiente objetivo explícito es superar primero el 80 % y
-después elevar por etapas el núcleo alcanzable hacia el 100 %, añadiendo
-pruebas reales y nunca excluyendo módulos. Los umbrales pueden elevarse mediante
+regiones 75 %. Los umbrales pueden elevarse mediante
 `QUALITY_MIN_LINE_COVERAGE`, `QUALITY_MIN_FUNCTION_COVERAGE` y
-`QUALITY_MIN_REGION_COVERAGE`, pero nunca reducirse en una entrega.
+`QUALITY_MIN_REGION_COVERAGE`, pero nunca reducirse en una entrega. Puerta 2,
+descrita más abajo, fija el siguiente nivel certificado sin reducir estos
+contratos ni excluir módulos difíciles.
 
 ASan y LSan son controles separados. Integrar la detección de fugas dentro de
 ASan hace que toda la suite dependa de que el host permita `ptrace`. La puerta
@@ -82,6 +82,43 @@ Para aumentar la campaña sin cambiar el procedimiento:
 
 ```text
 QUALITY_FUZZ_RUNS=1000000 quality/gate1-tooling.sh
+```
+
+# Puerta 2: verificación crítica de producción
+
+`quality/gate2-verification.sh` es una puerta de certificación acumulativa. No
+sustituye Puerta 0 ni Puerta 1: ejecuta ambas y después añade controles que no
+pueden omitirse en P2. La campaña mínima de fuzzing queda fijada en 100.000
+ejecuciones por objetivo; una variable de entorno sólo puede elevarla, nunca
+reducirla.
+
+P2 exige cobertura global mínima de 82 % de líneas, 75 % de funciones y 80 %
+de regiones. Además impone mínimos de líneas sobre autoridades críticas para
+impedir que el promedio global oculte una zona de sombra: `engine/runtime.rs`
+80 %, `engine/transition.rs` 75 %, `engine/support.rs` 80 %,
+`engine/analysis.rs` 85 %, `isolated_execution.rs` 85 % y `digest.rs` 95 %.
+La cobertura se obtiene de un único `cargo llvm-cov --workspace --all-targets`
+y se valida directamente desde el JSON emitido por LLVM.
+
+La puerta repite Clippy con `-D warnings`, exige que LSan pueda ejecutarse y
+termine limpio (un host que lo bloquee no puede certificar P2), ejecuta Miri con
+procedencia estricta, alineación simbólica y múltiples semillas sobre
+`low_rank_math`, `linalg`, `trust_region` y `transport`, y ejecuta
+ThreadSanitizer sobre **todos los objetivos de prueba** del workspace, no
+mediante un filtro de nombres. Toda la compilación se dirige a `/tmp`, y una
+instantánea SHA-256 completa del checkout antes y después hace fallar P2 ante
+cualquier mutación de fuentes o artefactos.
+
+Ejecución de certificación:
+
+```text
+quality/gate2-verification.sh
+```
+
+Para aumentar, pero nunca rebajar, la campaña de fuzzing heredada por P1:
+
+```text
+QUALITY_FUZZ_RUNS=1000000 quality/gate2-verification.sh
 ```
 
 ## Límite de la evidencia
@@ -113,11 +150,13 @@ independiente.
 La puerta actual es sólida como infraestructura; la evidencia de TIDE‑X todavía
 debe crecer:
 
-1. Elevar cobertura real del 74,45 % por etapas: 80 → 90 → 95 → 100 en el
-   núcleo alcanzable.
-2. Medir también ramas y funciones, no sólo líneas.
-3. Ampliar Miri desde `low_rank_math` a todos los módulos puros y seguros para
-   Miri; excluir sólo fronteras de SO justificadas.
+1. Mantener los mínimos P2 y elevar por etapas el núcleo alcanzable hacia
+   90 → 95 → 100 sin excluir módulos para mejorar el promedio.
+2. Medir también ramas/condiciones cuando la instrumentación estable lo permita;
+   P2 ya exige funciones y regiones además de líneas.
+3. Mantener bajo Miri `low_rank_math`, `linalg`, `trust_region` y `transport`, y
+   ampliar a otros módulos puros únicamente cuando sus fronteras sean compatibles
+   con el intérprete.
 4. Añadir model checking de concurrencia y fallos (loom o equivalente) para
    CAS, cabezas canónicas, publicación atómica y recuperación.
 5. Añadir verificación formal a kernels e invariantes críticos donde sea

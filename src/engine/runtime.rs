@@ -520,7 +520,9 @@ impl BrainEngine {
             let mixtures = reconstruction.skill_source_mixtures.clone();
             self.materialize_dense_fields(&mut reconstruction.fields, &mixtures, &observations)?;
         }
-        let reconstruction_bytes = serialize_pretty_line(&reconstruction)?;
+        let normalized = normalize_reconstruction_report_wire(&reconstruction)?;
+        reconstruction = normalized.0;
+        let reconstruction_bytes = normalized.1;
         let reconstruction_sha256 =
             ReportDigest::from(Sha256Digest::digest_bytes(&reconstruction_bytes));
         let bundle = load_sleep_evidence(&self.root)?;
@@ -917,17 +919,33 @@ impl BrainEngine {
         source_observation_sha256: &str,
     ) -> BrainResult<RecordedGovernedComposition> {
         self.require_current_observation_digest(source_observation_sha256)?;
-        let composition = self.compose(activation)?;
+        if activation.is_empty() || activation.values().any(|value| !value.is_finite()) {
+            return Err(BrainError::Integrity(
+                "governed_composition_activation_contract_invalid".into(),
+            ));
+        }
+        // The receipt persists this activation and every verifier later recomposes
+        // from those persisted bytes. Make that exact wire value authoritative
+        // before the first composition so one operation cannot depend on a
+        // pre-serialization f64 that the receipt itself does not contain.
+        let activation_bytes = serde_json::to_vec(activation)?;
+        let canonical_activation: BTreeMap<SkillId, f64> =
+            serde_json::from_slice(&activation_bytes)?;
+        let stable_activation: BTreeMap<SkillId, f64> =
+            serde_json::from_slice(&serde_json::to_vec(&canonical_activation)?)?;
+        if stable_activation != canonical_activation {
+            return Err(BrainError::Integrity(
+                "governed_composition_activation_wire_unstable".into(),
+            ));
+        }
+        let composition = self.compose(&canonical_activation)?;
         let bank = self.load_bank()?;
         let field_ids = bank
             .fields
             .iter()
             .map(|field| field.skill_id.clone())
             .collect::<Vec<_>>();
-        if field_ids.is_empty()
-            || activation.is_empty()
-            || activation.values().any(|value| !value.is_finite())
-        {
+        if field_ids.is_empty() {
             return Err(BrainError::Integrity(
                 "governed_composition_activation_contract_invalid".into(),
             ));
@@ -1039,7 +1057,7 @@ impl BrainEngine {
             causal_credit_sha256: &causal_credit_sha256,
             parameter_layout_artifact_sha256: &parameter_layout_artifact.sha256,
             parameter_layout_sha256: &parameter_layout_sha256,
-            activation,
+            activation: &canonical_activation,
             projected_delta_sha256: &projected_delta.sha256,
             source_observation_sha256,
         })?;
@@ -1071,7 +1089,7 @@ impl BrainEngine {
                 &pointer.receipt_sha256,
             )?;
             if receipt.operation_key != operation_key
-                || receipt.requested_activation != *activation
+                || receipt.requested_activation != canonical_activation
                 || receipt.source_observation_sha256 != source_observation_sha256
             {
                 return Err(BrainError::Integrity(
@@ -1105,7 +1123,7 @@ impl BrainEngine {
             parameter_layout_artifact: parameter_layout_artifact.clone(),
             parameter_layout_sha256: parameter_layout_sha256.clone(),
             field_ids,
-            requested_activation: activation.clone(),
+            requested_activation: canonical_activation.clone(),
             accepted_coefficients: composition.trust_region.accepted_coefficients.clone(),
             trust_region: composition.trust_region.clone(),
             projected_delta,
@@ -1118,7 +1136,15 @@ impl BrainEngine {
             },
             source_observation_sha256: source_observation_sha256.to_string(),
         };
+        let first_receipt_bytes = serialize_pretty_line(&receipt)?;
+        let receipt: GovernedCompositionReceipt = serde_json::from_slice(&first_receipt_bytes)?;
         let receipt_bytes = serialize_pretty_line(&receipt)?;
+        let stable_receipt: GovernedCompositionReceipt = serde_json::from_slice(&receipt_bytes)?;
+        if stable_receipt != receipt {
+            return Err(BrainError::Integrity(
+                "governed_composition_receipt_wire_unstable".into(),
+            ));
+        }
         let receipt_sha256 = sha256_bytes(&receipt_bytes);
         let receipt_path = by_sha.join(format!("{receipt_sha256}.json"));
         write_new_private(&self.root, &receipt_path, &receipt_bytes)?;

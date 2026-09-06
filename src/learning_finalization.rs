@@ -512,7 +512,8 @@ pub(crate) mod tests {
                 .join(format!("{layout_digest}.json"));
             write_or_verify_immutable(root, &layout_path, &layout_raw).unwrap();
             let dense =
-                crate::artifact::create_content_addressed_dvec(root, &[0.1 * i as f32, 0.2, 0.3]).unwrap();
+                crate::artifact::create_content_addressed_dvec(root, &[0.1 * i as f32, 0.2, 0.3])
+                    .unwrap();
 
             let observation = DeltaObservation {
                 observation_id: ObservationId::parse(format!("obs-fin-{i}")).unwrap(),
