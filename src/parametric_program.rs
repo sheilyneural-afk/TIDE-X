@@ -241,9 +241,9 @@ mod tests {
 
     fn field(id: &str, direction: Vec<f64>) -> SkillField {
         SkillField {
-            skill_id: id.into(),
-            reconstruction_id: String::new(),
-            lineage_id: String::new(),
+            skill_id: crate::identity::SkillId::parse(id).unwrap(),
+            reconstruction_id: Default::default(),
+            lineage_id: Default::default(),
             generation_created: 1,
             direction,
             structured_geometry: None,

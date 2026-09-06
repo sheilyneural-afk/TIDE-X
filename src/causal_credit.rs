@@ -1,4 +1,5 @@
 use crate::error::{BrainError, BrainResult};
+use crate::identity::SkillId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,13 +12,13 @@ pub struct CounterfactualEvaluation {
     /// randomization/seed share one group and must not be treated as replicates.
     #[serde(default)]
     pub independence_group: String,
-    pub active_fields: Vec<String>,
+    pub active_fields: Vec<SkillId>,
     pub utility: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FieldCausalCredit {
-    pub skill_id: String,
+    pub skill_id: SkillId,
     pub matched_pairs: usize,
     pub independent_contexts: usize,
     pub mean_marginal_effect: f64,
@@ -32,13 +33,37 @@ pub struct FieldCausalCredit {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PairInteractionCredit {
-    pub left_skill_id: String,
-    pub right_skill_id: String,
+    pub left_skill_id: SkillId,
+    pub right_skill_id: SkillId,
     pub matched_quads: usize,
     pub independent_contexts: usize,
     pub mean_interaction_effect: f64,
     pub standard_error: f64,
     pub resolved: bool,
+}
+
+impl PairInteractionCredit {
+    /// Pessimistic 95% interaction effect used by governed routing. Positive
+    /// synergy is admitted only when it survives its uncertainty margin;
+    /// possible negative interference is deliberately retained.
+    pub fn lower_confidence_bound(&self) -> BrainResult<f64> {
+        if !self.resolved
+            || !self.mean_interaction_effect.is_finite()
+            || !self.standard_error.is_finite()
+            || self.standard_error < 0.0
+        {
+            return Err(BrainError::Integrity(
+                "causal_pair_interaction_unresolved".into(),
+            ));
+        }
+        let bound = self.mean_interaction_effect - EFFECT_95_Z * self.standard_error;
+        if !bound.is_finite() {
+            return Err(BrainError::Numerical(
+                "causal_pair_interaction_bound_non_finite".into(),
+            ));
+        }
+        Ok(bound)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,7 +74,7 @@ pub struct CausalCreditReport {
     pub field_count: usize,
     pub fields: Vec<FieldCausalCredit>,
     pub pair_interactions: Vec<PairInteractionCredit>,
-    pub unresolved_fields: Vec<String>,
+    pub unresolved_fields: Vec<SkillId>,
 }
 
 /// Return the conservative, evidence-backed causal utility weight for every
@@ -60,7 +85,7 @@ pub struct CausalCreditReport {
 /// substitute a heuristic weight.
 pub fn certified_causal_priority_weights(
     report: &CausalCreditReport,
-    field_ids: &[String],
+    field_ids: &[SkillId],
 ) -> BrainResult<Vec<f64>> {
     if report.schema != "cerebro.tidex.causal_credit/v3"
         || field_ids.is_empty()
@@ -73,7 +98,7 @@ pub fn certified_causal_priority_weights(
         ));
     }
     let expected = field_ids.iter().cloned().collect::<BTreeSet<_>>();
-    if expected.len() != field_ids.len() || expected.iter().any(|id| id.trim().is_empty()) {
+    if expected.len() != field_ids.len() {
         return Err(BrainError::Invalid(
             "causal_credit_priority_field_identity_invalid".into(),
         ));
@@ -93,7 +118,7 @@ pub fn certified_causal_priority_weights(
             || !field.positive_fraction.is_finite()
             || !(0.0..=1.0).contains(&field.positive_fraction)
             || by_id
-                .insert(field.skill_id.as_str(), field.lower_confidence_bound)
+                .insert(field.skill_id.clone(), field.lower_confidence_bound)
                 .is_some()
         {
             return Err(BrainError::Integrity(
@@ -102,7 +127,7 @@ pub fn certified_causal_priority_weights(
         }
     }
     if by_id.len() != expected.len()
-        || by_id.keys().any(|id| !expected.contains(*id))
+        || by_id.keys().any(|id| !expected.contains(id))
         || report.pair_interactions.len() != expected.len() * expected.len().saturating_sub(1) / 2
     {
         return Err(BrainError::Integrity(
@@ -125,6 +150,7 @@ pub fn certified_causal_priority_weights(
             || !pair.mean_interaction_effect.is_finite()
             || !pair.standard_error.is_finite()
             || pair.standard_error < 0.0
+            || pair.lower_confidence_bound().is_err()
             || !pairs.insert((left.clone(), right.clone()))
         {
             return Err(BrainError::Integrity(
@@ -136,14 +162,14 @@ pub fn certified_causal_priority_weights(
         .iter()
         .map(|field_id| {
             by_id
-                .get(field_id.as_str())
+                .get(field_id)
                 .copied()
                 .ok_or_else(|| BrainError::Integrity("causal_credit_priority_field_missing".into()))
         })
         .collect::<BrainResult<Vec<_>>>()
 }
 
-fn canonical_set(fields: &[String]) -> BTreeSet<String> {
+fn canonical_set(fields: &[SkillId]) -> BTreeSet<SkillId> {
     fields.iter().cloned().collect()
 }
 
@@ -190,7 +216,7 @@ pub fn estimate_causal_credit(
     let mut independent_groups = BTreeSet::new();
     let mut context_groups = BTreeMap::<String, String>::new();
     let mut fields = BTreeSet::new();
-    let mut table = BTreeMap::<(String, BTreeSet<String>), f64>::new();
+    let mut table = BTreeMap::<(String, BTreeSet<SkillId>), f64>::new();
     for (index, evaluation) in evaluations.iter().enumerate() {
         if evaluation.context_id.trim().is_empty() || !evaluation.utility.is_finite() {
             return Err(BrainError::Invalid(format!(
@@ -361,10 +387,10 @@ mod tests {
             for mask in 0..4 {
                 let mut active = Vec::new();
                 if mask & 1 != 0 {
-                    active.push("a".to_string());
+                    active.push(SkillId::parse("a").unwrap());
                 }
                 if mask & 2 != 0 {
-                    active.push("b".to_string());
+                    active.push(SkillId::parse("b").unwrap());
                 }
                 let a = if mask & 1 != 0 { 2.0 } else { 0.0 };
                 let b = if mask & 2 != 0 { 1.0 } else { 0.0 };
@@ -406,7 +432,7 @@ mod tests {
                         context_id: format!("seed-{seed}:{task}"),
                         independence_group: format!("seed-{seed}"),
                         active_fields: if mask == 1 {
-                            vec!["skill".into()]
+                            vec![SkillId::parse("skill").unwrap()]
                         } else {
                             vec![]
                         },

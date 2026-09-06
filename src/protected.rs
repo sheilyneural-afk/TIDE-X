@@ -1,7 +1,7 @@
 #![allow(clippy::needless_range_loop)]
 use crate::contracts::ProtectedCortex;
 use crate::error::{BrainError, BrainResult};
-use crate::linalg::{norm, symmetric_eigen_jacobi_signed, Matrix};
+use crate::linalg::{norm, sub, symmetric_eigen_jacobi_signed, Matrix};
 
 #[derive(Debug, Clone)]
 pub struct ProtectionResult {
@@ -13,12 +13,29 @@ pub struct ProtectionResult {
     pub max_weighted_residual: f64,
 }
 
-fn wdot(a: &[f64], b: &[f64], w: &[f64]) -> f64 {
-    a.iter()
+fn wdot(a: &[f64], b: &[f64], weights: &[f64]) -> BrainResult<f64> {
+    if a.len() != b.len()
+        || a.len() != weights.len()
+        || a.iter()
+            .chain(b)
+            .chain(weights)
+            .any(|value| !value.is_finite())
+        || weights.iter().any(|weight| *weight < 0.0)
+    {
+        return Err(BrainError::Invalid("protected_weighted_dot_input".into()));
+    }
+    let value = a
+        .iter()
         .zip(b)
-        .zip(w)
-        .map(|((x, y), z)| x * y * z.max(0.0))
-        .sum()
+        .zip(weights)
+        .map(|((left, right), weight)| left * right * weight)
+        .sum::<f64>();
+    if !value.is_finite() {
+        return Err(BrainError::Numerical(
+            "protected_weighted_dot_non_finite".into(),
+        ));
+    }
+    Ok(value)
 }
 
 pub fn project_to_safe_subspace(
@@ -49,7 +66,7 @@ pub fn project_to_safe_subspace(
     let mut braked = delta
         .iter()
         .zip(&cortex.parameter_importance)
-        .map(|(value, importance)| value / (1.0 + importance.max(0.0)))
+        .map(|(value, importance)| value / (1.0 + importance))
         .collect::<Vec<_>>();
 
     let active = cortex
@@ -60,6 +77,18 @@ pub fn project_to_safe_subspace(
     let mut protected_rank = 0usize;
     let mut max_weighted_residual = 0.0f64;
     if !active.is_empty() {
+        for direction in &active {
+            if wdot(
+                &direction.direction,
+                &direction.direction,
+                &cortex.parameter_importance,
+            )? == 0.0
+            {
+                return Err(BrainError::Numerical(
+                    "protected_direction_unobservable_in_metric".into(),
+                ));
+            }
+        }
         let m = active.len();
         let mut gram = Matrix::zeros(m, m);
         for i in 0..m {
@@ -68,7 +97,7 @@ pub fn project_to_safe_subspace(
                     &active[i].direction,
                     &active[j].direction,
                     &cortex.parameter_importance,
-                );
+                )?;
                 gram.set(i, j, value);
                 gram.set(j, i, value);
             }
@@ -105,7 +134,7 @@ pub fn project_to_safe_subspace(
         let rhs = active
             .iter()
             .map(|direction| wdot(&braked, &direction.direction, &cortex.parameter_importance))
-            .collect::<Vec<_>>();
+            .collect::<BrainResult<Vec<_>>>()?;
         let coefficients = pseudoinverse.matvec(&rhs)?;
         for (coefficient, direction) in coefficients.iter().zip(&active) {
             for parameter in 0..braked.len() {
@@ -113,19 +142,21 @@ pub fn project_to_safe_subspace(
             }
         }
 
-        let reference_energy = wdot(delta, delta, &cortex.parameter_importance)
-            .sqrt()
-            .max(1e-15);
+        let reference_energy = wdot(delta, delta, &cortex.parameter_importance)?.sqrt();
         for direction in &active {
             let direction_energy = wdot(
                 &direction.direction,
                 &direction.direction,
                 &cortex.parameter_importance,
-            )
-            .sqrt()
-            .max(1e-15);
-            let residual = wdot(&braked, &direction.direction, &cortex.parameter_importance).abs()
-                / (reference_energy * direction_energy);
+            )?
+            .sqrt();
+            let numerator =
+                wdot(&braked, &direction.direction, &cortex.parameter_importance)?.abs();
+            let residual = if reference_energy == 0.0 {
+                0.0
+            } else {
+                numerator / (reference_energy * direction_energy)
+            };
             max_weighted_residual = max_weighted_residual.max(residual);
         }
         let residual_tolerance = f64::EPSILON.sqrt() * (m.max(1) as f64).sqrt() * 16.0;
@@ -136,12 +167,20 @@ pub fn project_to_safe_subspace(
         }
     }
 
-    let removed = delta
-        .iter()
-        .zip(&braked)
-        .map(|(before, after)| (before - after).powi(2))
-        .sum::<f64>();
-    let damage = removed.sqrt() / norm(delta)?.max(1e-15);
+    let removed_vector = sub(delta, &braked)?;
+    let removed_norm = norm(&removed_vector)?;
+    let removed = removed_norm * removed_norm;
+    if !removed.is_finite() {
+        return Err(BrainError::Numerical(
+            "protected_removed_energy_non_finite".into(),
+        ));
+    }
+    let delta_norm = norm(delta)?;
+    let damage = if delta_norm == 0.0 {
+        0.0
+    } else {
+        removed_norm / delta_norm
+    };
     Ok(ProtectionResult {
         projected: braked,
         damage_ratio: damage,
@@ -150,4 +189,30 @@ pub fn project_to_safe_subspace(
         protected_rank,
         max_weighted_residual,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_updates_keep_their_true_damage_ratio() {
+        let cortex = ProtectedCortex {
+            parameter_importance: vec![1.0],
+            directions: Vec::new(),
+            max_damage_ratio: 1.0,
+        };
+        let result = project_to_safe_subspace(&[1e-300], &cortex).unwrap();
+        assert!((result.damage_ratio - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nonrepresentable_protection_energy_fails_closed() {
+        let cortex = ProtectedCortex {
+            parameter_importance: vec![f64::MAX],
+            directions: Vec::new(),
+            max_damage_ratio: 1.0,
+        };
+        assert!(project_to_safe_subspace(&[f64::MAX], &cortex).is_err());
+    }
 }

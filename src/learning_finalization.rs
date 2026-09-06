@@ -11,7 +11,7 @@ use crate::authority::PrivateFileReference;
 use crate::contracts::DeltaObservation;
 use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
-use crate::identity::{ObservationId, SessionId};
+use crate::identity::{LearningTargetId, ObservationId, SessionId};
 use crate::learning_orchestrator::{
     load_persistent_adaptive_learning_receipt, AdaptiveLearningEventKind,
 };
@@ -52,7 +52,7 @@ pub struct LearningFinalizationInput {
     pub schema: String,
     pub session_id: SessionId,
     pub adaptive_receipt_sha256: Sha256Digest,
-    pub target_id: String,
+    pub target_id: LearningTargetId,
     pub target_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
     /// Content hashes of immutable learning-evidence envelopes in their
@@ -107,7 +107,7 @@ fn checked_representation_receipt_reference(
 
 struct AdaptiveLearningSourceSet {
     adaptive_receipt_sha256: Sha256Digest,
-    target_id: String,
+    target_id: LearningTargetId,
     target_digest: Sha256Digest,
     policy_digest: Sha256Digest,
     completed_evidence_sha256: Vec<Sha256Digest>,
@@ -160,7 +160,7 @@ fn source_observations_from_adaptive_cycle(
         }
         let (path, raw, observation) = read_confined_observation(root, &evidence.observation)?;
         let digest = Sha256Digest::digest_bytes(&raw);
-        let observation_id = ObservationId::parse(&observation.observation_id)?;
+        let observation_id = observation.observation_id.clone();
         if observation.observation_id != evidence.observation_id
             || digest != evidence.observation.sha256
             || !observation_digests.insert(digest.clone())
@@ -264,7 +264,7 @@ fn prepare_learning_finalization_under_root(
         );
         let (_destination_path, _destination_raw, destination) =
             read_confined_observation(root, &destination_reference)?;
-        if destination.observation_id != observation_id.as_str()
+        if destination.observation_id != observation_id
             || destination.representation_artifact.as_ref()
                 != Some(&installation.representation_artifact)
             || destination.representation_protocol_sha256.as_deref()
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn promoted_semantic_digest_is_not_the_staged_file_digest() {
         let observation = DeltaObservation {
-            observation_id: "obs-bridge".into(),
+            observation_id: ObservationId::parse("obs-bridge").unwrap(),
             from_checkpoint: "base".into(),
             to_checkpoint: "candidate".into(),
             generation: 1,
@@ -423,7 +423,9 @@ mod tests {
             parameter_layout_sha256: None,
             representation_artifact: None,
             representation_protocol_sha256: None,
-            provenance_digest: Sha256Digest::digest_bytes(b"obs-bridge").to_string(),
+            provenance_digest: crate::digest::ProvenanceDigest::from(Sha256Digest::digest_bytes(
+                b"obs-bridge",
+            )),
         };
         let canonical = semantic_observation_sha256(&observation).unwrap();
         let mut staged_file_bytes = serde_json::to_vec_pretty(&observation).unwrap();

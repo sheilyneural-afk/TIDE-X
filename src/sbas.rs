@@ -20,9 +20,31 @@ pub fn reconstruct_trajectory(
     if observations.is_empty() {
         return Err(BrainError::Invalid("sbas_no_edges".into()));
     }
+    if !ridge.is_finite() || ridge <= 0.0 {
+        return Err(BrainError::Invalid("sbas_ridge_invalid".into()));
+    }
     let dim = observations[0].delta.len();
-    if dim == 0 || observations.iter().any(|o| o.delta.len() != dim) {
+    if dim == 0
+        || observations.iter().any(|observation| {
+            observation.delta.len() != dim
+                || observation.delta.iter().any(|value| !value.is_finite())
+        })
+    {
         return Err(BrainError::Invalid("sbas_dimension_mismatch".into()));
+    }
+    if observations.iter().any(|observation| {
+        observation.from_checkpoint.trim().is_empty()
+            || observation.to_checkpoint.trim().is_empty()
+            || observation.from_checkpoint == observation.to_checkpoint
+    }) {
+        return Err(BrainError::Invalid("sbas_checkpoint_edge_invalid".into()));
+    }
+    if observations.iter().any(|observation| {
+        !observation.reliability.is_finite()
+            || observation.reliability <= 0.0
+            || observation.reliability > 1.0
+    }) {
+        return Err(BrainError::Invalid("sbas_reliability_invalid".into()));
     }
     let mut nodes = BTreeSet::new();
     for o in observations {
@@ -68,7 +90,7 @@ pub fn reconstruct_trajectory(
     for o in observations {
         let i = index[o.from_checkpoint.as_str()];
         let j = index[o.to_checkpoint.as_str()];
-        let w = o.reliability.clamp(0.0, 1.0).max(1e-4);
+        let w = o.reliability;
         let ridx = |node: usize| {
             if node < anchor {
                 Some(node)
@@ -116,7 +138,7 @@ pub fn reconstruct_trajectory(
         let predicted = sub(&potentials[j], &potentials[i])?;
         let residual = sub(&predicted, &o.delta)?;
         let r = norm(&residual)? / (norm(&o.delta)? + 1e-12);
-        let w = o.reliability.clamp(0.0, 1.0).max(1e-4);
+        let w = o.reliability;
         sq += w * r * r;
         weight_sum += w;
         maxr = maxr.max(r);
@@ -141,7 +163,7 @@ mod autonomous_star_tests {
     }
     fn observation(index: usize, delta: Vec<f64>) -> DeltaObservation {
         DeltaObservation {
-            observation_id: format!("star-{index}"),
+            observation_id: crate::identity::ObservationId::parse(format!("star-{index}")).unwrap(),
             from_checkpoint: "base:checkpoint".into(),
             to_checkpoint: format!("variant-{index}"),
             generation: index as u64 + 1,
@@ -163,7 +185,9 @@ mod autonomous_star_tests {
             parameter_layout_sha256: None,
             representation_artifact: None,
             representation_protocol_sha256: None,
-            provenance_digest: digest(700 + index as u64),
+            provenance_digest: crate::digest::ProvenanceDigest::from(
+                crate::digest::Sha256Digest::parse(digest(700 + index as u64)).unwrap(),
+            ),
         }
     }
 

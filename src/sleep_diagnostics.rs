@@ -1,5 +1,6 @@
 use crate::contracts::{SkillBank, SkillField};
 use crate::error::BrainResult;
+use crate::identity::SkillId;
 use crate::linalg::cosine;
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +17,8 @@ pub enum ConsolidationEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConsolidationEvent {
     pub event: ConsolidationEventKind,
-    pub prior_skill_ids: Vec<String>,
-    pub reconstructed_skill_ids: Vec<String>,
+    pub prior_skill_ids: Vec<SkillId>,
+    pub reconstructed_skill_ids: Vec<SkillId>,
     pub strongest_similarity: f64,
 }
 
@@ -143,9 +144,9 @@ mod tests {
     use super::*;
     fn field(id: &str, direction: Vec<f64>) -> SkillField {
         SkillField {
-            skill_id: id.into(),
-            reconstruction_id: String::new(),
-            lineage_id: String::new(),
+            skill_id: SkillId::parse(id).unwrap(),
+            reconstruction_id: Default::default(),
+            lineage_id: Default::default(),
             generation_created: 1,
             direction,
             structured_geometry: None,

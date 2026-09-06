@@ -1,11 +1,13 @@
 #![allow(clippy::needless_range_loop)]
 use crate::contracts::{BrainConfig, SkillBank, SkillField};
+use crate::digest::ObservationRecordDigest;
 use crate::error::{BrainError, BrainResult};
 use crate::gauge::align_bases;
+use crate::identity::{LineageId, ReconstructionId, SkillId};
 use crate::linalg::{
-    cosine, dot, median, normalize, symmetric_eigen_jacobi, weighted_row_gram, Matrix,
+    cosine, dot, median, norm, normalize, symmetric_eigen_jacobi, weighted_row_gram, Matrix,
 };
-use crate::validation::{choose_energy_rank, effective_rank_from_spectrum};
+use crate::validation::{choose_energy_rank, effective_rank_from_spectrum, validate_reliability};
 
 #[derive(Debug, Clone)]
 pub struct TomographyResult {
@@ -48,19 +50,28 @@ pub fn reconstruct_skill_fields(
     generation: u64,
     cfg: &BrainConfig,
 ) -> BrainResult<TomographyResult> {
-    if d.rows < 3 || d.cols == 0 || base_weights.len() != d.rows || groups.len() != d.rows {
+    d.validate("tomography_matrix")?;
+    if d.rows < 3
+        || d.cols == 0
+        || base_weights.len() != d.rows
+        || groups.len() != d.rows
+        || groups.iter().any(|group| group.trim().is_empty())
+        || !cfg.huber_delta.is_finite()
+        || cfg.huber_delta <= 0.0
+        || cfg.irls_rounds == 0
+    {
         return Err(BrainError::Invalid("tomography_input_shape".into()));
     }
     let mut weights = base_weights
         .iter()
-        .map(|w| w.clamp(1e-4, 1.0))
-        .collect::<Vec<_>>();
+        .map(|weight| validate_reliability(*weight, "tomography"))
+        .collect::<BrainResult<Vec<_>>>()?;
     let mut final_eigs = Vec::new();
     let mut final_dirs = Vec::new();
     let mut final_mixtures = Vec::new();
     let mut final_coeff = Matrix::zeros(0, 0);
     let mut final_rms = 0.0;
-    for _ in 0..cfg.irls_rounds.max(1) {
+    for round in 0..cfg.irls_rounds {
         let gram = weighted_row_gram(d, &weights)?;
         let eigs = symmetric_eigen_jacobi(&gram, 1e-11, d.rows * d.rows * 80)?;
         if eigs.is_empty() {
@@ -73,14 +84,28 @@ pub fn reconstruct_skill_fields(
         let mut mixtures = Vec::new();
         for (lambda, u) in eigs.iter().take(rank) {
             let mut h = vec![0.0; d.cols];
-            let denom = lambda.sqrt().max(1e-12);
-            let mix = (0..d.rows)
+            let denom = lambda.sqrt();
+            if denom == 0.0 {
+                return Err(BrainError::Numerical(
+                    "tomography_zero_singular_value".into(),
+                ));
+            }
+            let mut mix = (0..d.rows)
                 .map(|r| weights[r].sqrt() * u[r] / denom)
                 .collect::<Vec<_>>();
             for r in 0..d.rows {
                 for p in 0..d.cols {
                     h[p] += mix[r] * d.get(r, p);
                 }
+            }
+            let h_norm = norm(&h)?;
+            if h_norm == 0.0 {
+                return Err(BrainError::Numerical(
+                    "tomography_reconstructed_direction_degenerate".into(),
+                ));
+            }
+            for coefficient in &mut mix {
+                *coefficient /= h_norm;
             }
             dirs.push(normalize(&h)?);
             mixtures.push(mix);
@@ -96,17 +121,19 @@ pub fn reconstruct_skill_fields(
                 s.sqrt()
             })
             .collect::<Vec<_>>();
-        let med = median(residual_norms.clone());
-        let mad = median(residual_norms.iter().map(|x| (x - med).abs()).collect()).max(1e-9);
-        let scale = 1.4826 * mad;
-        for r in 0..d.rows {
-            let z = (residual_norms[r] - med).abs() / scale;
-            let huber = if z <= cfg.huber_delta {
-                1.0
-            } else {
-                cfg.huber_delta / z
-            };
-            weights[r] = (base_weights[r].clamp(1e-4, 1.0) * huber).clamp(1e-4, 1.0);
+        if round + 1 < cfg.irls_rounds {
+            let med = median(residual_norms.clone())?;
+            let mad = median(residual_norms.iter().map(|x| (x - med).abs()).collect())?.max(1e-9);
+            let scale = 1.4826 * mad;
+            for r in 0..d.rows {
+                let z = (residual_norms[r] - med).abs() / scale;
+                let huber = if z <= cfg.huber_delta {
+                    1.0
+                } else {
+                    cfg.huber_delta / z
+                };
+                weights[r] = base_weights[r] * huber;
+            }
         }
         final_eigs = eigs;
         final_dirs = dirs;
@@ -151,9 +178,9 @@ pub fn reconstruct_skill_fields(
                 .max(1) as f64)
             .clamp(0.0, 1.0);
         fields.push(SkillField {
-            skill_id: format!("skill-g{generation}-{k:03}"),
-            reconstruction_id: String::new(),
-            lineage_id: String::new(),
+            skill_id: SkillId::parse(format!("skill-g{generation}-{k:03}"))?,
+            reconstruction_id: ReconstructionId::unassigned(),
+            lineage_id: LineageId::unassigned(),
             generation_created: generation,
             direction: h.clone(),
             structured_geometry: None,
@@ -230,17 +257,15 @@ fn global_field_alignment(
     Ok(incoming_to_old)
 }
 
-fn evidence_set(field: &SkillField) -> BrainResult<std::collections::BTreeSet<String>> {
+fn evidence_set(
+    field: &SkillField,
+) -> BrainResult<std::collections::BTreeSet<ObservationRecordDigest>> {
     let set = field
         .evidence_support_digests
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    if set.len() != field.evidence_support_digests.len()
-        || set.iter().any(|digest| {
-            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-    {
+    if set.len() != field.evidence_support_digests.len() {
         return Err(BrainError::Integrity(
             "skill_evidence_support_digest_invalid".into(),
         ));
@@ -248,7 +273,10 @@ fn evidence_set(field: &SkillField) -> BrainResult<std::collections::BTreeSet<St
     Ok(set)
 }
 
-fn durable_identity(prior: &SkillField, incoming: &SkillField) -> (String, String, Vec<String>) {
+fn durable_identity(
+    prior: &SkillField,
+    incoming: &SkillField,
+) -> (SkillId, LineageId, Vec<SkillId>) {
     let legacy_prior = prior.lineage_id.is_empty();
     let skill_id = if legacy_prior {
         incoming.skill_id.clone()
@@ -452,4 +480,55 @@ pub fn reconcile_full_corpus(
     bank.generation = bank.generation.saturating_add(1);
     bank.fields = next;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tomography_rejects_zero_reliability_and_zero_irls_rounds() {
+        let matrix = Matrix::from_rows(&[vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]]).unwrap();
+        let groups = vec!["a".into(), "b".into(), "c".into()];
+        assert!(reconstruct_skill_fields(
+            &matrix,
+            &[1.0, 0.0, 1.0],
+            &groups,
+            1,
+            &BrainConfig::default(),
+        )
+        .is_err());
+
+        let config = BrainConfig {
+            irls_rounds: 0,
+            ..Default::default()
+        };
+        assert!(reconstruct_skill_fields(&matrix, &[1.0; 3], &groups, 1, &config).is_err());
+    }
+
+    #[test]
+    fn tomography_sources_exactly_recreate_normalized_fields_and_report_used_weights() {
+        let matrix = Matrix::from_rows(&[vec![2.0, 0.0], vec![0.0, 3.0], vec![1.0, 1.0]]).unwrap();
+        let base_weights = [0.25, 0.5, 1.0];
+        let groups = vec!["a".into(), "b".into(), "c".into()];
+        let config = BrainConfig {
+            irls_rounds: 1,
+            max_rank: 2,
+            target_explained_variance: 1.0,
+            ..Default::default()
+        };
+        let result = reconstruct_skill_fields(&matrix, &base_weights, &groups, 1, &config).unwrap();
+        assert_eq!(result.robust_weights, base_weights);
+        for (field, mixture) in result.fields.iter().zip(&result.source_mixtures) {
+            let mut reconstructed = vec![0.0; matrix.column_count()];
+            for row in 0..matrix.row_count() {
+                for column in 0..matrix.column_count() {
+                    reconstructed[column] += mixture[row] * matrix.get(row, column);
+                }
+            }
+            for (actual, expected) in reconstructed.iter().zip(&field.direction) {
+                assert!((actual - expected).abs() < 1e-10);
+            }
+        }
+    }
 }

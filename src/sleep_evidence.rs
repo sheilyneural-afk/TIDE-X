@@ -5,8 +5,12 @@ use crate::causal_credit::{
     CounterfactualEvaluation,
 };
 use crate::contracts::{DeltaObservation, SkillField};
-use crate::digest::sha256_file;
+use crate::digest::{
+    sha256_file, AnalysisVersionDigest, CausalCreditDigest, ConfigDigest, CorpusDigest,
+    ProtectedMapDigest, ReportDigest, Sha256Digest, SourceTreeDigest,
+};
 use crate::error::{BrainError, BrainResult};
+use crate::identity::SkillId;
 use crate::interaction::second_order_interactions;
 use crate::linalg::Matrix;
 use crate::protected_map::{
@@ -22,11 +26,13 @@ use std::path::{Path, PathBuf};
 const NONINFERIORITY_95_Z: f64 = 1.959_963_984_540_054;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ProtectionEvidenceSummary {
     pub source_path: String,
-    pub source_sha256: String,
+    /// Physical byte identity of a heterogeneous external evidence file.
+    pub source_sha256: Sha256Digest,
     pub protected_map_path: String,
-    pub protected_map_sha256: String,
+    pub protected_map_sha256: ProtectedMapDigest,
     pub probe_count: usize,
     pub parameter_dimension: usize,
     pub selected_rank: usize,
@@ -35,13 +41,15 @@ pub struct ProtectionEvidenceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct InteractionEvidenceSummary {
     pub source_path: String,
-    pub source_sha256: String,
+    /// Physical byte identity; the referenced payload owns its semantic type.
+    pub source_sha256: Sha256Digest,
     /// Digest of the exact causal-credit wrapper whose lower confidence bounds
     /// determined the trust-region contraction order.
-    pub causal_credit_sha256: String,
-    pub field_ids: Vec<String>,
+    pub causal_credit_sha256: CausalCreditDigest,
+    pub field_ids: Vec<SkillId>,
     pub dense_parameter_dimension: usize,
     pub proposed_quadratic_cost: f64,
     pub accepted_quadratic_cost: f64,
@@ -53,11 +61,13 @@ pub struct InteractionEvidenceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayEvidenceSummary {
     pub baseline_source_path: String,
-    pub baseline_source_sha256: String,
+    /// Physical replay files are heterogeneous across evaluators.
+    pub baseline_source_sha256: Sha256Digest,
     pub candidate_source_path: String,
-    pub candidate_source_sha256: String,
+    pub candidate_source_sha256: Sha256Digest,
     pub paired_independent_groups: usize,
     pub mean_utility_delta: f64,
     pub standard_error: f64,
@@ -67,13 +77,16 @@ pub struct ReplayEvidenceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CausalCreditEvidenceSummary {
     pub replay_source_path: String,
-    pub replay_source_sha256: String,
+    pub replay_source_sha256: Sha256Digest,
     pub credit_source_path: String,
-    pub credit_source_sha256: String,
-    pub report_sha256: String,
-    pub plan_sha256: String,
+    pub credit_source_sha256: CausalCreditDigest,
+    pub report_sha256: ReportDigest,
+    /// Legacy producer plan identity is not yet governed by one canonical
+    /// schema, so assigning a stronger semantic domain would be premature.
+    pub plan_sha256: Sha256Digest,
     pub independent_group_count: usize,
     pub field_count: usize,
     pub resolved_field_count: usize,
@@ -83,13 +96,14 @@ pub struct CausalCreditEvidenceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SleepEvidenceBundle {
     pub schema: String,
-    pub corpus_digest: String,
-    pub source_tree_digest: String,
-    pub config_digest: String,
-    pub analysis_version_digest: String,
-    pub field_ids: Vec<String>,
+    pub corpus_digest: CorpusDigest,
+    pub source_tree_digest: SourceTreeDigest,
+    pub config_digest: ConfigDigest,
+    pub analysis_version_digest: AnalysisVersionDigest,
+    pub field_ids: Vec<SkillId>,
     pub protection: ProtectionEvidenceSummary,
     pub interaction: InteractionEvidenceSummary,
     pub replay: ReplayEvidenceSummary,
@@ -97,6 +111,7 @@ pub struct SleepEvidenceBundle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SleepEvidenceVerification {
     pub schema: String,
     pub verified: bool,
@@ -111,25 +126,26 @@ pub struct SleepEvidenceVerification {
 }
 
 pub struct SleepEvidenceExpectation<'a> {
-    pub corpus_digest: &'a str,
+    pub corpus_digest: &'a CorpusDigest,
     /// SHA256 of the exact canonical reconstruction report being certified.
     /// Replay, trust and causal-credit artifacts must all bind to this report;
     /// the evidence bundle is not allowed to self-attest a different digest.
-    pub report_sha256: &'a str,
-    pub source_tree_digest: &'a str,
-    pub config_digest: &'a str,
-    pub analysis_version_digest: &'a str,
+    pub report_sha256: &'a ReportDigest,
+    pub source_tree_digest: &'a SourceTreeDigest,
+    pub config_digest: &'a ConfigDigest,
+    pub analysis_version_digest: &'a AnalysisVersionDigest,
     pub fields: &'a [SkillField],
     pub observations: &'a [DeltaObservation],
     pub source_mixtures: &'a [Vec<f64>],
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CounterfactualReplayArtifact {
     schema: String,
-    report_sha256: String,
-    plan_sha256: String,
-    field_ids: Vec<String>,
+    report_sha256: ReportDigest,
+    plan_sha256: Sha256Digest,
+    field_ids: Vec<SkillId>,
     field_coefficients: Vec<f64>,
     validation_seeds: Vec<u64>,
     validation_tasks: Vec<String>,
@@ -140,20 +156,22 @@ struct CounterfactualReplayArtifact {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CounterfactualReplayRow {
     mask: u64,
-    active_fields: Vec<String>,
+    active_fields: Vec<SkillId>,
     seed: u64,
     metrics: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrustRegionFunctionalReplayArtifact {
     schema: String,
-    report_sha256: String,
-    trust_region_sha256: String,
-    plan_sha256: String,
-    field_ids: Vec<String>,
+    report_sha256: ReportDigest,
+    trust_region_sha256: Sha256Digest,
+    plan_sha256: Sha256Digest,
+    field_ids: Vec<SkillId>,
     accepted_coefficients: Vec<f64>,
     validation_seeds: Vec<u64>,
     validation_tasks: Vec<String>,
@@ -163,6 +181,7 @@ struct TrustRegionFunctionalReplayArtifact {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrustRegionFunctionalReplayRow {
     seed: u64,
     metrics: BTreeMap<String, f64>,
@@ -176,18 +195,23 @@ enum CausalPriorityWeightKind {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrustRegionArtifactIdentity {
     schema: String,
-    report_sha256: String,
-    protected_map_sha256: String,
-    causal_plan_sha256: String,
-    causal_credit_sha256: String,
+    report_sha256: ReportDigest,
+    protected_map_sha256: ProtectedMapDigest,
+    causal_plan_sha256: Sha256Digest,
+    causal_credit_sha256: CausalCreditDigest,
     causal_priority_weight_kind: CausalPriorityWeightKind,
-    field_ids: Vec<String>,
+    field_ids: Vec<SkillId>,
+    dense_parameter_dimension: usize,
+    interaction_matrix: Vec<Vec<f64>>,
+    diagonal_budget: f64,
     trust_region: TrustRegionDecisionIdentity,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrustRegionDecisionIdentity {
     proposed_coefficients: Vec<f64>,
     accepted_coefficients: Vec<f64>,
@@ -251,12 +275,13 @@ fn confined_path(root: &Path, raw: impl AsRef<Path>) -> BrainResult<PathBuf> {
     existing_regular_file_under_root(root, path)
 }
 
-fn verify_file(root: &Path, path: &str, expected_sha: &str) -> BrainResult<bool> {
+fn verify_file(root: &Path, path: &str, expected_sha: &impl AsRef<str>) -> BrainResult<bool> {
     let path = confined_path(root, path)?;
-    Ok(sha256_file(&path)? == expected_sha)
+    Ok(sha256_file(&path)?.as_str() == expected_sha.as_ref())
 }
 
-fn valid_sha256(value: &str) -> bool {
+fn valid_sha256(value: &impl AsRef<str>) -> bool {
+    let value = value.as_ref();
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -325,7 +350,7 @@ fn checked_replay_identity(
     root: &Path,
     bundle: &SleepEvidenceBundle,
     expected: &SleepEvidenceExpectation<'_>,
-    expected_ids: &[String],
+    expected_ids: &[SkillId],
     baseline: &CounterfactualReplayArtifact,
     candidate: &TrustRegionFunctionalReplayArtifact,
 ) -> BrainResult<()> {
@@ -337,14 +362,14 @@ fn checked_replay_identity(
         || baseline.blind_data_accessed
         || candidate.blind_data_accessed
         || bundle.replay.blind_data_accessed
-        || baseline.report_sha256 != expected.report_sha256
-        || candidate.report_sha256 != expected.report_sha256
-        || bundle.causal_credit.report_sha256 != expected.report_sha256
+        || baseline.report_sha256.as_str() != expected.report_sha256.as_str()
+        || candidate.report_sha256.as_str() != expected.report_sha256.as_str()
+        || bundle.causal_credit.report_sha256.as_str() != expected.report_sha256.as_str()
         || baseline.plan_sha256 != candidate.plan_sha256
         || baseline.plan_sha256 != bundle.causal_credit.plan_sha256
         || baseline.field_ids.as_slice() != expected_ids
         || candidate.field_ids.as_slice() != expected_ids
-        || !exact_unique_nonempty(expected_ids)
+        || expected_ids.iter().collect::<BTreeSet<_>>().len() != expected_ids.len()
         || !exact_unique_seeds(&baseline.validation_seeds)
         || baseline.validation_seeds != candidate.validation_seeds
         || !exact_unique_nonempty(&baseline.validation_tasks)
@@ -368,7 +393,7 @@ fn checked_replay_identity(
     let trust_path = confined_path(root, &bundle.interaction.source_path)?;
     let trust: TrustRegionArtifactIdentity = serde_json::from_slice(&fs::read(trust_path)?)?;
     if trust.schema != "cerebro.tidex.trust_region_benchmark/v3"
-        || trust.report_sha256 != expected.report_sha256
+        || trust.report_sha256.as_str() != expected.report_sha256.as_str()
         || trust.protected_map_sha256 != bundle.protection.protected_map_sha256
         || trust.causal_plan_sha256 != baseline.plan_sha256
         || trust.causal_credit_sha256 != bundle.causal_credit.credit_source_sha256
@@ -377,6 +402,12 @@ fn checked_replay_identity(
         || !valid_sha256(&bundle.interaction.causal_credit_sha256)
         || trust.causal_priority_weight_kind != CausalPriorityWeightKind::LowerConfidenceBound95
         || trust.field_ids.as_slice() != expected_ids
+        || trust.dense_parameter_dimension != bundle.interaction.dense_parameter_dimension
+        || !finite_scalar_match(trust.diagonal_budget, bundle.interaction.diagonal_budget)
+        || trust.interaction_matrix.len() != expected_ids.len()
+        || trust.interaction_matrix.iter().any(|row| {
+            row.len() != expected_ids.len() || row.iter().any(|value| !value.is_finite())
+        })
         || trust.trust_region.proposed_coefficients.len() != expected_ids.len()
         || trust.trust_region.accepted_coefficients.len() != expected_ids.len()
         || trust.trust_region.component_retention.len() != expected_ids.len()
@@ -425,7 +456,7 @@ fn checked_replay_identity(
 
 fn baseline_full_coalition_rows(
     baseline: &CounterfactualReplayArtifact,
-    expected_ids: &[String],
+    expected_ids: &[SkillId],
 ) -> BrainResult<BTreeMap<u64, BTreeMap<String, f64>>> {
     let mask = expected_full_mask(expected_ids.len())?;
     let expected_seeds = baseline
@@ -460,7 +491,7 @@ fn baseline_full_coalition_rows(
 
 fn verify_full_coalition_evaluations(
     baseline: &CounterfactualReplayArtifact,
-    expected_ids: &[String],
+    expected_ids: &[SkillId],
     full_rows: &BTreeMap<u64, BTreeMap<String, f64>>,
 ) -> BrainResult<()> {
     let mut expected = BTreeMap::<(u64, String), f64>::new();
@@ -525,7 +556,7 @@ fn recompute_functional_replay(
     root: &Path,
     bundle: &SleepEvidenceBundle,
     expected: &SleepEvidenceExpectation<'_>,
-    expected_ids: &[String],
+    expected_ids: &[SkillId],
 ) -> BrainResult<RecomputedReplayStatistics> {
     if !verify_file(
         root,
@@ -691,12 +722,14 @@ fn load_sensitivity_evidence(
             })?;
             let mut artifact = row.artifact;
             artifact.path = artifact_path;
-            let values = read_dvec_f32(&artifact)?
+            let values = read_dvec_f32(root, &artifact)?
                 .into_iter()
                 .map(f64::from)
                 .collect::<Vec<_>>();
             Ok(SensitivityEvidence {
-                probe_id: row.probe_id,
+                probe_id: crate::identity::ProbeId::parse(row.probe_id).map_err(|_| {
+                    BrainError::Integrity("protected_sensitivity_probe_id_invalid".into())
+                })?,
                 sensitivity: values,
                 reliability: row.reliability,
                 causal_damage: Some(row.causal_damage_per_parameter_norm),
@@ -712,8 +745,8 @@ fn verify_protection_artifacts(root: &Path, source_path: &str) -> BrainResult<bo
 fn verify_causal_credit_artifacts(
     root: &Path,
     summary: &CausalCreditEvidenceSummary,
-    expected_ids: &[String],
-    expected_report_sha256: &str,
+    expected_ids: &[SkillId],
+    expected_report_sha256: &ReportDigest,
 ) -> BrainResult<bool> {
     if !verify_file(
         root,
@@ -725,7 +758,7 @@ fn verify_causal_credit_artifacts(
         &summary.credit_source_sha256,
     )? || summary.blind_data_accessed
         || !valid_sha256(expected_report_sha256)
-        || summary.report_sha256 != expected_report_sha256
+        || summary.report_sha256.as_str() != expected_report_sha256.as_str()
         || summary.independent_group_count < 3
         || summary.field_count != expected_ids.len()
         || summary.resolved_field_count != expected_ids.len()
@@ -761,10 +794,11 @@ fn verify_causal_credit_artifacts(
         .ok_or_else(|| BrainError::Integrity("causal_replay_field_ids_missing".into()))?
         .iter()
         .map(|value| {
-            value
+            let value = value
                 .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| BrainError::Integrity("causal_replay_field_id_invalid".into()))
+                .ok_or_else(|| BrainError::Integrity("causal_replay_field_id_invalid".into()))?;
+            SkillId::parse(value)
+                .map_err(|_| BrainError::Integrity("causal_replay_field_id_invalid".into()))
         })
         .collect::<BrainResult<Vec<_>>>()?;
     if replay_ids != expected_ids {
@@ -828,9 +862,11 @@ fn verify_causal_credit_artifacts(
         .ok_or_else(|| BrainError::Integrity("causal_credit_wrapper_field_ids_missing".into()))?
         .iter()
         .map(|value| {
-            value.as_str().map(str::to_string).ok_or_else(|| {
+            let value = value.as_str().ok_or_else(|| {
                 BrainError::Integrity("causal_credit_wrapper_field_id_invalid".into())
-            })
+            })?;
+            SkillId::parse(value)
+                .map_err(|_| BrainError::Integrity("causal_credit_wrapper_field_id_invalid".into()))
         })
         .collect::<BrainResult<Vec<_>>>()?;
     if wrapper_field_ids != expected_ids {
@@ -942,7 +978,7 @@ fn verify_causal_credit_artifacts(
                     "causal_credit_field_support_unresolved".into(),
                 ));
             }
-            Ok(skill_id.to_string())
+            SkillId::parse(skill_id)
         })
         .collect::<BrainResult<Vec<_>>>()?;
     let mut sorted_field_ids = field_ids;
@@ -1010,8 +1046,8 @@ fn verify_causal_credit_artifacts(
 fn verified_causal_credit_with_weights(
     root: &Path,
     summary: &CausalCreditEvidenceSummary,
-    expected_ids: &[String],
-    expected_report_sha256: &str,
+    expected_ids: &[SkillId],
+    expected_report_sha256: &ReportDigest,
 ) -> BrainResult<Option<(CausalCreditReport, Vec<f64>)>> {
     if !verify_causal_credit_artifacts(root, summary, expected_ids, expected_report_sha256)? {
         return Ok(None);
@@ -1031,6 +1067,7 @@ fn verified_causal_credit_with_weights(
 }
 
 fn dense_fields_from_observations(
+    root: &Path,
     expectation: &SleepEvidenceExpectation<'_>,
     parameter_dimension: usize,
 ) -> BrainResult<Vec<Vec<f64>>> {
@@ -1071,7 +1108,7 @@ fn dense_fields_from_observations(
                     observation.observation_id
                 )));
             }
-            let values = read_dvec_f32(reference)?;
+            let values = read_dvec_f32(root, reference)?;
             if values.len() != parameter_dimension {
                 return Err(BrainError::Integrity(
                     "sleep_dense_field_loaded_dimension".into(),
@@ -1107,12 +1144,12 @@ pub fn verify_sleep_evidence(
         return Err(BrainError::Invalid("sleep_evidence_schema_invalid".into()));
     }
     let mut reasons = Vec::new();
-    if bundle.corpus_digest != expected.corpus_digest {
+    if bundle.corpus_digest.as_str() != expected.corpus_digest.as_str() {
         reasons.push("sleep_evidence_corpus_mismatch".into());
     }
-    if bundle.source_tree_digest != expected.source_tree_digest
-        || bundle.config_digest != expected.config_digest
-        || bundle.analysis_version_digest != expected.analysis_version_digest
+    if bundle.source_tree_digest.as_str() != expected.source_tree_digest.as_str()
+        || bundle.config_digest.as_str() != expected.config_digest.as_str()
+        || bundle.analysis_version_digest.as_str() != expected.analysis_version_digest.as_str()
     {
         reasons.push("sleep_evidence_analysis_identity_mismatch".into());
     }
@@ -1278,10 +1315,16 @@ pub fn verify_sleep_evidence(
             let field_ids = payload
                 .get("field_ids")
                 .and_then(serde_json::Value::as_array)
-                .unwrap()
+                .ok_or_else(|| BrainError::Integrity("sleep_field_ids_missing".into()))?
                 .iter()
-                .map(|value| value.as_str().unwrap_or("").to_string())
-                .collect::<Vec<_>>();
+                .map(|value| {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| BrainError::Integrity("sleep_field_id_invalid".into()))?;
+                    SkillId::parse(value)
+                        .map_err(|_| BrainError::Integrity("sleep_field_id_invalid".into()))
+                })
+                .collect::<BrainResult<Vec<_>>>()?;
             let rows = payload
                 .get("interaction_matrix")
                 .and_then(serde_json::Value::as_array)
@@ -1307,6 +1350,7 @@ pub fn verify_sleep_evidence(
             let matrix = Matrix::from_rows(&rows)?;
             let recomputed_matrix = if let Some(cortex) = verified_cortex.as_ref() {
                 let dense = dense_fields_from_observations(
+                    root,
                     expected,
                     bundle.interaction.dense_parameter_dimension,
                 )?;
@@ -1621,9 +1665,9 @@ mod tests {
 
     fn field() -> SkillField {
         SkillField {
-            skill_id: "s".into(),
-            reconstruction_id: String::new(),
-            lineage_id: String::new(),
+            skill_id: crate::identity::SkillId::parse("s").unwrap(),
+            reconstruction_id: Default::default(),
+            lineage_id: Default::default(),
             generation_created: 1,
             direction: vec![1.0],
             structured_geometry: None,
@@ -1654,8 +1698,8 @@ mod tests {
         let baseline = root.join("causal_replay.json");
         let candidate = root.join("candidate_replay.json");
         let causal_credit = root.join("causal_credit.json");
-        let report_sha = "1".repeat(64);
-        let plan_sha = "2".repeat(64);
+        let report_sha = ReportDigest::from(Sha256Digest::parse("1".repeat(64)).unwrap());
+        let plan_sha = Sha256Digest::parse("2".repeat(64)).unwrap();
         let validation_seeds = vec![11_u64, 12, 13];
         let validation_tasks = vec!["task".to_string()];
 
@@ -1673,7 +1717,7 @@ mod tests {
             causal_evaluations.push(CounterfactualEvaluation {
                 context_id,
                 independence_group,
-                active_fields: vec!["s".into()],
+                active_fields: vec![crate::identity::SkillId::parse("s").unwrap()],
                 utility: 0.5,
             });
             raw_results.push(serde_json::json!({
@@ -1708,8 +1752,11 @@ mod tests {
         )
         .unwrap();
         let causal_report = estimate_causal_credit(&causal_evaluations).unwrap();
-        let causal_priority_weights =
-            certified_causal_priority_weights(&causal_report, &["s".to_string()]).unwrap();
+        let causal_priority_weights = certified_causal_priority_weights(
+            &causal_report,
+            &[crate::identity::SkillId::parse("s").unwrap()],
+        )
+        .unwrap();
         fs::write(
             &causal_credit,
             serde_json::to_vec(&serde_json::json!({
@@ -1724,7 +1771,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let sha = |p: &Path| crate::artifact::sha256_file(p).unwrap().to_string();
+        let sha = |p: &Path| crate::artifact::sha256_file(p).unwrap();
         let a = root.join("protection.json");
         let protection_payload = serde_json::json!({
             "schema":"cerebro.tidex.protected_sensitivity_evidence/v1",
@@ -1825,16 +1872,18 @@ mod tests {
         write_candidate(&[0.45, 0.45, 0.45]);
         let mut bundle = SleepEvidenceBundle {
             schema: "cerebro.tidex.sleep_evidence/v4".into(),
-            corpus_digest: "x".into(),
-            source_tree_digest: "source".into(),
-            config_digest: "config".into(),
-            analysis_version_digest: "analysis".into(),
-            field_ids: vec!["s".into()],
+            corpus_digest: CorpusDigest::from(Sha256Digest::digest_bytes(b"x")),
+            source_tree_digest: SourceTreeDigest::from(Sha256Digest::digest_bytes(b"source")),
+            config_digest: ConfigDigest::from(Sha256Digest::digest_bytes(b"config")),
+            analysis_version_digest: AnalysisVersionDigest::from(Sha256Digest::digest_bytes(
+                b"analysis",
+            )),
+            field_ids: vec![SkillId::parse("s").unwrap()],
             protection: ProtectionEvidenceSummary {
                 source_path: a.to_string_lossy().into(),
                 source_sha256: sha(&a),
                 protected_map_path: protected_map_path.to_string_lossy().into(),
-                protected_map_sha256: sha(&protected_map_path),
+                protected_map_sha256: ProtectedMapDigest::from(sha(&protected_map_path)),
                 probe_count: 2,
                 parameter_dimension: 1,
                 selected_rank: 1,
@@ -1844,8 +1893,8 @@ mod tests {
             interaction: InteractionEvidenceSummary {
                 source_path: interaction.to_string_lossy().into(),
                 source_sha256: interaction_sha.clone(),
-                causal_credit_sha256: sha(&causal_credit),
-                field_ids: vec!["s".into()],
+                causal_credit_sha256: CausalCreditDigest::from(sha(&causal_credit)),
+                field_ids: vec![SkillId::parse("s").unwrap()],
                 dense_parameter_dimension: 1,
                 proposed_quadratic_cost: 2.0,
                 accepted_quadratic_cost: 1.0,
@@ -1870,7 +1919,7 @@ mod tests {
                 replay_source_path: baseline.to_string_lossy().into(),
                 replay_source_sha256: sha(&baseline),
                 credit_source_path: causal_credit.to_string_lossy().into(),
-                credit_source_sha256: sha(&causal_credit),
+                credit_source_sha256: CausalCreditDigest::from(sha(&causal_credit)),
                 report_sha256: report_sha.clone(),
                 plan_sha256: plan_sha.clone(),
                 independent_group_count: 3,
@@ -1884,7 +1933,7 @@ mod tests {
         let expected_fields = [field()];
         let dense_update = create_content_addressed_dvec(&root, &[(2.0f32).sqrt()]).unwrap();
         let observations = [DeltaObservation {
-            observation_id: "o1".into(),
+            observation_id: crate::identity::ObservationId::parse("o1").unwrap(),
             from_checkpoint: "base".into(),
             to_checkpoint: "next".into(),
             generation: 1,
@@ -1898,15 +1947,17 @@ mod tests {
             parameter_layout_sha256: None,
             representation_artifact: None,
             representation_protocol_sha256: None,
-            provenance_digest: "test".into(),
+            provenance_digest: crate::digest::ProvenanceDigest::from(
+                crate::digest::Sha256Digest::digest_bytes(b"test"),
+            ),
         }];
         let source_mixtures = [vec![1.0]];
         let expectation = SleepEvidenceExpectation {
-            corpus_digest: "x",
+            corpus_digest: &bundle.corpus_digest,
             report_sha256: &report_sha,
-            source_tree_digest: "source",
-            config_digest: "config",
-            analysis_version_digest: "analysis",
+            source_tree_digest: &bundle.source_tree_digest,
+            config_digest: &bundle.config_digest,
+            analysis_version_digest: &bundle.analysis_version_digest,
             fields: &expected_fields,
             observations: &observations,
             source_mixtures: &source_mixtures,
@@ -1914,10 +1965,13 @@ mod tests {
         let bad = verify_sleep_evidence(&root, &bundle, &expectation).unwrap();
         assert!(!bad.verified);
         assert!(!bad.replay_verified);
-        assert!(bad
-            .reasons
-            .iter()
-            .any(|reason| reason == "sleep_functional_replay_noninferior_unproven"));
+        assert!(
+            bad.reasons
+                .iter()
+                .any(|reason| reason == "sleep_functional_replay_noninferior_unproven"),
+            "unexpected verification reasons: {:?}",
+            bad.reasons
+        );
 
         write_candidate(&[0.495, 0.495, 0.495]);
         bundle.replay.candidate_source_sha256 = sha(&candidate);
@@ -1930,6 +1984,25 @@ mod tests {
         assert!(good.interaction_verified);
         assert!(good.causal_credit_verified);
         assert!(good.replay_lower_confidence_bound >= -0.01);
+
+        let mut unknown_field = serde_json::to_value(&bundle).unwrap();
+        unknown_field
+            .as_object_mut()
+            .unwrap()
+            .insert("uncommitted_digest".into(), true.into());
+        assert!(serde_json::from_value::<SleepEvidenceBundle>(unknown_field).is_err());
+
+        let mut cross_domain = bundle.clone();
+        cross_domain.protection.protected_map_sha256 = ProtectedMapDigest::from(
+            cross_domain
+                .causal_credit
+                .credit_source_sha256
+                .as_digest()
+                .clone(),
+        );
+        let crossed = verify_sleep_evidence(&root, &cross_domain, &expectation).unwrap();
+        assert!(!crossed.verified);
+        assert!(!crossed.protection_verified);
 
         let mut causal_priority_forgery = bundle.clone();
         causal_priority_forgery.interaction.causal_priority_weights = vec![999.0];

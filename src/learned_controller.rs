@@ -2,16 +2,23 @@
 
 use crate::authority::existing_regular_file_under_root;
 use crate::contracts::{DeltaObservation, SkillBank, SkillField};
-use crate::digest::Sha256Digest;
+use crate::digest::{
+    AdaptiveLearningReceiptDigest, ControllerDatasetDigest, LearnedControllerPolicyDigest,
+    LearnedControllerReceiptDigest, LearningEvidenceDigest, LearningTargetDigest, Sha256Digest,
+    SkillBankDigest, SkillFieldSetDigest,
+};
 use crate::engine::{
     load_verified_governed_composition_receipt, load_verified_learning_finalization_receipt,
     LearningFinalizationReceipt,
 };
 use crate::error::{BrainError, BrainResult};
+use crate::identity::SkillId;
 use crate::identity::{ObservationId, SessionId};
+#[cfg(test)]
+use crate::learning_orchestrator::sha256_bytes;
 use crate::learning_orchestrator::{
     confined_existing_file, ensure_private_dir, load_persistent_adaptive_learning_receipt,
-    private_directory_if_present, private_regular_file_if_present, sha256_bytes, write_new_private,
+    private_directory_if_present, private_regular_file_if_present, write_new_private,
     write_private_atomic, EvidenceReference, LoadedAdaptiveLearningReceipt,
 };
 use crate::ledger;
@@ -56,7 +63,7 @@ pub struct LearnedController {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeLearnedController {
     pub(crate) schema: String,
-    pub(crate) field_ids: Vec<String>,
+    pub(crate) field_ids: Vec<SkillId>,
     pub(crate) controller: LearnedController,
 }
 
@@ -64,37 +71,40 @@ pub struct RuntimeLearnedController {
 /// Its learned observation comes from an authenticated aperture observation and
 /// its state/label pair must exactly match an immutable supervision artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ControllerTrainingRecord {
     pub schema: String,
     pub state_before: Vec<f64>,
-    pub observation_id: String,
+    pub observation_id: ObservationId,
     pub observation: EvidenceReference,
     pub target_coefficients: Vec<f64>,
     pub reliability: f64,
     pub independence_group: String,
-    pub adaptive_evidence_sha256: String,
+    pub adaptive_evidence_sha256: LearningEvidenceDigest,
     pub supervision: EvidenceReference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ControllerTrainingDataset {
     pub schema: String,
-    pub session_id: String,
-    pub target_digest: String,
+    pub session_id: SessionId,
+    pub target_digest: LearningTargetDigest,
     pub records: Vec<ControllerTrainingRecord>,
 }
 
 /// The immutable supervision record makes state and coefficient labels
 /// auditable rather than allowing a caller to inject a free-form target vector.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ControllerSupervisionEvidence {
     pub schema: String,
-    pub session_id: String,
-    pub target_digest: String,
-    pub adaptive_evidence_sha256: String,
-    pub observation_id: String,
-    pub active_bank_sha256: String,
-    pub field_ids: Vec<String>,
+    pub session_id: SessionId,
+    pub target_digest: LearningTargetDigest,
+    pub adaptive_evidence_sha256: LearningEvidenceDigest,
+    pub observation_id: ObservationId,
+    pub active_bank_sha256: SkillBankDigest,
+    pub field_ids: Vec<SkillId>,
     /// Engine-issued receipt for the governed composition that produced the
     /// coefficient label. This makes free-form labels fail closed.
     pub governed_composition_receipt: EvidenceReference,
@@ -105,6 +115,7 @@ pub struct ControllerSupervisionEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LearnedControllerPolicy {
     pub schema: String,
     pub ridge: f64,
@@ -117,18 +128,19 @@ pub struct LearnedControllerPolicy {
 /// Inputs that tie a controller to the promoted CEREBRO/TIDE-X state. The
 /// caller supplies hashes, but they are all re-derived from private artifacts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LearnedControllerBinding {
     pub schema: String,
-    pub session_id: String,
-    pub target_digest: String,
-    pub adaptive_receipt_sha256: String,
+    pub session_id: SessionId,
+    pub target_digest: LearningTargetDigest,
+    pub adaptive_receipt_sha256: AdaptiveLearningReceiptDigest,
     /// Authenticated engine finalization receipt. It is the sole bridge from
     /// immutable raw adaptive evidence to the semantic digest of the exact
     /// promoted observation accepted by runtime composition.
     pub finalization_receipt: EvidenceReference,
     pub reconstruction_report: EvidenceReference,
-    pub active_bank_sha256: String,
-    pub dataset_sha256: String,
+    pub active_bank_sha256: SkillBankDigest,
+    pub dataset_sha256: ControllerDatasetDigest,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,19 +158,20 @@ impl LearnedControllerEventKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LearnedControllerReceipt {
     pub schema: String,
     pub event_kind: LearnedControllerEventKind,
     pub generation: u64,
-    pub prior_receipt_sha256: Option<String>,
+    pub prior_receipt_sha256: Option<LearnedControllerReceiptDigest>,
     pub binding: LearnedControllerBinding,
-    pub field_ids: Vec<String>,
-    pub field_fingerprint: String,
+    pub field_ids: Vec<SkillId>,
+    pub field_fingerprint: SkillFieldSetDigest,
     /// Internal, content-addressed dataset copy. The input location is not
     /// trusted after this point.
     pub dataset: EvidenceReference,
     pub policy: LearnedControllerPolicy,
-    pub policy_digest: String,
+    pub policy_digest: LearnedControllerPolicyDigest,
     pub runtime_controller: RuntimeLearnedController,
 }
 
@@ -166,13 +179,13 @@ pub struct LearnedControllerReceipt {
 #[serde(deny_unknown_fields)]
 struct LearnedControllerPointer {
     schema: String,
-    session_id: String,
-    receipt_sha256: String,
+    session_id: SessionId,
+    receipt_sha256: LearnedControllerReceiptDigest,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedLearnedControllerReceipt {
-    pub receipt_sha256: String,
+    pub receipt_sha256: LearnedControllerReceiptDigest,
     pub receipt: LearnedControllerReceipt,
 }
 
@@ -432,7 +445,7 @@ pub(crate) fn train_runtime_learned_controller(
     })
 }
 
-fn canonical_field_ids(fields: &[SkillField]) -> BrainResult<Vec<String>> {
+fn canonical_field_ids(fields: &[SkillField]) -> BrainResult<Vec<SkillId>> {
     if fields.is_empty() {
         return Err(BrainError::Invalid(
             "runtime_learned_controller_fields_empty".into(),
@@ -452,12 +465,18 @@ fn canonical_field_ids(fields: &[SkillField]) -> BrainResult<Vec<String>> {
         .collect()
 }
 
-fn controller_policy_digest(policy: &LearnedControllerPolicy) -> BrainResult<String> {
-    Ok(sha256_bytes(&serde_json::to_vec(policy)?))
+fn controller_policy_digest(
+    policy: &LearnedControllerPolicy,
+) -> BrainResult<LearnedControllerPolicyDigest> {
+    Ok(LearnedControllerPolicyDigest::from(
+        Sha256Digest::digest_bytes(&serde_json::to_vec(policy)?),
+    ))
 }
 
-fn field_fingerprint(field_ids: &[String]) -> BrainResult<String> {
-    Ok(sha256_bytes(&serde_json::to_vec(field_ids)?))
+fn field_fingerprint(field_ids: &[SkillId]) -> BrainResult<SkillFieldSetDigest> {
+    Ok(SkillFieldSetDigest::from(Sha256Digest::digest_bytes(
+        &serde_json::to_vec(field_ids)?,
+    )))
 }
 
 fn validate_persisted_controller_policy(policy: &LearnedControllerPolicy) -> BrainResult<()> {
@@ -598,16 +617,14 @@ fn parse_referenced_json<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
-fn active_bank_under_root(root: &Path, expected_digest: &str) -> BrainResult<SkillBank> {
-    if !Sha256Digest::is_valid_str(expected_digest) {
-        return Err(BrainError::Integrity(
-            "learned_controller_active_bank_digest_invalid".into(),
-        ));
-    }
+fn active_bank_under_root(
+    root: &Path,
+    expected_digest: &SkillBankDigest,
+) -> BrainResult<SkillBank> {
     let active_path = confined_existing_file(
         root,
         root.join("state/skill_bank.json"),
-        Some(expected_digest),
+        Some(expected_digest.as_str()),
     )?;
     let bank: SkillBank = serde_json::from_slice(&fs::read(&active_path)?)?;
     let _ = canonical_field_ids(&bank.fields)?;
@@ -615,7 +632,7 @@ fn active_bank_under_root(root: &Path, expected_digest: &str) -> BrainResult<Ski
         root,
         root.join("state/skill_banks/by-sha")
             .join(format!("{expected_digest}.json")),
-        Some(expected_digest),
+        Some(expected_digest.as_str()),
     )?;
     let historical: SkillBank = serde_json::from_slice(&fs::read(historical_path)?)?;
     if historical != bank {
@@ -626,8 +643,8 @@ fn active_bank_under_root(root: &Path, expected_digest: &str) -> BrainResult<Ski
     Ok(bank)
 }
 
-fn report_field_ids(report: &Value) -> BrainResult<Vec<String>> {
-    if report.get("schema").and_then(Value::as_str) != Some("cerebro.tidex.reconstruction/v6")
+fn report_field_ids(report: &Value) -> BrainResult<Vec<SkillId>> {
+    if report.get("schema").and_then(Value::as_str) != Some("cerebro.tidex.reconstruction/v7")
         || report
             .get("promotion")
             .and_then(|promotion| promotion.get("allowed"))
@@ -645,14 +662,15 @@ fn report_field_ids(report: &Value) -> BrainResult<Vec<String>> {
     fields
         .iter()
         .map(|field| {
-            field
+            let value = field
                 .get("skill_id")
                 .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-                .map(str::to_string)
                 .ok_or_else(|| {
                     BrainError::Integrity("learned_controller_report_field_identity_invalid".into())
-                })
+                })?;
+            SkillId::parse(value).map_err(|_| {
+                BrainError::Integrity("learned_controller_report_field_identity_invalid".into())
+            })
         })
         .collect()
 }
@@ -660,7 +678,7 @@ fn report_field_ids(report: &Value) -> BrainResult<Vec<String>> {
 fn verify_reconstruction_report_binding(
     root: &Path,
     binding: &LearnedControllerBinding,
-    field_ids: &[String],
+    field_ids: &[SkillId],
 ) -> BrainResult<()> {
     let report: Value = parse_referenced_json(root, &binding.reconstruction_report)?;
     if report_field_ids(&report)? != field_ids {
@@ -681,8 +699,8 @@ fn verify_finalization_binding_under_root(
 ) -> BrainResult<LearningFinalizationReceipt> {
     let finalization =
         load_verified_learning_finalization_receipt(root, &binding.finalization_receipt)?;
-    if finalization.session_id.as_str() != binding.session_id
-        || finalization.adaptive_receipt_sha256.as_str() != binding.adaptive_receipt_sha256
+    if finalization.session_id != binding.session_id
+        || finalization.adaptive_receipt_sha256 != *binding.adaptive_receipt_sha256.as_digest()
         || finalization.report_sha256 != binding.reconstruction_report.sha256
     {
         return Err(BrainError::Integrity(
@@ -701,18 +719,13 @@ fn validate_controller_binding_under_root(
     LearningFinalizationReceipt,
 )> {
     if binding.schema != "cerebro.tidex.learned_controller_binding/v1"
-        || SessionId::parse(&binding.session_id).is_err()
-        || !Sha256Digest::is_valid_str(&binding.target_digest)
-        || !Sha256Digest::is_valid_str(&binding.adaptive_receipt_sha256)
         || !Sha256Digest::is_valid_str(binding.finalization_receipt.sha256.as_str())
-        || !Sha256Digest::is_valid_str(&binding.active_bank_sha256)
-        || !Sha256Digest::is_valid_str(&binding.dataset_sha256)
     {
         return Err(BrainError::Integrity(
             "learned_controller_binding_contract_invalid".into(),
         ));
     }
-    let adaptive = load_persistent_adaptive_learning_receipt(root, &binding.session_id)?;
+    let adaptive = load_persistent_adaptive_learning_receipt(root, binding.session_id.as_str())?;
     if adaptive.receipt_sha256 != binding.adaptive_receipt_sha256
         || adaptive.receipt.target_digest != binding.target_digest
         || adaptive.receipt.cycle.target_digest != binding.target_digest
@@ -734,18 +747,15 @@ fn validate_controller_binding_under_root(
 fn promoted_observation_semantic_sha256(
     root: &Path,
     finalization: &LearningFinalizationReceipt,
-    observation_id: &str,
+    observation_id: &ObservationId,
     raw_observation: &EvidenceReference,
 ) -> BrainResult<Sha256Digest> {
-    let observation_id = ObservationId::parse(observation_id).map_err(|_| {
-        BrainError::Integrity("learned_controller_training_record_observation_id_invalid".into())
-    })?;
     let raw_path = raw_observation.verify(root)?;
     let mut matches = finalization
         .representation_observation_bindings
         .iter()
         .filter(|binding| {
-            binding.observation_id == observation_id
+            binding.observation_id == *observation_id
                 && binding.adaptive_source_observation == *raw_observation
         });
     let mapping = matches.next().ok_or_else(|| {
@@ -775,13 +785,11 @@ fn validate_supervision(
     root: &Path,
     record: &ControllerTrainingRecord,
     expected_evidence: &crate::learning_orchestrator::LearningExperimentEvidence,
-    field_ids: &[String],
+    field_ids: &[SkillId],
     binding: &LearnedControllerBinding,
     finalization: &LearningFinalizationReceipt,
 ) -> BrainResult<ControllerExample> {
     if record.schema != "cerebro.tidex.learned_controller_training_record/v1"
-        || ObservationId::parse(&record.observation_id).is_err()
-        || !Sha256Digest::is_valid_str(&record.adaptive_evidence_sha256)
         || record.observation != expected_evidence.observation
         || record.observation_id != expected_evidence.observation_id
     {
@@ -907,13 +915,13 @@ fn validate_governed_composition_supervision(
     reference: &EvidenceReference,
     promoted_observation_semantic_sha256: &Sha256Digest,
     target_coefficients: &[f64],
-    field_ids: &[String],
+    field_ids: &[SkillId],
     binding: &LearnedControllerBinding,
 ) -> BrainResult<()> {
     let receipt =
         load_verified_governed_composition_receipt(root, &reference.path, &reference.sha256)?;
     if receipt.report_sha256 != binding.reconstruction_report.sha256
-        || receipt.active_bank_sha256 != binding.active_bank_sha256
+        || receipt.active_bank_sha256 != binding.active_bank_sha256.as_str()
         || receipt.source_observation_sha256 != promoted_observation_semantic_sha256.as_str()
         || receipt.field_ids != field_ids
         || !same_supervision_coefficients(&receipt.accepted_coefficients, target_coefficients)
@@ -929,11 +937,11 @@ fn validate_training_dataset_under_root(
     root: &Path,
     dataset_reference: &EvidenceReference,
     binding: &LearnedControllerBinding,
-    field_ids: &[String],
+    field_ids: &[SkillId],
     adaptive: &LoadedAdaptiveLearningReceipt,
     finalization: &LearningFinalizationReceipt,
 ) -> BrainResult<(ControllerTrainingDataset, Vec<ControllerExample>)> {
-    if dataset_reference.sha256 != binding.dataset_sha256 {
+    if dataset_reference.sha256 != *binding.dataset_sha256.as_digest() {
         return Err(BrainError::Integrity(
             "learned_controller_dataset_binding_digest_mismatch".into(),
         ));
@@ -997,7 +1005,7 @@ fn validate_training_dataset_under_root(
 fn validate_controller_quality(
     runtime: &RuntimeLearnedController,
     policy: &LearnedControllerPolicy,
-    field_ids: &[String],
+    field_ids: &[SkillId],
 ) -> BrainResult<()> {
     if runtime.schema != "cerebro.tidex.runtime_learned_controller/v1"
         || runtime.field_ids != field_ids
@@ -1019,17 +1027,17 @@ fn validate_controller_quality(
 
 fn persist_controller_dataset(
     root: &Path,
-    digest: &str,
+    digest: &ControllerDatasetDigest,
     raw: &[u8],
 ) -> BrainResult<EvidenceReference> {
-    if !Sha256Digest::is_valid_str(digest) || sha256_bytes(raw) != digest {
+    if Sha256Digest::digest_bytes(raw) != *digest.as_digest() {
         return Err(BrainError::Integrity(
             "learned_controller_dataset_content_digest_invalid".into(),
         ));
     }
-    let path = controller_dataset_path(root, digest);
+    let path = controller_dataset_path(root, digest.as_str());
     if private_regular_file_if_present(root, &path)?.is_some() {
-        let _ = confined_existing_file(root, &path, Some(digest)).map_err(|_| {
+        let _ = confined_existing_file(root, &path, Some(digest.as_str())).map_err(|_| {
             BrainError::Integrity("learned_controller_dataset_artifact_collision".into())
         })?;
     } else {
@@ -1037,34 +1045,29 @@ fn persist_controller_dataset(
     }
     Ok(EvidenceReference {
         path,
-        sha256: Sha256Digest::parse(digest)?,
+        sha256: digest.as_digest().clone(),
     })
 }
 
 fn load_controller_receipt_by_sha(
     root: &Path,
-    digest: &str,
+    digest: &LearnedControllerReceiptDigest,
 ) -> BrainResult<LearnedControllerReceipt> {
-    if !Sha256Digest::is_valid_str(digest) {
-        return Err(BrainError::Integrity(
-            "learned_controller_receipt_digest_invalid".into(),
-        ));
-    }
-    let path = controller_receipt_path(root, digest);
-    let path = confined_existing_file(root, &path, Some(digest))?;
+    let path = controller_receipt_path(root, digest.as_str());
+    let path = confined_existing_file(root, &path, Some(digest.as_str()))?;
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
 fn verify_controller_ledger_binding(
     root: &Path,
-    digest: &str,
+    digest: &LearnedControllerReceiptDigest,
     receipt: &LearnedControllerReceipt,
 ) -> BrainResult<()> {
     let event = ledger::find_v2_event_by_payload_string(
         root,
         "learned_controller_receipt",
         "receipt_sha256",
-        digest,
+        digest.as_str(),
     )?
     .ok_or_else(|| BrainError::Integrity("learned_controller_receipt_ledger_missing".into()))?;
     let payload = event.payload()?;
@@ -1090,7 +1093,7 @@ fn verify_controller_ledger_binding(
 
 fn validate_controller_receipt_under_root(
     root: &Path,
-    digest: &str,
+    digest: &LearnedControllerReceiptDigest,
 ) -> BrainResult<LearnedControllerReceipt> {
     let receipt = load_controller_receipt_by_sha(root, digest)?;
     if receipt.schema != "cerebro.tidex.learned_controller_receipt/v1"
@@ -1098,12 +1101,7 @@ fn validate_controller_receipt_under_root(
         || receipt.policy_digest != controller_policy_digest(&receipt.policy)?
         || receipt.field_fingerprint != field_fingerprint(&receipt.field_ids)?
         || receipt.runtime_controller.field_ids != receipt.field_ids
-        || receipt.dataset.sha256 != receipt.binding.dataset_sha256
-        || SessionId::parse(&receipt.binding.session_id).is_err()
-        || receipt
-            .prior_receipt_sha256
-            .as_deref()
-            .is_some_and(|prior| !Sha256Digest::is_valid_str(prior))
+        || receipt.dataset.sha256 != *receipt.binding.dataset_sha256.as_digest()
     {
         return Err(BrainError::Integrity(
             "learned_controller_receipt_contract_invalid".into(),
@@ -1177,8 +1175,7 @@ fn load_current_controller_receipt_under_root(
         })?;
     let pointer: LearnedControllerPointer = serde_json::from_slice(&fs::read(path)?)?;
     if pointer.schema != "cerebro.tidex.learned_controller_pointer/v1"
-        || pointer.session_id != session_id
-        || !Sha256Digest::is_valid_str(&pointer.receipt_sha256)
+        || pointer.session_id.as_str() != session_id
     {
         return Err(BrainError::Integrity(
             "learned_controller_current_pointer_contract_invalid".into(),
@@ -1196,8 +1193,8 @@ fn persist_controller_receipt_under_root(
     receipt: LearnedControllerReceipt,
 ) -> BrainResult<LoadedLearnedControllerReceipt> {
     let raw = serde_json::to_vec_pretty(&receipt)?;
-    let digest = sha256_bytes(&raw);
-    let receipt_path = controller_receipt_path(root, &digest);
+    let digest = LearnedControllerReceiptDigest::from(Sha256Digest::digest_bytes(&raw));
+    let receipt_path = controller_receipt_path(root, digest.as_str());
     if private_regular_file_if_present(root, &receipt_path)?.is_some() {
         return Err(BrainError::Integrity(
             "learned_controller_receipt_digest_already_exists".into(),
@@ -1209,14 +1206,14 @@ fn persist_controller_receipt_under_root(
         "learned_controller_receipt",
         json!({
             "schema":"cerebro.tidex.learned_controller_ledger_binding/v1",
-            "receipt_sha256":digest,
-            "session_id":receipt.binding.session_id,
-            "target_digest":receipt.binding.target_digest,
-            "adaptive_receipt_sha256":receipt.binding.adaptive_receipt_sha256,
+            "receipt_sha256":&digest,
+            "session_id":&receipt.binding.session_id,
+            "target_digest":&receipt.binding.target_digest,
+            "adaptive_receipt_sha256":&receipt.binding.adaptive_receipt_sha256,
             "finalization_receipt_sha256":receipt.binding.finalization_receipt.sha256,
             "reconstruction_report_sha256":receipt.binding.reconstruction_report.sha256,
-            "active_bank_sha256":receipt.binding.active_bank_sha256,
-            "dataset_sha256":receipt.binding.dataset_sha256,
+            "active_bank_sha256":&receipt.binding.active_bank_sha256,
+            "dataset_sha256":&receipt.binding.dataset_sha256,
             "generation":receipt.generation,
         }),
     )?;
@@ -1235,10 +1232,11 @@ fn persist_controller_receipt_under_root(
     pointer_raw.push(b'\n');
     write_private_atomic(
         root,
-        &controller_pointer_path(root, &receipt.binding.session_id),
+        &controller_pointer_path(root, receipt.binding.session_id.as_str()),
         &pointer_raw,
     )?;
-    let loaded = load_current_controller_receipt_under_root(root, &receipt.binding.session_id)?;
+    let loaded =
+        load_current_controller_receipt_under_root(root, receipt.binding.session_id.as_str())?;
     // The reloader authenticates the exact receipt bytes by digest, verifies
     // the ledger binding and deterministically replays the controller. The
     // digest is the canonical post-write identity; a second `PartialEq` over
@@ -1258,18 +1256,19 @@ fn train_persisted_runtime_learned_controller_under_root(
     binding: &LearnedControllerBinding,
 ) -> BrainResult<LoadedLearnedControllerReceipt> {
     validate_persisted_controller_policy(policy)?;
-    validate_controller_state_topology(root, &binding.session_id)?;
+    validate_controller_state_topology(root, binding.session_id.as_str())?;
     // Authenticate the caller-provided immutable data set before creating a
     // lock or any controller-state directory.
-    let _ = confined_existing_file(root, dataset_path, Some(&binding.dataset_sha256))?;
-    let _lock = acquire_controller_lock(root, &binding.session_id)?;
+    let _ = confined_existing_file(root, dataset_path, Some(binding.dataset_sha256.as_str()))?;
+    let _lock = acquire_controller_lock(root, binding.session_id.as_str())?;
     let (bank, adaptive, finalization) = validate_controller_binding_under_root(root, binding)?;
     let field_ids = canonical_field_ids(&bank.fields)?;
-    let source_path = confined_existing_file(root, dataset_path, Some(&binding.dataset_sha256))?;
+    let source_path =
+        confined_existing_file(root, dataset_path, Some(binding.dataset_sha256.as_str()))?;
     let raw = fs::read(&source_path)?;
     let source_reference = EvidenceReference {
         path: source_path,
-        sha256: Sha256Digest::parse(&binding.dataset_sha256)?,
+        sha256: binding.dataset_sha256.as_digest().clone(),
     };
     let (_, examples) = validate_training_dataset_under_root(
         root,
@@ -1287,11 +1286,11 @@ fn train_persisted_runtime_learned_controller_under_root(
         policy.ood_margin_fraction,
     )?;
     validate_controller_quality(&runtime, policy, &field_ids)?;
-    let pointer = controller_pointer_path(root, &binding.session_id);
+    let pointer = controller_pointer_path(root, binding.session_id.as_str());
     let previous = if private_regular_file_if_present(root, &pointer)?.is_some() {
         Some(load_current_controller_receipt_under_root(
             root,
-            &binding.session_id,
+            binding.session_id.as_str(),
         )?)
     } else {
         None
@@ -1516,6 +1515,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir(&root).unwrap();
+        crate::security::secure_dir(&root).unwrap();
         root
     }
 
@@ -1602,7 +1602,7 @@ mod tests {
     fn runtime_controller_binds_coefficients_to_skillfield_identity() {
         let fields = vec![
             SkillField {
-                skill_id: "a".into(),
+                skill_id: crate::identity::SkillId::parse("a").unwrap(),
                 reconstruction_id: "ra".into(),
                 lineage_id: "la".into(),
                 generation_created: 1,
@@ -1622,7 +1622,7 @@ mod tests {
                 parent_skill_ids: vec![],
             },
             SkillField {
-                skill_id: "b".into(),
+                skill_id: crate::identity::SkillId::parse("b").unwrap(),
                 reconstruction_id: "rb".into(),
                 lineage_id: "lb".into(),
                 generation_created: 1,
@@ -1678,7 +1678,7 @@ mod tests {
         validate_persisted_controller_policy(&policy).unwrap();
         let runtime = RuntimeLearnedController {
             schema: "cerebro.tidex.runtime_learned_controller/v1".into(),
-            field_ids: vec!["field-a".into()],
+            field_ids: vec![SkillId::parse("field-a").unwrap()],
             controller: LearnedController {
                 schema: "cerebro.tidex.learned_controller/v1".into(),
                 state_dim: 1,
@@ -1717,16 +1717,36 @@ mod tests {
 
     #[test]
     fn controller_binding_requires_authenticated_finalization_reference() {
+        let report_path = std::env::temp_dir()
+            .join(format!(
+                "tidex-controller-binding-fixture-{}",
+                std::process::id()
+            ))
+            .join("report.json");
         let raw = serde_json::json!({
             "schema":"cerebro.tidex.learned_controller_binding/v1",
             "session_id":"session",
             "target_digest":"a".repeat(64),
             "adaptive_receipt_sha256":"b".repeat(64),
-            "reconstruction_report":{"path":"/home/yo/cerebro/state/reports/report.json","sha256":"c".repeat(64)},
+            "reconstruction_report":{"path":report_path,"sha256":"c".repeat(64)},
             "active_bank_sha256":"d".repeat(64),
             "dataset_sha256":"e".repeat(64)
         });
         assert!(serde_json::from_value::<LearnedControllerBinding>(raw).is_err());
+    }
+
+    #[test]
+    fn versioned_controller_policy_rejects_unknown_wire_fields() {
+        let wire = serde_json::json!({
+            "schema": "cerebro.tidex.learned_controller_policy/v1",
+            "ridge": 0.01,
+            "ood_margin_fraction": 0.1,
+            "minimum_grouped_cv_r2": 0.5,
+            "maximum_training_rms": 1.0,
+            "minimum_independent_groups": 3,
+            "unreviewed_override": true
+        });
+        assert!(serde_json::from_value::<LearnedControllerPolicy>(wire).is_err());
     }
 
     #[test]
@@ -1737,6 +1757,7 @@ mod tests {
         let source_path = state.join("adaptive-observation.json");
         let source_bytes = b"sealed-adaptive-observation";
         fs::write(&source_path, source_bytes).unwrap();
+        secure_file(&source_path).unwrap();
         let source_sha256 = sha256_bytes(source_bytes);
         let raw = EvidenceReference {
             path: source_path.clone(),
@@ -1744,8 +1765,9 @@ mod tests {
         };
         let mut finalization =
             finalization_with_mapping(&source_path, &source_sha256, &"f".repeat(64));
+        let observation_id = ObservationId::parse("observation-a").unwrap();
         assert_eq!(
-            promoted_observation_semantic_sha256(&root, &finalization, "observation-a", &raw,)
+            promoted_observation_semantic_sha256(&root, &finalization, &observation_id, &raw,)
                 .unwrap(),
             Sha256Digest::parse("f".repeat(64)).unwrap()
         );
@@ -1753,7 +1775,7 @@ mod tests {
             .adaptive_source_observation
             .sha256 = Sha256Digest::zero();
         assert!(
-            promoted_observation_semantic_sha256(&root, &finalization, "observation-a", &raw,)
+            promoted_observation_semantic_sha256(&root, &finalization, &observation_id, &raw,)
                 .is_err()
         );
         let mut destination_tampered =
@@ -1764,7 +1786,7 @@ mod tests {
         assert!(promoted_observation_semantic_sha256(
             &root,
             &destination_tampered,
-            "observation-a",
+            &observation_id,
             &raw,
         )
         .is_err());

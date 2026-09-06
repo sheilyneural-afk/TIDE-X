@@ -1,5 +1,6 @@
 use crate::contracts::ApertureCandidate;
 use crate::error::{BrainError, BrainResult};
+use crate::identity::ApertureId;
 use crate::linalg::{dot, Matrix};
 use crate::validation::validate_symmetric_psd;
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApertureScore {
-    pub aperture_id: String,
+    pub aperture_id: ApertureId,
     pub information_gain: f64,
     pub objective: f64,
 }
@@ -15,7 +16,7 @@ pub struct ApertureScore {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AperturePlanStep {
     pub step: usize,
-    pub aperture_id: String,
+    pub aperture_id: ApertureId,
     pub information_gain: f64,
     pub objective: f64,
     pub posterior_trace_before: f64,
@@ -24,6 +25,7 @@ pub struct AperturePlanStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveAperturePlan {
     pub schema: String,
     pub initial_posterior_trace: f64,
@@ -31,18 +33,23 @@ pub struct ActiveAperturePlan {
     pub total_trace_reduction: f64,
     pub total_information_gain: f64,
     pub steps: Vec<AperturePlanStep>,
-    pub unselected_aperture_ids: Vec<String>,
+    pub unselected_aperture_ids: Vec<ApertureId>,
     pub stopped_on_nonpositive_objective: bool,
     pub final_posterior_covariance: Vec<Vec<f64>>,
 }
 
 fn validate_candidate(candidate: &ApertureCandidate, dimension: usize) -> BrainResult<()> {
-    if candidate.aperture_id.trim().is_empty()
-        || candidate.sensing_vector.len() != dimension
+    if candidate.sensing_vector.len() != dimension
         || candidate
             .sensing_vector
             .iter()
             .any(|value| !value.is_finite())
+        || candidate
+            .sensing_vector
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            <= 1e-30
         || candidate.noise_variance <= 0.0
         || !candidate.noise_variance.is_finite()
         || !candidate.cost.is_finite()
@@ -97,10 +104,10 @@ pub fn choose_active_aperture(
             information_gain,
             objective,
         };
-        if best
-            .as_ref()
-            .is_none_or(|current| score.objective > current.objective)
-        {
+        if best.as_ref().is_none_or(|current| {
+            score.objective > current.objective
+                || (score.objective == current.objective && score.aperture_id < current.aperture_id)
+        }) {
             best = Some(score);
         }
     }
@@ -286,6 +293,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aperture_candidate_wire_rejects_paths_and_digests() {
+        let candidate = serde_json::json!({
+            "aperture_id": "../outside",
+            "sensing_vector": [1.0],
+            "noise_variance": 1.0,
+            "cost": 0.0,
+            "risk": 0.0
+        });
+        assert!(serde_json::from_value::<ApertureCandidate>(candidate).is_err());
+        let digest = serde_json::json!({
+            "aperture_id": "a".repeat(64),
+            "sensing_vector": [1.0],
+            "noise_variance": 1.0,
+            "cost": 0.0,
+            "risk": 0.0
+        });
+        assert!(serde_json::from_value::<ApertureCandidate>(digest).is_err());
+    }
+
+    #[test]
     fn active_aperture_rejects_indefinite_covariance() {
         let mut covariance = Matrix::zeros(2, 2);
         covariance.set(0, 0, 1.0);
@@ -298,6 +325,33 @@ mod tests {
             risk: 0.0,
         };
         assert!(choose_active_aperture(&[candidate], &covariance, 0.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn active_aperture_rejects_zero_sensing_and_breaks_ties_canonically() {
+        let covariance = Matrix::identity(2);
+        let zero = ApertureCandidate {
+            aperture_id: "zero".into(),
+            sensing_vector: vec![0.0, 0.0],
+            noise_variance: 1.0,
+            cost: 0.0,
+            risk: 0.0,
+        };
+        assert!(choose_active_aperture(&[zero], &covariance, 0.0, 0.0).is_err());
+
+        let make = |id: &str| ApertureCandidate {
+            aperture_id: id.into(),
+            sensing_vector: vec![1.0, 0.0],
+            noise_variance: 1.0,
+            cost: 0.0,
+            risk: 0.0,
+        };
+        let forward =
+            choose_active_aperture(&[make("zeta"), make("alpha")], &covariance, 0.0, 0.0).unwrap();
+        let reverse =
+            choose_active_aperture(&[make("alpha"), make("zeta")], &covariance, 0.0, 0.0).unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.aperture_id.as_str(), "alpha");
     }
 
     #[test]
@@ -320,7 +374,7 @@ mod tests {
             },
         ];
         let selected = choose_active_aperture(&candidates, &covariance, 0.1, 0.1).unwrap();
-        assert_eq!(selected.aperture_id, "strong");
+        assert_eq!(selected.aperture_id.as_str(), "strong");
     }
 
     #[test]

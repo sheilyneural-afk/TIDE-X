@@ -1,6 +1,7 @@
 use crate::causal_credit::CausalCreditReport;
 use crate::contracts::SkillField;
 use crate::error::{BrainError, BrainResult};
+use crate::identity::SkillId;
 use crate::linalg::{cosine, Matrix};
 use crate::validation::validate_symmetric_psd;
 use serde::{Deserialize, Serialize};
@@ -68,7 +69,7 @@ pub struct CognitiveFieldDrive {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CognitiveCoalition {
-    pub field_ids: Vec<String>,
+    pub field_ids: Vec<SkillId>,
     pub mean_activation: f64,
     pub internal_coherence: f64,
     pub salience: f64,
@@ -77,7 +78,7 @@ pub struct CognitiveCoalition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CognitiveFieldState {
     pub schema: String,
-    pub field_ids: Vec<String>,
+    pub field_ids: Vec<SkillId>,
     pub activations: Vec<f64>,
     pub steps: usize,
     pub converged: bool,
@@ -91,16 +92,16 @@ pub struct CognitiveFieldState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FieldRoutingDecision {
     pub schema: String,
-    pub field_ids: Vec<String>,
+    pub field_ids: Vec<SkillId>,
     pub coefficients: Vec<f64>,
-    pub selected_field_ids: Vec<String>,
+    pub selected_field_ids: Vec<SkillId>,
     pub selected_activation_mass: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DynamicCognitiveField {
     pub schema: String,
-    pub field_ids: Vec<String>,
+    pub field_ids: Vec<SkillId>,
     pub coupling_matrix: Vec<Vec<f64>>,
     pub positive_laplacian: Vec<Vec<f64>>,
     pub causal_bias: Vec<f64>,
@@ -199,7 +200,7 @@ fn functional_similarity(left: &SkillField, right: &SkillField) -> BrainResult<f
     }
 }
 
-fn attractor_digest(field_ids: &[String], activations: &[f64]) -> String {
+fn attractor_digest(field_ids: &[SkillId], activations: &[f64]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"CEREBRO:TIDEX:COGNITIVE-FIELD-ATTRACTOR:v1\0");
     for (field_id, activation) in field_ids.iter().zip(activations) {
@@ -259,15 +260,9 @@ impl DynamicCognitiveField {
             ));
         }
 
-        let pair_scale = robust_effect_scale(
-            causal
-                .pair_interactions
-                .iter()
-                .map(|row| row.mean_interaction_effect),
-        );
         let marginal_scale =
             robust_effect_scale(causal.fields.iter().map(|row| row.mean_marginal_effect));
-        let mut pair_effects = BTreeMap::<(String, String), f64>::new();
+        let mut pair_effects = BTreeMap::<(SkillId, SkillId), f64>::new();
         for pair in &causal.pair_interactions {
             if !pair.resolved
                 || !pair.mean_interaction_effect.is_finite()
@@ -284,15 +279,15 @@ impl DynamicCognitiveField {
             } else {
                 (pair.right_skill_id.clone(), pair.left_skill_id.clone())
             };
-            if pair_effects
-                .insert(key, pair.mean_interaction_effect)
-                .is_some()
-            {
+            let conservative_effect = pair.lower_confidence_bound()?;
+            if pair_effects.insert(key, conservative_effect).is_some() {
                 return Err(BrainError::Integrity(
                     "cognitive_field_pair_interaction_duplicate".into(),
                 ));
             }
         }
+
+        let pair_scale = robust_effect_scale(pair_effects.values().copied());
 
         let expected_pairs = n * n.saturating_sub(1) / 2;
         if config.causal_interaction_weight > 0.0 && pair_effects.len() != expected_pairs {
@@ -601,9 +596,9 @@ mod tests {
 
     fn field(id: &str, functional: Vec<f64>) -> SkillField {
         SkillField {
-            skill_id: id.into(),
-            reconstruction_id: String::new(),
-            lineage_id: String::new(),
+            skill_id: SkillId::parse(id).unwrap(),
+            reconstruction_id: Default::default(),
+            lineage_id: Default::default(),
             generation_created: 1,
             direction: vec![1.0, 0.0],
             structured_geometry: None,
@@ -631,7 +626,7 @@ mod tests {
             fields: ["a", "b", "c"]
                 .into_iter()
                 .map(|id| FieldCausalCredit {
-                    skill_id: id.into(),
+                    skill_id: SkillId::parse(id).unwrap(),
                     matched_pairs: 16,
                     independent_contexts: 4,
                     mean_marginal_effect: 0.2,
@@ -644,8 +639,8 @@ mod tests {
                 .collect(),
             pair_interactions: vec![
                 PairInteractionCredit {
-                    left_skill_id: "a".into(),
-                    right_skill_id: "b".into(),
+                    left_skill_id: SkillId::parse("a").unwrap(),
+                    right_skill_id: SkillId::parse("b").unwrap(),
                     matched_quads: 8,
                     independent_contexts: 4,
                     mean_interaction_effect: 0.3,
@@ -653,8 +648,8 @@ mod tests {
                     resolved: true,
                 },
                 PairInteractionCredit {
-                    left_skill_id: "a".into(),
-                    right_skill_id: "c".into(),
+                    left_skill_id: SkillId::parse("a").unwrap(),
+                    right_skill_id: SkillId::parse("c").unwrap(),
                     matched_quads: 8,
                     independent_contexts: 4,
                     mean_interaction_effect: -0.2,
@@ -662,8 +657,8 @@ mod tests {
                     resolved: true,
                 },
                 PairInteractionCredit {
-                    left_skill_id: "b".into(),
-                    right_skill_id: "c".into(),
+                    left_skill_id: SkillId::parse("b").unwrap(),
+                    right_skill_id: SkillId::parse("c").unwrap(),
                     matched_quads: 8,
                     independent_contexts: 4,
                     mean_interaction_effect: -0.2,
@@ -728,6 +723,33 @@ mod tests {
             CognitiveFieldConfig::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn uncertain_pairwise_synergy_is_routed_as_possible_interference() {
+        let fields = vec![
+            field("a", vec![1.0, 0.0]),
+            field("b", vec![1.0, 0.0]),
+            field("c", vec![1.0, 0.0]),
+        ];
+        let mut evidence = causal();
+        let pair = evidence
+            .pair_interactions
+            .iter_mut()
+            .find(|pair| pair.left_skill_id == "a" && pair.right_skill_id == "b")
+            .unwrap();
+        pair.mean_interaction_effect = 0.3;
+        pair.standard_error = 0.3;
+        let config = CognitiveFieldConfig {
+            curvature_weight: 0.0,
+            causal_interaction_weight: 1.0,
+            functional_compatibility_weight: 0.0,
+            coupling_gain: 1.0,
+            ..CognitiveFieldConfig::default()
+        };
+        let model =
+            DynamicCognitiveField::build(&fields, &Matrix::identity(3), &evidence, config).unwrap();
+        assert!(model.coupling_matrix[0][1] < 0.0);
     }
 
     #[test]

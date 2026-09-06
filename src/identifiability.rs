@@ -2,12 +2,14 @@
 
 use crate::contracts::SkillField;
 use crate::error::{BrainError, BrainResult};
-use crate::linalg::{cosine, inverse_with_ridge, symmetric_eigen_jacobi, Matrix};
+use crate::identity::SkillId;
+use crate::linalg::{cosine, inverse_with_ridge, norm, symmetric_eigen_jacobi, Matrix};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FieldResolution {
-    pub skill_id: String,
+    pub skill_id: SkillId,
     pub coefficient_rms: f64,
     pub posterior_std: f64,
     pub signal_to_posterior_noise: f64,
@@ -29,7 +31,7 @@ pub struct ResolutionMap {
     pub posterior_covariance: Vec<Vec<f64>>,
     pub fields: Vec<FieldResolution>,
     pub all_fields_resolved: bool,
-    pub unresolved_field_ids: Vec<String>,
+    pub unresolved_field_ids: Vec<SkillId>,
 }
 
 fn gram_of_fields(fields: &[SkillField]) -> BrainResult<Matrix> {
@@ -39,12 +41,20 @@ fn gram_of_fields(fields: &[SkillField]) -> BrainResult<Matrix> {
         ));
     }
     let dim = fields[0].direction.len();
-    if dim == 0
-        || fields.iter().any(|field| {
-            field.direction.len() != dim || field.direction.iter().any(|value| !value.is_finite())
-        })
-    {
+    let mut skill_ids = BTreeSet::new();
+    let norm_tolerance = f64::EPSILON.sqrt() * (dim.max(1) as f64).sqrt() * 16.0;
+    if dim == 0 {
         return Err(BrainError::Invalid("identifiability_field_shape".into()));
+    }
+    for field in fields {
+        if field.skill_id.trim().is_empty()
+            || !skill_ids.insert(field.skill_id.as_str())
+            || field.direction.len() != dim
+            || field.direction.iter().any(|value| !value.is_finite())
+            || (norm(&field.direction)? - 1.0).abs() > norm_tolerance
+        {
+            return Err(BrainError::Invalid("identifiability_field_shape".into()));
+        }
     }
     let mut gram = Matrix::zeros(fields.len(), fields.len());
     for i in 0..fields.len() {
@@ -58,12 +68,13 @@ fn gram_of_fields(fields: &[SkillField]) -> BrainResult<Matrix> {
 }
 
 fn excitation_information(coefficients: &Matrix, weights: &[f64]) -> BrainResult<Matrix> {
+    coefficients.validate("identifiability_coefficients")?;
     if coefficients.rows == 0
         || coefficients.cols == 0
         || coefficients.rows != weights.len()
         || weights
             .iter()
-            .any(|weight| !weight.is_finite() || *weight < 0.0)
+            .any(|weight| !weight.is_finite() || *weight <= 0.0)
     {
         return Err(BrainError::Invalid(
             "identifiability_excitation_shape".into(),
@@ -79,6 +90,7 @@ fn excitation_information(coefficients: &Matrix, weights: &[f64]) -> BrainResult
             }
         }
     }
+    info.validate("identifiability_excitation")?;
     Ok(info)
 }
 
@@ -134,6 +146,7 @@ pub fn resolution_map(
     minimum_signal_to_noise: f64,
 ) -> BrainResult<ResolutionMap> {
     if fields.len() != coefficients.cols
+        || coefficients.rows != observation_weights.len()
         || !reconstruction_rms.is_finite()
         || reconstruction_rms < 0.0
         || !ridge.is_finite()
@@ -155,18 +168,33 @@ pub fn resolution_map(
     let mut field_resolution = Vec::with_capacity(fields.len());
     let mut unresolved = Vec::new();
     for field_index in 0..fields.len() {
-        let coefficient_rms = (0..coefficients.rows)
+        let weighted_squared_coefficient = (0..coefficients.rows)
             .map(|row| observation_weights[row] * coefficients.get(row, field_index).powi(2))
-            .sum::<f64>()
-            .sqrt()
-            / observation_weights
+            .sum::<f64>();
+        let total_observation_weight = observation_weights.iter().copied().sum::<f64>();
+        if !weighted_squared_coefficient.is_finite()
+            || !total_observation_weight.is_finite()
+            || total_observation_weight <= 0.0
+        {
+            return Err(BrainError::Numerical(
+                "identifiability_coefficient_energy_invalid".into(),
+            ));
+        }
+        let coefficient_rms = (weighted_squared_coefficient / total_observation_weight).sqrt();
+        let covariance_diagonal = covariance.get(field_index, field_index);
+        let covariance_tolerance = f64::EPSILON.sqrt()
+            * covariance
+                .as_slice()
                 .iter()
-                .copied()
-                .sum::<f64>()
-                .sqrt()
-                .max(1e-15);
-        let posterior_std =
-            (covariance.get(field_index, field_index).max(0.0) * noise_variance).sqrt();
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+        if covariance_diagonal < -covariance_tolerance {
+            return Err(BrainError::Numerical(
+                "identifiability_negative_posterior_variance".into(),
+            ));
+        }
+        let posterior_std = (covariance_diagonal.max(0.0) * noise_variance).sqrt();
         let signal_to_posterior_noise = coefficient_rms / posterior_std.max(1e-15);
         // One-sigma identifiability: the observed field amplitude must exceed
         // its posterior standard deviation, and the joint system must have full
@@ -212,9 +240,9 @@ mod tests {
 
     fn field(id: &str, direction: Vec<f64>) -> SkillField {
         SkillField {
-            skill_id: id.into(),
-            reconstruction_id: String::new(),
-            lineage_id: String::new(),
+            skill_id: SkillId::parse(id).unwrap(),
+            reconstruction_id: Default::default(),
+            lineage_id: Default::default(),
             generation_created: 1,
             direction,
             structured_geometry: None,
@@ -251,7 +279,7 @@ mod tests {
 
     #[test]
     fn resolution_map_marks_collinear_fields_unresolved() {
-        let fields = vec![field("a", vec![1.0, 0.0]), field("b", vec![2.0, 0.0])];
+        let fields = vec![field("a", vec![1.0, 0.0]), field("b", vec![1.0, 0.0])];
         let coefficients = Matrix::from_rows(&[
             vec![1.0, 2.0],
             vec![2.0, 4.0],
@@ -263,5 +291,15 @@ mod tests {
         assert!(map.resolved_rank < 2);
         assert!(!map.all_fields_resolved);
         assert_eq!(map.unresolved_field_ids.len(), 2);
+    }
+
+    #[test]
+    fn resolution_map_rejects_zero_weight_and_noncanonical_field_geometry() {
+        let fields = vec![field("a", vec![1.0, 0.0])];
+        let coefficients = Matrix::from_rows(&[vec![1.0], vec![2.0]]).unwrap();
+        assert!(resolution_map(&fields, &coefficients, &[1.0, 0.0], 0.01, 1e-6, 1.0).is_err());
+
+        let invalid = vec![field("a", vec![2.0, 0.0])];
+        assert!(resolution_map(&invalid, &coefficients, &[1.0; 2], 0.01, 1e-6, 1.0).is_err());
     }
 }

@@ -32,6 +32,29 @@ pub fn fit_functional_map(
     if coeff.rows != observations.len() || coeff.rows < 4 {
         return Err(BrainError::Invalid("functional_shape".into()));
     }
+    if coeff.data.iter().any(|value| !value.is_finite()) {
+        return Err(BrainError::Invalid(
+            "functional_coefficients_non_finite".into(),
+        ));
+    }
+    if !ridge.is_finite() || ridge <= 0.0 {
+        return Err(BrainError::Invalid("functional_ridge_invalid".into()));
+    }
+    if observations.iter().any(|observation| {
+        !observation.reliability.is_finite()
+            || observation.reliability <= 0.0
+            || observation.reliability > 1.0
+    }) {
+        return Err(BrainError::Invalid("functional_reliability_invalid".into()));
+    }
+    if observations.iter().any(|observation| {
+        observation
+            .functional_response
+            .iter()
+            .any(|value| !value.is_finite())
+    }) {
+        return Err(BrainError::Invalid("functional_response_non_finite".into()));
+    }
     let out_dim = observations
         .iter()
         .find(|o| !o.functional_response.is_empty())
@@ -54,7 +77,7 @@ pub fn fit_functional_map(
         let x = design(coeff, train)?;
         let weights = train
             .iter()
-            .map(|&r| observations[r].reliability.clamp(1e-4, 1.0))
+            .map(|&r| observations[r].reliability)
             .collect::<Vec<_>>();
         for out in 0..out_dim {
             let y = train
@@ -79,7 +102,7 @@ pub fn fit_functional_map(
     let x = design(coeff, &all)?;
     let weights = observations
         .iter()
-        .map(|o| o.reliability.clamp(1e-4, 1.0))
+        .map(|o| o.reliability)
         .collect::<Vec<_>>();
     let mut signatures = vec![vec![0.0; out_dim]; coeff.cols];
     for out in 0..out_dim {

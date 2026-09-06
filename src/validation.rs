@@ -13,6 +13,16 @@ pub fn valid_observation_id(value: &str) -> bool {
     ObservationId::parse(value).is_ok()
 }
 
+/// Accept only real evidence weights. A missing or unusable observation must
+/// be rejected by the owning protocol, never promoted to a small positive
+/// weight by a numerical convenience clamp.
+pub fn validate_reliability(value: f64, label: &str) -> BrainResult<f64> {
+    if !value.is_finite() || value <= 0.0 || value > 1.0 {
+        return Err(BrainError::Invalid(format!("{label}_reliability_invalid")));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupFold {
     pub holdout_group: String,
@@ -47,7 +57,12 @@ pub fn independence_group_folds(
     observations: &[DeltaObservation],
     minimum_groups: usize,
 ) -> BrainResult<Vec<GroupFold>> {
-    if observations.is_empty() || minimum_groups < 2 {
+    if observations.is_empty()
+        || minimum_groups < 2
+        || observations
+            .iter()
+            .any(|observation| observation.independence_group.trim().is_empty())
+    {
         return Err(BrainError::Invalid("grouped_cv_input_invalid".into()));
     }
     let groups = observations

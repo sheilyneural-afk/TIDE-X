@@ -9,13 +9,15 @@ use crate::authority::{
     replace_private_file_atomic,
 };
 use crate::contracts::{ApertureCandidate, DeltaObservation};
-use crate::digest::Sha256Digest;
+use crate::digest::{
+    AdaptiveLearningPolicyDigest, AdaptiveLearningReceiptDigest, LearningEvidenceDigest,
+    LearningTargetDigest, Sha256Digest,
+};
 use crate::error::{BrainError, BrainResult};
-use crate::identity::SessionId;
+use crate::identity::{ApertureId, CapabilityId, LearningTargetId, ObservationId, SessionId};
 use crate::ledger;
 use crate::linalg::{dot, norm, Matrix};
 use crate::security::{secure_file, verify_private_root};
-use crate::validation::valid_observation_id;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -27,8 +29,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LearningTarget {
-    pub target_id: String,
-    pub capability_ids: Vec<String>,
+    pub target_id: LearningTargetId,
+    pub capability_ids: Vec<CapabilityId>,
     #[serde(default = "default_candidate_budget")]
     pub candidate_budget: usize,
     #[serde(default = "default_plan_steps")]
@@ -58,20 +60,22 @@ fn default_risk_weight() -> f64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LearningAperture {
-    pub aperture_id: String,
+    pub aperture_id: ApertureId,
     pub capability_weights: Vec<f64>,
-    pub active_capability_ids: Vec<String>,
+    pub active_capability_ids: Vec<CapabilityId>,
     pub information_gain: f64,
     pub objective: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AutonomousLearningPlan {
     pub schema: String,
-    pub target_id: String,
-    pub target_digest: String,
-    pub capability_ids: Vec<String>,
+    pub target_id: LearningTargetId,
+    pub target_digest: LearningTargetDigest,
+    pub capability_ids: Vec<CapabilityId>,
     pub candidate_count: usize,
     pub design_rank: usize,
     pub minimum_capability_coverage: usize,
@@ -85,6 +89,7 @@ pub struct AutonomousLearningPlan {
 /// pure information-design artifact, while a live session must declare how a
 /// realized outcome affects its next experiment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveLearningPolicy {
     pub schema: String,
     /// Positive multiplier for the posterior-predicted outcome in the live
@@ -98,22 +103,24 @@ pub struct AdaptiveLearningPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveLearningSession {
     pub schema: String,
-    pub target_digest: String,
+    pub target_digest: LearningTargetDigest,
     pub policy: AdaptiveLearningPolicy,
-    pub policy_digest: String,
-    pub capability_ids: Vec<String>,
+    pub policy_digest: AdaptiveLearningPolicyDigest,
+    pub capability_ids: Vec<CapabilityId>,
     pub posterior: GaussianAperturePosterior,
-    pub completed_aperture_ids: Vec<String>,
+    pub completed_aperture_ids: Vec<ApertureId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveLearningStep {
     pub schema: String,
-    pub aperture_id: String,
+    pub aperture_id: ApertureId,
     pub capability_weights: Vec<f64>,
-    pub active_capability_ids: Vec<String>,
+    pub active_capability_ids: Vec<CapabilityId>,
     pub noise_variance: f64,
     pub cost: f64,
     pub risk: f64,
@@ -129,13 +136,14 @@ pub struct AdaptiveLearningStep {
 /// must emit this envelope only after the experiment, its measurement and all
 /// referenced artifacts exist. The Rust cycle never fabricates one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LearningExperimentEvidence {
     pub schema: String,
-    pub session_id: String,
-    pub target_digest: String,
-    pub aperture_id: String,
+    pub session_id: SessionId,
+    pub target_digest: LearningTargetDigest,
+    pub aperture_id: ApertureId,
     pub observed_value: f64,
-    pub observation_id: String,
+    pub observation_id: ObservationId,
     /// The exact experimental observation used to derive `observed_value`.
     pub observation: EvidenceReference,
     pub evidence_files: Vec<EvidenceReference>,
@@ -145,16 +153,17 @@ pub struct LearningExperimentEvidence {
 /// A small atomic pointer selects the current receipt; the receipt history is
 /// append-only and hash-addressed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveLearningCycle {
     pub schema: String,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub target: LearningTarget,
-    pub target_digest: String,
-    pub policy_digest: String,
+    pub target_digest: LearningTargetDigest,
+    pub policy_digest: AdaptiveLearningPolicyDigest,
     pub session: AdaptiveLearningSession,
     pub pending_step: Option<AdaptiveLearningStep>,
     pub completed_evidence: Vec<LearningExperimentEvidence>,
-    pub completed_evidence_sha256: Vec<String>,
+    pub completed_evidence_sha256: Vec<LearningEvidenceDigest>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,15 +187,16 @@ impl AdaptiveLearningEventKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveLearningReceipt {
     pub schema: String,
     pub event_kind: AdaptiveLearningEventKind,
     pub generation: u64,
-    pub session_id: String,
-    pub target_digest: String,
-    pub policy_digest: String,
-    pub prior_receipt_sha256: Option<String>,
-    pub evidence_sha256: Option<String>,
+    pub session_id: SessionId,
+    pub target_digest: LearningTargetDigest,
+    pub policy_digest: AdaptiveLearningPolicyDigest,
+    pub prior_receipt_sha256: Option<AdaptiveLearningReceiptDigest>,
+    pub evidence_sha256: Option<LearningEvidenceDigest>,
     pub cycle: AdaptiveLearningCycle,
 }
 
@@ -194,19 +204,18 @@ pub struct AdaptiveLearningReceipt {
 #[serde(deny_unknown_fields)]
 struct AdaptiveLearningPointer {
     schema: String,
-    session_id: String,
-    receipt_sha256: String,
+    session_id: SessionId,
+    receipt_sha256: AdaptiveLearningReceiptDigest,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedAdaptiveLearningReceipt {
-    pub receipt_sha256: String,
+    pub receipt_sha256: AdaptiveLearningReceiptDigest,
     pub receipt: AdaptiveLearningReceipt,
 }
 
 fn validate_target(target: &LearningTarget) -> BrainResult<()> {
-    if target.target_id.trim().is_empty()
-        || target.capability_ids.len() < 2
+    if target.capability_ids.len() < 2
         || target.capability_ids.len() > 256
         || target.candidate_budget < target.capability_ids.len()
         || target.plan_steps < target.capability_ids.len()
@@ -222,7 +231,7 @@ fn validate_target(target: &LearningTarget) -> BrainResult<()> {
     }
     let mut seen = BTreeSet::new();
     for id in &target.capability_ids {
-        if id.trim().is_empty() || !seen.insert(id) {
+        if !seen.insert(id) {
             return Err(BrainError::Invalid(
                 "learning_target_capability_identity_invalid".into(),
             ));
@@ -262,7 +271,9 @@ fn stable_u64(target_id: &str, counter: u64) -> u64 {
     hasher.update(target_id.as_bytes());
     hasher.update(counter.to_be_bytes());
     let digest = hasher.finalize();
-    u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix is 8 bytes"))
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(prefix)
 }
 
 fn next_random(state: &mut u64) -> u64 {
@@ -282,7 +293,7 @@ fn candidate_key(weights: &[f64]) -> Vec<u8> {
 fn generate_candidates(target: &LearningTarget) -> BrainResult<Vec<ApertureCandidate>> {
     validate_target(target)?;
     let dimension = target.capability_ids.len();
-    let mut rows = Vec::<(String, Vec<f64>, f64, f64)>::new();
+    let mut rows = Vec::<(ApertureId, Vec<f64>, f64, f64)>::new();
     let mut seen = BTreeSet::<Vec<u8>>::new();
 
     // Identity apertures guarantee a spanning design even if every mixed
@@ -291,7 +302,12 @@ fn generate_candidates(target: &LearningTarget) -> BrainResult<Vec<ApertureCandi
         let mut direction = vec![0.0; dimension];
         direction[index] = 1.0;
         seen.insert(candidate_key(&direction));
-        rows.push((format!("isolate-{index:03}"), direction, 4.0, 0.02));
+        rows.push((
+            ApertureId::parse(format!("isolate-{index:03}"))?,
+            direction,
+            4.0,
+            0.02,
+        ));
     }
 
     // Pair apertures expose pairwise interaction directions without requiring
@@ -306,7 +322,12 @@ fn generate_candidates(target: &LearningTarget) -> BrainResult<Vec<ApertureCandi
             direction[right] = 1.0;
             let key = candidate_key(&direction);
             if seen.insert(key) {
-                rows.push((format!("pair-{left:03}-{right:03}"), direction, 0.8, 0.03));
+                rows.push((
+                    ApertureId::parse(format!("pair-{left:03}-{right:03}"))?,
+                    direction,
+                    0.8,
+                    0.03,
+                ));
             }
         }
     }
@@ -316,7 +337,7 @@ fn generate_candidates(target: &LearningTarget) -> BrainResult<Vec<ApertureCandi
     // generic across independent learning producers and targets.
     let mut counter = 0u64;
     while rows.len() < target.candidate_budget {
-        let mut state = stable_u64(&target.target_id, counter);
+        let mut state = stable_u64(target.target_id.as_str(), counter);
         counter = counter.wrapping_add(1);
         let desired = (2 + (next_random(&mut state) as usize % dimension.saturating_sub(1).max(1)))
             .min(dimension);
@@ -339,7 +360,7 @@ fn generate_candidates(target: &LearningTarget) -> BrainResult<Vec<ApertureCandi
             continue;
         }
         rows.push((
-            format!("mixed-{:04}", rows.len()),
+            ApertureId::parse(format!("mixed-{:04}", rows.len()))?,
             direction,
             0.65 + 0.04 * desired as f64,
             (0.02 + 0.005 * desired as f64).min(0.25),
@@ -445,12 +466,16 @@ pub fn plan_autonomous_learning(target: &LearningTarget) -> BrainResult<Autonomo
     })
 }
 
-fn target_digest(target: &LearningTarget) -> BrainResult<String> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(target)?)))
+fn target_digest(target: &LearningTarget) -> BrainResult<LearningTargetDigest> {
+    Ok(LearningTargetDigest::from(Sha256Digest::digest_bytes(
+        &serde_json::to_vec(target)?,
+    )))
 }
 
-fn policy_digest(policy: &AdaptiveLearningPolicy) -> BrainResult<String> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(policy)?)))
+fn policy_digest(policy: &AdaptiveLearningPolicy) -> BrainResult<AdaptiveLearningPolicyDigest> {
+    Ok(AdaptiveLearningPolicyDigest::from(
+        Sha256Digest::digest_bytes(&serde_json::to_vec(policy)?),
+    ))
 }
 
 pub fn start_adaptive_learning(
@@ -622,7 +647,7 @@ pub fn next_learning_aperture(
     let completed = session
         .completed_aperture_ids
         .iter()
-        .map(String::as_str)
+        .map(ApertureId::as_str)
         .collect::<BTreeSet<_>>();
     let remaining = generate_candidates(target)?
         .into_iter()
@@ -741,6 +766,7 @@ pub fn assimilate_learning_result(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -921,16 +947,15 @@ pub(crate) fn confined_existing_file(
 fn validate_experiment_evidence(
     root: &Path,
     evidence: &LearningExperimentEvidence,
-    session_id: &str,
-    target_digest: &str,
-    aperture_id: &str,
+    session_id: &SessionId,
+    target_digest: &LearningTargetDigest,
+    aperture_id: &ApertureId,
     capability_weights: &[f64],
 ) -> BrainResult<()> {
     if evidence.schema != "cerebro.tidex.learning_experiment_evidence/v1"
-        || evidence.session_id != session_id
-        || evidence.target_digest != target_digest
-        || evidence.aperture_id != aperture_id
-        || !valid_observation_id(&evidence.observation_id)
+        || evidence.session_id != *session_id
+        || evidence.target_digest != *target_digest
+        || evidence.aperture_id != *aperture_id
         || !evidence.observed_value.is_finite()
         || evidence.evidence_files.is_empty()
         || !Sha256Digest::is_valid_str(evidence.observation.sha256.as_str())
@@ -945,9 +970,8 @@ fn validate_experiment_evidence(
         Some(&evidence.observation.sha256),
     )?;
     let observation: DeltaObservation = serde_json::from_slice(&fs::read(observation_path)?)?;
-    if !valid_observation_id(&observation.observation_id)
-        || observation.observation_id != evidence.observation_id
-        || observation.independence_group != aperture_id
+    if observation.observation_id != evidence.observation_id
+        || observation.independence_group != aperture_id.as_str()
         || observation.delta.is_empty()
         || observation.delta.iter().any(|value| !value.is_finite())
         || observation.functional_response.len() != capability_weights.len()
@@ -958,7 +982,6 @@ fn validate_experiment_evidence(
         || !observation.reliability.is_finite()
         || !(0.0..=1.0).contains(&observation.reliability)
         || observation.reliability <= 0.0
-        || !Sha256Digest::is_valid_str(&observation.provenance_digest)
         || observation.dense_artifact.is_none()
         || observation
             .parameter_layout_sha256
@@ -978,7 +1001,7 @@ fn validate_experiment_evidence(
             "adaptive_learning_observation_dense_artifact_noncanonical".into(),
         ));
     }
-    let dense_values = crate::artifact::read_dvec_f32(dense)?;
+    let dense_values = crate::artifact::read_dvec_f32(root, dense)?;
     if dense_values.len() as u64 != dense.parameter_count || dense_values.is_empty() {
         return Err(BrainError::Integrity(
             "adaptive_learning_observation_dense_artifact_contract_invalid".into(),
@@ -1022,7 +1045,6 @@ fn validate_experiment_evidence(
 
 fn validate_cycle(root: &Path, cycle: &AdaptiveLearningCycle) -> BrainResult<()> {
     if cycle.schema != "cerebro.tidex.adaptive_learning_cycle/v1"
-        || SessionId::parse(&cycle.session_id).is_err()
         || cycle.target_digest != target_digest(&cycle.target)?
         || cycle.policy_digest != policy_digest(&cycle.session.policy)?
         || cycle.session.target_digest != cycle.target_digest
@@ -1043,16 +1065,13 @@ fn validate_cycle(root: &Path, cycle: &AdaptiveLearningCycle) -> BrainResult<()>
         .zip(&cycle.completed_evidence_sha256)
         .zip(&cycle.session.completed_aperture_ids)
     {
-        if !Sha256Digest::is_valid_str(digest)
-            || evidence.aperture_id != *completed_id
-            || !completed_ids.insert(completed_id.clone())
-        {
+        if evidence.aperture_id != *completed_id || !completed_ids.insert(completed_id.clone()) {
             return Err(BrainError::Integrity(
                 "adaptive_learning_completed_evidence_identity_invalid".into(),
             ));
         }
-        let path = experiment_evidence_path(root, digest);
-        let path = confined_existing_file(root, &path, Some(digest)).map_err(|_| {
+        let path = experiment_evidence_path(root, digest.as_str());
+        let path = confined_existing_file(root, &path, Some(digest.as_str())).map_err(|_| {
             BrainError::Integrity("adaptive_learning_completed_evidence_artifact_invalid".into())
         })?;
         let persisted: LearningExperimentEvidence = serde_json::from_slice(&fs::read(&path)?)?;
@@ -1077,7 +1096,7 @@ fn validate_cycle(root: &Path, cycle: &AdaptiveLearningCycle) -> BrainResult<()>
             evidence,
             &cycle.session_id,
             &cycle.target_digest,
-            &candidate.aperture_id,
+            &evidence.aperture_id,
             &candidate.sensing_vector,
         )?;
     }
@@ -1102,20 +1121,9 @@ fn validate_cycle(root: &Path, cycle: &AdaptiveLearningCycle) -> BrainResult<()>
 
 fn validate_receipt_shape(root: &Path, receipt: &AdaptiveLearningReceipt) -> BrainResult<()> {
     if receipt.schema != "cerebro.tidex.adaptive_learning_receipt/v1"
-        || SessionId::parse(&receipt.session_id).is_err()
-        || !Sha256Digest::is_valid_str(&receipt.target_digest)
-        || !Sha256Digest::is_valid_str(&receipt.policy_digest)
         || receipt.cycle.session_id != receipt.session_id
         || receipt.cycle.target_digest != receipt.target_digest
         || receipt.cycle.policy_digest != receipt.policy_digest
-        || receipt
-            .prior_receipt_sha256
-            .as_deref()
-            .is_some_and(|digest| !Sha256Digest::is_valid_str(digest))
-        || receipt
-            .evidence_sha256
-            .as_deref()
-            .is_some_and(|digest| !Sha256Digest::is_valid_str(digest))
     {
         return Err(BrainError::Integrity(
             "adaptive_learning_receipt_contract_invalid".into(),
@@ -1124,28 +1132,26 @@ fn validate_receipt_shape(root: &Path, receipt: &AdaptiveLearningReceipt) -> Bra
     validate_cycle(root, &receipt.cycle)
 }
 
-fn load_receipt_by_sha(root: &Path, digest: &str) -> BrainResult<AdaptiveLearningReceipt> {
-    if !Sha256Digest::is_valid_str(digest) {
-        return Err(BrainError::Invalid(
-            "adaptive_learning_receipt_digest_invalid".into(),
-        ));
-    }
-    let path = receipt_path(root, digest);
-    let path = confined_existing_file(root, &path, Some(digest))
+fn load_receipt_by_sha(
+    root: &Path,
+    digest: &AdaptiveLearningReceiptDigest,
+) -> BrainResult<AdaptiveLearningReceipt> {
+    let path = receipt_path(root, digest.as_str());
+    let path = confined_existing_file(root, &path, Some(digest.as_str()))
         .map_err(|_| BrainError::Integrity("adaptive_learning_receipt_artifact_invalid".into()))?;
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
 fn verify_receipt_ledger_binding(
     root: &Path,
-    digest: &str,
+    digest: &AdaptiveLearningReceiptDigest,
     receipt: &AdaptiveLearningReceipt,
 ) -> BrainResult<()> {
     let event = ledger::find_v2_event_by_payload_string(
         root,
         "adaptive_learning_receipt",
         "receipt_sha256",
-        digest,
+        digest.as_str(),
     )?
     .ok_or_else(|| {
         BrainError::Integrity("adaptive_learning_receipt_ledger_event_missing".into())
@@ -1184,10 +1190,10 @@ fn same_cycle_base(left: &AdaptiveLearningCycle, right: &AdaptiveLearningCycle) 
 
 fn validate_receipt_transition(
     root: &Path,
-    digest: &str,
-    seen: &mut BTreeSet<String>,
+    digest: &AdaptiveLearningReceiptDigest,
+    seen: &mut BTreeSet<AdaptiveLearningReceiptDigest>,
 ) -> BrainResult<AdaptiveLearningReceipt> {
-    if !seen.insert(digest.to_string()) {
+    if !seen.insert(digest.clone()) {
         return Err(BrainError::Integrity(
             "adaptive_learning_receipt_chain_cycle".into(),
         ));
@@ -1244,7 +1250,7 @@ fn validate_receipt_transition(
             }
         }
         (Some(prior_digest), AdaptiveLearningEventKind::ResultAssimilated) => {
-            let evidence_digest = receipt.evidence_sha256.as_deref().ok_or_else(|| {
+            let evidence_digest = receipt.evidence_sha256.as_ref().ok_or_else(|| {
                 BrainError::Integrity(
                     "adaptive_learning_assimilation_evidence_digest_missing".into(),
                 )
@@ -1280,8 +1286,8 @@ fn validate_receipt_transition(
                     .cycle
                     .completed_evidence_sha256
                     .last()
-                    .map(String::as_str)
-                    != Some(evidence_digest)
+                    .map(LearningEvidenceDigest::as_str)
+                    != Some(evidence_digest.as_str())
             {
                 return Err(BrainError::Integrity(
                     "adaptive_learning_assimilation_receipt_lineage_invalid".into(),
@@ -1336,8 +1342,7 @@ fn load_current_receipt_under_root(
         })?;
     let pointer: AdaptiveLearningPointer = serde_json::from_slice(&fs::read(path)?)?;
     if pointer.schema != "cerebro.tidex.adaptive_learning_pointer/v1"
-        || pointer.session_id != session_id
-        || !Sha256Digest::is_valid_str(&pointer.receipt_sha256)
+        || pointer.session_id.as_str() != session_id
     {
         return Err(BrainError::Integrity(
             "adaptive_learning_current_pointer_contract_invalid".into(),
@@ -1345,7 +1350,7 @@ fn load_current_receipt_under_root(
     }
     let mut seen = BTreeSet::new();
     let receipt = validate_receipt_transition(root, &pointer.receipt_sha256, &mut seen)?;
-    if receipt.session_id != session_id {
+    if receipt.session_id.as_str() != session_id {
         return Err(BrainError::Integrity(
             "adaptive_learning_current_pointer_session_mismatch".into(),
         ));
@@ -1362,8 +1367,8 @@ fn persist_receipt_under_root(
 ) -> BrainResult<LoadedAdaptiveLearningReceipt> {
     validate_receipt_shape(root, &receipt)?;
     let raw = serde_json::to_vec_pretty(&receipt)?;
-    let digest = sha256_bytes(&raw);
-    let path = receipt_path(root, &digest);
+    let digest = AdaptiveLearningReceiptDigest::from(Sha256Digest::digest_bytes(&raw));
+    let path = receipt_path(root, digest.as_str());
     if private_regular_file_if_present(root, &path)?.is_some() {
         return Err(BrainError::Integrity(
             "adaptive_learning_receipt_digest_already_exists".into(),
@@ -1375,10 +1380,10 @@ fn persist_receipt_under_root(
         "adaptive_learning_receipt",
         json!({
             "schema":"cerebro.tidex.adaptive_learning_ledger_binding/v1",
-            "receipt_sha256":digest,
-            "session_id":receipt.session_id,
-            "target_digest":receipt.target_digest,
-            "policy_digest":receipt.policy_digest,
+            "receipt_sha256":&digest,
+            "session_id":&receipt.session_id,
+            "target_digest":&receipt.target_digest,
+            "policy_digest":&receipt.policy_digest,
             "event_kind":receipt.event_kind,
             "generation":receipt.generation,
         }),
@@ -1400,8 +1405,12 @@ fn persist_receipt_under_root(
     };
     let mut pointer_raw = serde_json::to_vec_pretty(&pointer)?;
     pointer_raw.push(b'\n');
-    write_private_atomic(root, &pointer_path(root, &receipt.session_id), &pointer_raw)?;
-    let loaded = load_current_receipt_under_root(root, &receipt.session_id)?;
+    write_private_atomic(
+        root,
+        &pointer_path(root, receipt.session_id.as_str()),
+        &pointer_raw,
+    )?;
+    let loaded = load_current_receipt_under_root(root, receipt.session_id.as_str())?;
     // `load_current_receipt_under_root` has re-read the pointer, verified the
     // content-addressed receipt and replayed its ledger-bound transition. The
     // digest is the exact serialized receipt identity; comparing re-parsed
@@ -1439,21 +1448,22 @@ fn start_persistent_adaptive_learning_under_root(
     }
     let target_digest = target_digest(target)?;
     let policy_digest = policy_digest(policy)?;
+    let session_id = SessionId::parse(session_id)?;
     let marker = json!({
         "schema":"cerebro.tidex.adaptive_learning_session_marker/v1",
-        "session_id":session_id,
-        "target_digest":target_digest,
-        "policy_digest":policy_digest,
+        "session_id":&session_id,
+        "target_digest":&target_digest,
+        "policy_digest":&policy_digest,
     });
     write_new_private(
         root,
-        &marker_path(root, session_id),
+        &marker_path(root, session_id.as_str()),
         &serde_json::to_vec_pretty(&marker)?,
     )?;
     let session = start_adaptive_learning(target, policy)?;
     let cycle = AdaptiveLearningCycle {
         schema: "cerebro.tidex.adaptive_learning_cycle/v1".into(),
-        session_id: session_id.to_string(),
+        session_id: session_id.clone(),
         target: target.clone(),
         target_digest: target_digest.clone(),
         policy_digest: policy_digest.clone(),
@@ -1468,7 +1478,7 @@ fn start_persistent_adaptive_learning_under_root(
             schema: "cerebro.tidex.adaptive_learning_receipt/v1".into(),
             event_kind: AdaptiveLearningEventKind::SessionStarted,
             generation: 0,
-            session_id: session_id.to_string(),
+            session_id,
             target_digest,
             policy_digest,
             prior_receipt_sha256: None,
@@ -1536,23 +1546,27 @@ pub fn issue_next_persistent_learning_aperture(
 fn read_experiment_evidence_from_path(
     root: &Path,
     path: &Path,
-) -> BrainResult<(LearningExperimentEvidence, Vec<u8>, String)> {
+) -> BrainResult<(LearningExperimentEvidence, Vec<u8>, LearningEvidenceDigest)> {
     let canonical = confined_existing_file(root, path, None)?;
     let raw = fs::read(canonical)?;
-    let digest = sha256_bytes(&raw);
+    let digest = LearningEvidenceDigest::from(Sha256Digest::digest_bytes(&raw));
     let evidence: LearningExperimentEvidence = serde_json::from_slice(&raw)?;
     Ok((evidence, raw, digest))
 }
 
-fn persist_experiment_evidence(root: &Path, digest: &str, raw: &[u8]) -> BrainResult<()> {
-    if !Sha256Digest::is_valid_str(digest) || sha256_bytes(raw) != digest {
+fn persist_experiment_evidence(
+    root: &Path,
+    digest: &LearningEvidenceDigest,
+    raw: &[u8],
+) -> BrainResult<()> {
+    if Sha256Digest::digest_bytes(raw) != *digest.as_digest() {
         return Err(BrainError::Integrity(
             "adaptive_learning_evidence_content_digest_invalid".into(),
         ));
     }
-    let path = experiment_evidence_path(root, digest);
+    let path = experiment_evidence_path(root, digest.as_str());
     if private_regular_file_if_present(root, &path)?.is_some() {
-        let _ = confined_existing_file(root, &path, Some(digest)).map_err(|_| {
+        let _ = confined_existing_file(root, &path, Some(digest.as_str())).map_err(|_| {
             BrainError::Integrity("adaptive_learning_evidence_artifact_collision".into())
         })?;
         return Ok(());
@@ -1664,10 +1678,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn versioned_learning_policy_rejects_unknown_wire_fields() {
+        let wire = serde_json::json!({
+            "schema": "cerebro.tidex.adaptive_learning_policy/v1",
+            "outcome_utility_weight": 1.0,
+            "maximize_observed_value": true,
+            "unreviewed_override": true
+        });
+        assert!(serde_json::from_value::<AdaptiveLearningPolicy>(wire).is_err());
+    }
+
     fn adaptive_target() -> LearningTarget {
         LearningTarget {
-            target_id: "adaptive".into(),
-            capability_ids: vec!["a".into(), "b".into(), "c".into()],
+            target_id: LearningTargetId::parse("adaptive").unwrap(),
+            capability_ids: ["a", "b", "c"]
+                .into_iter()
+                .map(|id| CapabilityId::parse(id).unwrap())
+                .collect(),
             candidate_budget: 32,
             plan_steps: 6,
             noise_variance: 0.1,
@@ -1693,7 +1721,7 @@ mod tests {
     fn write_test_evidence(
         root: &Path,
         session_id: &str,
-        target_digest: &str,
+        target_digest: &LearningTargetDigest,
         step: &AdaptiveLearningStep,
     ) -> PathBuf {
         let layout_raw = br#"{\"schema\":\"cerebro.tidex.parameter_layout/test\"}"#.to_vec();
@@ -1707,7 +1735,11 @@ mod tests {
             .map(|index| 0.2 + index as f64 * 0.15)
             .collect::<Vec<_>>();
         let observation = DeltaObservation {
-            observation_id: format!("observation-{}", step.aperture_id),
+            observation_id: crate::identity::ObservationId::parse(format!(
+                "observation-{}",
+                step.aperture_id
+            ))
+            .unwrap(),
             from_checkpoint: "checkpoint-before".into(),
             to_checkpoint: "checkpoint-after".into(),
             generation: 1,
@@ -1715,7 +1747,7 @@ mod tests {
             functional_response,
             confounders: Vec::new(),
             reliability: 1.0,
-            independence_group: step.aperture_id.clone(),
+            independence_group: step.aperture_id.to_string(),
             experiment_lineage: ExperimentLineage {
                 run_id: format!("run-{}", step.aperture_id),
                 replicate_id: "replicate-0".into(),
@@ -1726,10 +1758,12 @@ mod tests {
                 template_config_digest: "d".repeat(64),
             },
             dense_artifact: Some(dense),
-            parameter_layout_sha256: Some(layout_digest),
+            parameter_layout_sha256: Some(Sha256Digest::parse(layout_digest).unwrap()),
             representation_artifact: None,
             representation_protocol_sha256: None,
-            provenance_digest: "e".repeat(64),
+            provenance_digest: crate::digest::ProvenanceDigest::from(
+                Sha256Digest::parse("e".repeat(64)).unwrap(),
+            ),
         };
         let observation_raw = serde_json::to_vec_pretty(&observation).unwrap();
         let observation_path = root
@@ -1743,12 +1777,12 @@ mod tests {
         write_new_private(root, &support_path, &support_raw).unwrap();
         let evidence = LearningExperimentEvidence {
             schema: "cerebro.tidex.learning_experiment_evidence/v1".into(),
-            session_id: session_id.into(),
-            target_digest: target_digest.into(),
+            session_id: SessionId::parse(session_id).unwrap(),
+            target_digest: target_digest.clone(),
             aperture_id: step.aperture_id.clone(),
             observed_value: dot(&step.capability_weights, &observation.functional_response)
                 .unwrap(),
-            observation_id: observation.observation_id,
+            observation_id: ObservationId::parse(&observation.observation_id).unwrap(),
             observation: EvidenceReference {
                 path: observation_path.clone(),
                 sha256: Sha256Digest::parse(sha256_bytes(&observation_raw)).unwrap(),
@@ -1773,8 +1807,10 @@ mod tests {
     #[test]
     fn learning_plan_is_full_rank_and_covers_every_target() {
         let target = LearningTarget {
-            target_id: "producer-test".into(),
-            capability_ids: (0..10).map(|index| format!("f{index}")).collect(),
+            target_id: LearningTargetId::parse("producer-test").unwrap(),
+            capability_ids: (0..10)
+                .map(|index| CapabilityId::parse(format!("f{index}")).unwrap())
+                .collect(),
             candidate_budget: 192,
             plan_steps: 30,
             noise_variance: 0.08,
@@ -1791,8 +1827,11 @@ mod tests {
     #[test]
     fn learning_plan_is_deterministic_for_same_target() {
         let target = LearningTarget {
-            target_id: "stable".into(),
-            capability_ids: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            target_id: LearningTargetId::parse("stable").unwrap(),
+            capability_ids: ["a", "b", "c", "d"]
+                .into_iter()
+                .map(|id| CapabilityId::parse(id).unwrap())
+                .collect(),
             candidate_budget: 64,
             plan_steps: 12,
             noise_variance: 0.1,
@@ -1877,13 +1916,14 @@ mod tests {
             &started.receipt.target_digest,
             step,
         );
+        let evidence_raw = fs::read(&evidence_path).unwrap();
         let mut malformed: LearningExperimentEvidence =
-            serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
-        let original_observation_id = malformed.observation_id.clone();
-        malformed.observation_id = "../outside-observation".into();
+            serde_json::from_slice(&evidence_raw).unwrap();
+        let mut invalid_wire: serde_json::Value = serde_json::from_slice(&evidence_raw).unwrap();
+        invalid_wire["observation_id"] = serde_json::Value::String("../outside-observation".into());
         fs::write(
             &evidence_path,
-            serde_json::to_vec_pretty(&malformed).unwrap(),
+            serde_json::to_vec_pretty(&invalid_wire).unwrap(),
         )
         .unwrap();
         assert!(assimilate_persistent_learning_evidence_under_root(
@@ -1892,7 +1932,6 @@ mod tests {
             &evidence_path,
         )
         .is_err());
-        malformed.observation_id = original_observation_id;
         malformed.observed_value += 1.0;
         fs::write(
             &evidence_path,

@@ -1,44 +1,49 @@
 use crate::contracts::{DeltaObservation, SkillField};
+use crate::digest::{ObservationRecordDigest, ProvenanceDigest, Sha256Digest};
 use crate::error::{BrainError, BrainResult};
-use crate::validation::source_support_indices;
+use crate::identity::{ObservationId, SkillId};
+use crate::validation::{source_support_indices, validate_reliability};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceMemoryEntry {
-    pub observation_id: String,
-    pub observation_digest: String,
-    pub provenance_digest: String,
+    pub observation_id: ObservationId,
+    pub observation_digest: ObservationRecordDigest,
+    pub provenance_digest: ProvenanceDigest,
     pub independence_group: String,
     pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EpisodicSemanticEntry {
     pub episode_id: String,
-    pub observation_ids: Vec<String>,
+    pub observation_ids: Vec<ObservationId>,
     pub confounder_names: Vec<String>,
     pub mean_functional_response: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FunctionalMemoryEntry {
-    pub skill_id: String,
+    pub skill_id: SkillId,
     pub functional_signature: Vec<f64>,
     pub coherence: f64,
     pub persistence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ParametricMemoryEntry {
-    pub skill_id: String,
+    pub skill_id: SkillId,
     pub generation_created: u64,
     pub support: usize,
     pub uncertainty: f64,
     pub promoted: bool,
-    pub source_observation_ids: Vec<String>,
+    pub source_observation_ids: Vec<ObservationId>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +55,7 @@ pub enum LearningGraphRelation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LearningGraphEdge {
     pub from: String,
     pub to: String,
@@ -58,12 +64,14 @@ pub struct LearningGraphEdge {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CausalLearningGraph {
     pub nodes: Vec<String>,
     pub edges: Vec<LearningGraphEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct BrainMemorySnapshot {
     pub schema: String,
     pub generation: u64,
@@ -74,8 +82,12 @@ pub struct BrainMemorySnapshot {
     pub causal_learning_graph: CausalLearningGraph,
 }
 
-fn digest_json<T: Serialize>(value: &T) -> BrainResult<String> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
+fn observation_record_digest(
+    observation: &DeltaObservation,
+) -> BrainResult<ObservationRecordDigest> {
+    Ok(ObservationRecordDigest::from(Sha256Digest::digest_bytes(
+        &serde_json::to_vec(observation)?,
+    )))
 }
 
 pub fn build_memory_snapshot(
@@ -90,6 +102,27 @@ pub fn build_memory_snapshot(
         || source_mixtures
             .iter()
             .any(|row| row.len() != observations.len())
+        || observations.iter().any(|observation| {
+            observation.independence_group.trim().is_empty()
+                || validate_reliability(observation.reliability, "memory").is_err()
+                || observation
+                    .functional_response
+                    .iter()
+                    .any(|value| !value.is_finite())
+        })
+        || fields.iter().any(|field| {
+            field.skill_id.trim().is_empty()
+                || !field.coherence.is_finite()
+                || !(0.0..=1.0).contains(&field.coherence)
+                || !field.persistence.is_finite()
+                || !(0.0..=1.0).contains(&field.persistence)
+                || !field.uncertainty.is_finite()
+                || field.uncertainty < 0.0
+                || field
+                    .functional_signature
+                    .iter()
+                    .any(|value| !value.is_finite())
+        })
     {
         return Err(BrainError::Invalid("memory_snapshot_input_shape".into()));
     }
@@ -98,7 +131,7 @@ pub fn build_memory_snapshot(
         .map(|observation| {
             Ok(EvidenceMemoryEntry {
                 observation_id: observation.observation_id.clone(),
-                observation_digest: digest_json(observation)?,
+                observation_digest: observation_record_digest(observation)?,
                 provenance_digest: observation.provenance_digest.clone(),
                 independence_group: observation.independence_group.clone(),
                 generation: observation.generation,
@@ -128,7 +161,7 @@ pub fn build_memory_snapshot(
         let mut total_weight = 0.0;
         let mut confounders = BTreeSet::new();
         for &index in &indices {
-            let weight = observations[index].reliability.clamp(1e-4, 1.0);
+            let weight = observations[index].reliability;
             total_weight += weight;
             for (output, value) in mean.iter_mut().enumerate().take(functional_dim) {
                 *value += weight * observations[index].functional_response[output];
@@ -138,7 +171,7 @@ pub fn build_memory_snapshot(
             }
         }
         for value in &mut mean {
-            *value /= total_weight.max(1e-15);
+            *value /= total_weight;
         }
         semantic_episodic.push(EpisodicSemanticEntry {
             episode_id,
@@ -261,7 +294,7 @@ mod tests {
     fn memory_snapshot_links_evidence_to_functional_and_parametric_layers() {
         let observations = (0..3)
             .map(|i| DeltaObservation {
-                observation_id: format!("o{i}"),
+                observation_id: ObservationId::parse(format!("o{i}")).unwrap(),
                 from_checkpoint: "a".into(),
                 to_checkpoint: format!("b{i}"),
                 generation: i as u64 + 1,
@@ -278,13 +311,15 @@ mod tests {
                 parameter_layout_sha256: None,
                 representation_artifact: None,
                 representation_protocol_sha256: None,
-                provenance_digest: format!("{i:064x}"),
+                provenance_digest: ProvenanceDigest::from(
+                    Sha256Digest::parse(format!("{i:064x}")).unwrap(),
+                ),
             })
             .collect::<Vec<_>>();
         let field = SkillField {
-            skill_id: "s".into(),
-            reconstruction_id: String::new(),
-            lineage_id: String::new(),
+            skill_id: SkillId::parse("s").unwrap(),
+            reconstruction_id: Default::default(),
+            lineage_id: Default::default(),
             generation_created: 1,
             direction: vec![1.0, 0.0],
             structured_geometry: None,
@@ -316,6 +351,10 @@ mod tests {
                 .count(),
             3
         );
+
+        let mut invalid = observations;
+        invalid[0].reliability = 0.0;
+        assert!(build_memory_snapshot(&invalid, 3, true, &[], &[]).is_err());
     }
 
     #[test]

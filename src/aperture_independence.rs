@@ -4,6 +4,7 @@ use crate::contracts::DeltaObservation;
 use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
 use crate::linalg::{symmetric_eigen_jacobi, Matrix};
+use crate::validation::validate_reliability;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,7 +49,9 @@ fn group_design_profiles(
     let names = confounder_names(observations);
     let mut members = BTreeMap::<String, Vec<usize>>::new();
     for (index, observation) in observations.iter().enumerate() {
-        if observation.independence_group.trim().is_empty() {
+        if observation.independence_group.trim().is_empty()
+            || validate_reliability(observation.reliability, "aperture_independence").is_err()
+        {
             return Err(BrainError::Invalid(
                 "aperture_independence_group_required".into(),
             ));
@@ -78,7 +81,13 @@ fn group_design_profiles(
                         ));
                     }
                     present += 1;
-                    values.push((item.value, observations[row].reliability.clamp(1e-4, 1.0)));
+                    values.push((
+                        item.value,
+                        validate_reliability(
+                            observations[row].reliability,
+                            "aperture_independence",
+                        )?,
+                    ));
                 }
             }
             let presence_fraction = present as f64 / rows.len().max(1) as f64;
@@ -224,10 +233,18 @@ fn group_lineages(observations: &[DeltaObservation]) -> BrainResult<Vec<GroupLin
                 "aperture_group_lineage_inconsistent".into(),
             ));
         }
+        let randomization_id = randomizations
+            .into_iter()
+            .next()
+            .ok_or_else(|| BrainError::Integrity("aperture_group_randomization_missing".into()))?;
+        let replicate_id = replicates
+            .into_iter()
+            .next()
+            .ok_or_else(|| BrainError::Integrity("aperture_group_replicate_missing".into()))?;
         result.push(GroupLineage {
             group_id,
-            randomization_id: randomizations.into_iter().next().unwrap(),
-            replicate_id: replicates.into_iter().next().unwrap(),
+            randomization_id,
+            replicate_id,
         });
     }
     Ok(result)
@@ -351,7 +368,7 @@ mod tests {
 
     fn obs(index: usize, group: &str, axis: f64) -> DeltaObservation {
         DeltaObservation {
-            observation_id: format!("o{index}"),
+            observation_id: crate::identity::ObservationId::parse(format!("o{index}")).unwrap(),
             from_checkpoint: "a".into(),
             to_checkpoint: format!("b{index}"),
             generation: 1,
@@ -376,7 +393,9 @@ mod tests {
             parameter_layout_sha256: None,
             representation_artifact: None,
             representation_protocol_sha256: None,
-            provenance_digest: format!("{index:064x}"),
+            provenance_digest: crate::digest::ProvenanceDigest::from(
+                crate::digest::Sha256Digest::parse(format!("{index:064x}")).unwrap(),
+            ),
         }
     }
 
@@ -405,5 +424,12 @@ mod tests {
             report.effective_independent_groups
         );
         assert!(report.independent_enough);
+    }
+
+    #[test]
+    fn zero_reliability_is_not_promoted_to_independent_evidence() {
+        let mut observations = vec![obs(1, "a", -1.0), obs(2, "b", 0.0), obs(3, "c", 1.0)];
+        observations[1].reliability = 0.0;
+        assert!(estimate_aperture_independence(&observations, 3).is_err());
     }
 }

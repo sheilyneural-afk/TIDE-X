@@ -6,9 +6,24 @@ use cerebro_tidex::contracts::ApertureCandidate;
 use cerebro_tidex::contracts::{BrainConfig, ProtectedCortex, ProtectedDirection};
 use cerebro_tidex::engine::BrainEngine;
 use cerebro_tidex::gauge::align_bases;
+use cerebro_tidex::identity::{ApertureId, ProbeId};
 use cerebro_tidex::linalg::{cosine, Matrix};
 use cerebro_tidex::protected::project_to_safe_subspace;
 use phantom::cognitive_phantom;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+fn test_private_root() -> &'static PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root =
+            std::env::temp_dir().join(format!("cerebro-tidex-brain-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        cerebro_tidex::security::secure_dir(&root).unwrap();
+        std::env::set_var("TIDEX_PRIVATE_ROOT", &root);
+        root
+    })
+}
 
 #[test]
 fn phantom_recovers_latent_skill_subspace_and_function() {
@@ -17,7 +32,7 @@ fn phantom_recovers_latent_skill_subspace_and_function() {
         require_dual_space_for_promotion: false,
         ..BrainConfig::default()
     };
-    let engine = BrainEngine::open("/home/yo/cerebro", config).unwrap();
+    let engine = BrainEngine::open(test_private_root(), config).unwrap();
     let p = cognitive_phantom().unwrap();
     let report = engine.analyze(&p.observations).unwrap();
     let overlap = BrainEngine::skill_subspace_overlap(&report.fields, &p.true_skills).unwrap();
@@ -39,7 +54,7 @@ fn analysis_is_exactly_invariant_to_observation_order() {
         require_dual_space_for_promotion: false,
         ..BrainConfig::default()
     };
-    let engine = BrainEngine::open("/home/yo/cerebro", config).unwrap();
+    let engine = BrainEngine::open(test_private_root(), config).unwrap();
     let phantom = cognitive_phantom().unwrap();
     let forward = engine.analyze(&phantom.observations).unwrap();
     let mut reversed = phantom.observations.clone();
@@ -53,6 +68,17 @@ fn analysis_is_exactly_invariant_to_observation_order() {
 }
 
 #[test]
+fn zero_reliability_cannot_acquire_fabricated_reconstruction_weight() {
+    let engine = BrainEngine::open(test_private_root(), BrainConfig::default()).unwrap();
+    let mut observations = cognitive_phantom().unwrap().observations;
+    observations[0].reliability = 0.0;
+    assert!(matches!(
+        engine.analyze(&observations),
+        Err(cerebro_tidex::BrainError::Invalid(message)) if message == "reliability_invalid"
+    ));
+}
+
+#[test]
 fn repeated_identical_evidence_does_not_inflate_skill_support() {
     use cerebro_tidex::contracts::SkillBank;
     use cerebro_tidex::tomography::assimilate_bank;
@@ -62,7 +88,7 @@ fn repeated_identical_evidence_does_not_inflate_skill_support() {
         require_dual_space_for_promotion: false,
         ..BrainConfig::default()
     };
-    let engine = BrainEngine::open("/home/yo/cerebro", config.clone()).unwrap();
+    let engine = BrainEngine::open(test_private_root(), config.clone()).unwrap();
     let report = engine
         .analyze(&cognitive_phantom().unwrap().observations)
         .unwrap();
@@ -112,7 +138,7 @@ fn protected_projection_removes_known_damage_direction() {
     let cortex = ProtectedCortex {
         parameter_importance: vec![1.0, 1.0, 0.1],
         directions: vec![ProtectedDirection {
-            probe_id: "old-skill".into(),
+            probe_id: ProbeId::parse("old-skill").unwrap(),
             direction: vec![1.0, 0.0, 0.0],
             importance: 1.0,
         }],
@@ -130,12 +156,12 @@ fn protected_projection_is_joint_for_nonorthogonal_directions() {
         parameter_importance: vec![1.0, 1.0],
         directions: vec![
             ProtectedDirection {
-                probe_id: "d1".into(),
+                probe_id: ProbeId::parse("d1").unwrap(),
                 direction: vec![1.0, 0.0],
                 importance: 1.0,
             },
             ProtectedDirection {
-                probe_id: "d2".into(),
+                probe_id: ProbeId::parse("d2").unwrap(),
                 direction: vec![q, q],
                 importance: 1.0,
             },
@@ -151,17 +177,17 @@ fn protected_projection_is_joint_for_nonorthogonal_directions() {
 
 #[test]
 fn active_aperture_prefers_information_when_costs_match() {
-    let cov = Matrix::identity(2);
+    let cov = Matrix::from_rows(&[vec![1.0, 0.0], vec![0.0, 1.0]]).unwrap();
     let c = vec![
         ApertureCandidate {
-            aperture_id: "weak".into(),
+            aperture_id: ApertureId::parse("weak").unwrap(),
             sensing_vector: vec![0.1, 0.0],
             noise_variance: 1.0,
             cost: 0.1,
             risk: 0.1,
         },
         ApertureCandidate {
-            aperture_id: "strong".into(),
+            aperture_id: ApertureId::parse("strong").unwrap(),
             sensing_vector: vec![1.0, 1.0],
             noise_variance: 0.2,
             cost: 0.1,
@@ -169,7 +195,7 @@ fn active_aperture_prefers_information_when_costs_match() {
         },
     ];
     let s = choose_active_aperture(&c, &cov, 0.1, 0.1).unwrap();
-    assert_eq!(s.aperture_id, "strong");
+    assert_eq!(s.aperture_id.as_str(), "strong");
 }
 
 #[test]
@@ -179,24 +205,14 @@ fn phantom_true_skills_are_distinct() {
 }
 
 #[test]
-fn streaming_artifact_sketch_and_exact_linear_combination() {
-    use cerebro_tidex::artifact::{combine_dvec, create_dvec, inspect_dvec, sketch_dvec};
+fn public_artifact_writer_rejects_non_private_root() {
+    use cerebro_tidex::artifact::ArtifactWriteAuthority;
     use std::fs;
     let root = std::env::temp_dir().join(format!("cerebro-artifact-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
-    let a = create_dvec(&root, "a", &[1.0, 2.0, 3.0, 4.0]).unwrap();
-    let b = create_dvec(&root, "b", &[2.0, 0.0, -1.0, 1.0]).unwrap();
-    let c = combine_dvec(&root, "c", &[(a.clone(), 0.5), (b.clone(), 2.0)]).unwrap();
-    assert_eq!(
-        inspect_dvec(std::path::Path::new(&c.path))
-            .unwrap()
-            .parameter_count,
-        4
-    );
-    let s1 = sketch_dvec(std::path::Path::new(&a.path), 64, 7).unwrap();
-    let s2 = sketch_dvec(std::path::Path::new(&a.path), 64, 7).unwrap();
-    assert_eq!(s1, s2);
+    assert!(ArtifactWriteAuthority::open(&root).is_err());
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -223,9 +239,7 @@ fn transport_map_recovers_known_linear_generation_map() {
 #[test]
 fn mvdr_minimizes_interference_under_unit_constraint() {
     use cerebro_tidex::interaction::mvdr_weights;
-    let mut r = Matrix::zeros(2, 2);
-    r.set(0, 0, 10.0);
-    r.set(1, 1, 1.0);
+    let r = Matrix::from_rows(&[vec![10.0, 0.0], vec![0.0, 1.0]]).unwrap();
     let desired = [1.0, 1.0];
     let w = mvdr_weights(&r, &desired, 1e-9).unwrap();
     let constraint = w[0] + w[1];

@@ -6,21 +6,22 @@
 //! A later authoritative engine operation must explicitly consume those output
 //! records before they can influence a skill bank.
 
-use crate::artifact::{
-    create_content_addressed_f64, read_f64_artifact, sha256_file, F64ArtifactRef,
-};
+use crate::artifact::{read_f64_artifact, sha256_file, ArtifactWriteAuthority, F64ArtifactRef};
 use crate::authority::{
     ensure_private_parent, existing_regular_file_under_root, root_relative_path,
     write_or_verify_immutable,
 };
 use crate::contracts::DeltaObservation;
+use crate::digest::{
+    ObservationRecordDigest, RepresentationProtocolDigest, RepresentationRequestDigest,
+    Sha256Digest,
+};
 use crate::error::{BrainError, BrainResult};
+use crate::identity::ObservationId;
 use crate::ledger;
 use crate::security::verify_private_root;
-use crate::validation::valid_observation_id;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,12 +45,13 @@ const LEDGER_KIND: &str = "representation_evidence_recorded";
 /// [`RepresentationCapture`], not a path-dependent digest.  This makes the
 /// protocol bind the measured shifts even after a staging directory is moved.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SealedRepresentationProtocol {
     pub schema: String,
-    pub source_representation_sha256: String,
-    pub probe_sha256: String,
-    pub probe_text_sha256: String,
-    pub forbidden_vocabulary_sha256: String,
+    pub source_representation_sha256: Sha256Digest,
+    pub probe_sha256: Sha256Digest,
+    pub probe_text_sha256: Sha256Digest,
+    pub forbidden_vocabulary_sha256: Sha256Digest,
     pub task_labels_used: bool,
     pub probe_vocabulary_overlap: Vec<String>,
     pub probe_count: u64,
@@ -63,8 +65,9 @@ pub struct SealedRepresentationProtocol {
 /// A representation shift produced by the sealed probe protocol for one
 /// aperture observation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RepresentationShift {
-    pub observation_id: String,
+    pub observation_id: ObservationId,
     pub raw_dimension: u64,
     pub shift: Vec<f64>,
 }
@@ -72,6 +75,7 @@ pub struct RepresentationShift {
 /// The path-independent portion of the source payload that the protocol
 /// authenticates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RepresentationCapture {
     pub schema: String,
     pub observations: Vec<RepresentationShift>,
@@ -79,12 +83,13 @@ pub struct RepresentationCapture {
 
 /// A source observation and its immutable, non-active destination record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RepresentationEvidenceInstallTarget {
-    pub observation_id: String,
+    pub observation_id: ObservationId,
     /// Absolute path under the CEREBRO private root.
     pub source_observation_path: String,
     /// SHA-256 of the exact source observation JSON bytes.
-    pub source_observation_sha256: String,
+    pub source_observation_sha256: ObservationRecordDigest,
     /// Absolute path under `state/representation_evidence/installed-observations`.
     /// The active `state/observations` namespace is never a legal target.
     pub destination_observation_path: String,
@@ -92,6 +97,7 @@ pub struct RepresentationEvidenceInstallTarget {
 
 /// Strict source payload accepted by `record_representation_evidence`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RepresentationEvidenceInstallRequest {
     pub schema: String,
     pub protocol: SealedRepresentationProtocol,
@@ -100,25 +106,27 @@ pub struct RepresentationEvidenceInstallRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct InstalledRepresentationEvidence {
-    pub observation_id: String,
+    pub observation_id: ObservationId,
     pub source_observation_path: String,
-    pub source_observation_sha256: String,
+    pub source_observation_sha256: ObservationRecordDigest,
     pub destination_observation_path: String,
-    pub destination_observation_sha256: String,
+    pub destination_observation_sha256: ObservationRecordDigest,
     pub representation_artifact: F64ArtifactRef,
 }
 
 /// Immutable receipt, linked to the ledger and suitable as direct provenance
 /// input to a controlled TIDE-X learning finalizer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RepresentationEvidenceReceipt {
     pub schema: String,
-    pub source_tree_digest: String,
-    pub request_sha256: String,
-    pub source_representation_sha256: String,
-    pub representation_protocol_sha256: String,
-    pub installations_sha256: String,
+    pub source_tree_digest: Sha256Digest,
+    pub request_sha256: RepresentationRequestDigest,
+    pub source_representation_sha256: Sha256Digest,
+    pub representation_protocol_sha256: RepresentationProtocolDigest,
+    pub installations_sha256: Sha256Digest,
     pub observation_count: usize,
     pub installations: Vec<InstalledRepresentationEvidence>,
     pub ledger_event_hash: String,
@@ -132,8 +140,8 @@ fn integrity<T>(message: impl Into<String>) -> BrainResult<T> {
     Err(BrainError::Integrity(message.into()))
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+fn sha256_bytes(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::digest_bytes(bytes)
 }
 
 fn json_bytes<T: Serialize + ?Sized>(value: &T) -> BrainResult<Vec<u8>> {
@@ -146,14 +154,8 @@ fn pretty_json_line<T: Serialize>(value: &T) -> BrainResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn valid_lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && value.bytes().all(|byte| !byte.is_ascii_uppercase())
-}
-
 /// Digest the canonical representation capture that a protocol must bind.
-pub fn representation_capture_sha256(capture: &RepresentationCapture) -> BrainResult<String> {
+pub fn representation_capture_sha256(capture: &RepresentationCapture) -> BrainResult<Sha256Digest> {
     Ok(sha256_bytes(&json_bytes(capture)?))
 }
 
@@ -173,16 +175,6 @@ pub fn validate_sealed_representation_protocol(
     {
         return invalid("representation_protocol_contract_invalid");
     }
-    for digest in [
-        &protocol.source_representation_sha256,
-        &protocol.probe_sha256,
-        &protocol.probe_text_sha256,
-        &protocol.forbidden_vocabulary_sha256,
-    ] {
-        if !valid_lower_sha256(digest) {
-            return invalid("representation_protocol_digest_invalid");
-        }
-    }
     if protocol.probe_sha256 != protocol.probe_text_sha256 {
         return invalid("representation_protocol_probe_text_digest_mismatch");
     }
@@ -199,7 +191,7 @@ pub fn validate_sealed_representation_protocol(
 
 fn validate_request_contract(
     request: &RepresentationEvidenceInstallRequest,
-) -> BrainResult<BTreeMap<String, RepresentationShift>> {
+) -> BrainResult<BTreeMap<ObservationId, RepresentationShift>> {
     if request.schema != REPRESENTATION_EVIDENCE_REQUEST_SCHEMA
         || request.capture.schema != REPRESENTATION_CAPTURE_SCHEMA
         || request.capture.observations.is_empty()
@@ -215,8 +207,7 @@ fn validate_request_contract(
 
     let mut shifts = BTreeMap::new();
     for shift in &request.capture.observations {
-        if !valid_observation_id(&shift.observation_id)
-            || shift.raw_dimension != request.protocol.raw_dimension_per_observation
+        if shift.raw_dimension != request.protocol.raw_dimension_per_observation
             || shift.shift.len() as u64 != request.protocol.sketch_dim
             || shift.shift.iter().any(|value| !value.is_finite())
             || shifts
@@ -231,9 +222,7 @@ fn validate_request_contract(
     let mut source_paths = BTreeSet::new();
     let mut destination_paths = BTreeSet::new();
     for target in &request.installations {
-        if !valid_observation_id(&target.observation_id)
-            || !valid_lower_sha256(&target.source_observation_sha256)
-            || target.source_observation_path.trim().is_empty()
+        if target.source_observation_path.trim().is_empty()
             || target.destination_observation_path.trim().is_empty()
             || !target_ids.insert(target.observation_id.clone())
             || !source_paths.insert(target.source_observation_path.clone())
@@ -268,11 +257,17 @@ fn protocol_bytes(protocol: &SealedRepresentationProtocol) -> BrainResult<Vec<u8
     json_bytes(protocol)
 }
 
-fn persist_protocol(root: &Path, protocol: &SealedRepresentationProtocol) -> BrainResult<String> {
+fn persist_protocol(
+    root: &Path,
+    protocol: &SealedRepresentationProtocol,
+) -> BrainResult<RepresentationProtocolDigest> {
     let bytes = protocol_bytes(protocol)?;
-    let digest = sha256_bytes(&bytes);
+    let digest = RepresentationProtocolDigest::from(sha256_bytes(&bytes));
     let directory = root.join(PROTOCOLS_RELATIVE);
-    ensure_private_parent(root, &directory.join("placeholder.json"))?;
+    // `ensure_private_parent` takes a prospective child path; this concrete
+    // protocol filename makes that intent explicit without introducing a
+    // fictitious artifact into the persistence protocol.
+    ensure_private_parent(root, &directory.join("protocol.json"))?;
     let path = directory.join(format!("{digest}.json"));
     write_or_verify_immutable(root, &path, &bytes)?;
     Ok(digest)
@@ -281,14 +276,14 @@ fn persist_protocol(root: &Path, protocol: &SealedRepresentationProtocol) -> Bra
 fn destination_observation_bytes(
     before: &DeltaObservation,
     artifact: F64ArtifactRef,
-    protocol_sha256: &str,
+    protocol_sha256: &RepresentationProtocolDigest,
 ) -> BrainResult<Vec<u8>> {
     if before.representation_artifact.is_some() || before.representation_protocol_sha256.is_some() {
         return integrity("representation_evidence_already_installed_on_source");
     }
     let mut after = before.clone();
     after.representation_artifact = Some(artifact);
-    after.representation_protocol_sha256 = Some(protocol_sha256.to_string());
+    after.representation_protocol_sha256 = Some(protocol_sha256.clone());
     let mut semantic_check = after.clone();
     semantic_check.representation_artifact = None;
     semantic_check.representation_protocol_sha256 = None;
@@ -298,11 +293,13 @@ fn destination_observation_bytes(
     pretty_json_line(&after)
 }
 
-fn installations_sha256(installations: &[InstalledRepresentationEvidence]) -> BrainResult<String> {
+fn installations_sha256(
+    installations: &[InstalledRepresentationEvidence],
+) -> BrainResult<Sha256Digest> {
     Ok(sha256_bytes(&json_bytes(installations)?))
 }
 
-fn receipt_path(root: &Path, request_sha256: &str) -> PathBuf {
+fn receipt_path(root: &Path, request_sha256: &RepresentationRequestDigest) -> PathBuf {
     root.join(RECEIPTS_RELATIVE)
         .join(format!("{request_sha256}.json"))
 }
@@ -321,7 +318,7 @@ fn ledger_payload(receipt: &RepresentationEvidenceReceipt) -> Value {
 
 fn verify_reference_under_root(root: &Path, reference: &F64ArtifactRef) -> BrainResult<()> {
     let _ = existing_regular_file_under_root(root, Path::new(&reference.path))?;
-    let value = read_f64_artifact(reference)?;
+    let value = read_f64_artifact(root, reference)?;
     if value.len() as u64 != reference.element_count {
         return integrity("representation_evidence_artifact_reference_mismatch");
     }
@@ -332,15 +329,15 @@ fn verify_existing_receipt(
     root: &Path,
     receipt: &RepresentationEvidenceReceipt,
     request: &RepresentationEvidenceInstallRequest,
-    request_sha256: &str,
-    capture_sha256: &str,
-    protocol_sha256: &str,
+    request_sha256: &RepresentationRequestDigest,
+    capture_sha256: &Sha256Digest,
+    protocol_sha256: &RepresentationProtocolDigest,
 ) -> BrainResult<()> {
     if receipt.schema != REPRESENTATION_EVIDENCE_RECEIPT_SCHEMA
-        || receipt.source_tree_digest != env!("TIDEX_SOURCE_TREE_DIGEST")
-        || receipt.request_sha256 != request_sha256
-        || receipt.source_representation_sha256 != capture_sha256
-        || receipt.representation_protocol_sha256 != protocol_sha256
+        || receipt.source_tree_digest.as_str() != env!("TIDEX_SOURCE_TREE_DIGEST")
+        || receipt.request_sha256 != *request_sha256
+        || receipt.source_representation_sha256 != *capture_sha256
+        || receipt.representation_protocol_sha256 != *protocol_sha256
         || receipt.observation_count != request.installations.len()
         || receipt.installations.len() != request.installations.len()
         || receipt.installations_sha256 != installations_sha256(&receipt.installations)?
@@ -369,7 +366,7 @@ fn verify_existing_receipt(
             Path::new(&installed.destination_observation_path),
         )?;
         let existing = existing_regular_file_under_root(root, &destination)?;
-        if sha256_file(&existing)? != installed.destination_observation_sha256 {
+        if sha256_file(&existing)? != *installed.destination_observation_sha256.as_digest() {
             return integrity("representation_evidence_receipt_destination_mismatch");
         }
         verify_reference_under_root(root, &installed.representation_artifact)?;
@@ -378,14 +375,14 @@ fn verify_existing_receipt(
         .join(PROTOCOLS_RELATIVE)
         .join(format!("{protocol_sha256}.json"));
     let protocol = existing_regular_file_under_root(root, &protocol_path)?;
-    if sha256_file(&protocol)? != protocol_sha256 {
+    if sha256_file(&protocol)? != *protocol_sha256.as_digest() {
         return integrity("representation_evidence_receipt_protocol_mismatch");
     }
     let event = ledger::find_v2_event_by_payload_string(
         root,
         LEDGER_KIND,
         "request_sha256",
-        request_sha256,
+        request_sha256.as_str(),
     )?
     .ok_or_else(|| {
         BrainError::Integrity("representation_evidence_receipt_ledger_missing".into())
@@ -403,11 +400,12 @@ fn record_from_payload_path_at_root(
 ) -> BrainResult<RepresentationEvidenceReceipt> {
     let payload_path = existing_regular_file_under_root(root, source_payload_path)?;
     let payload_bytes = fs::read(&payload_path)?;
-    let request_sha256 = sha256_bytes(&payload_bytes);
+    let request_sha256 = RepresentationRequestDigest::from(sha256_bytes(&payload_bytes));
     let request: RepresentationEvidenceInstallRequest = serde_json::from_slice(&payload_bytes)?;
     let shifts = validate_request_contract(&request)?;
     let capture_sha256 = representation_capture_sha256(&request.capture)?;
-    let protocol_sha256 = sha256_bytes(&protocol_bytes(&request.protocol)?);
+    let protocol_sha256 =
+        RepresentationProtocolDigest::from(sha256_bytes(&protocol_bytes(&request.protocol)?));
 
     let receipt_path = receipt_path(root, &request_sha256);
     if receipt_path.exists() {
@@ -435,7 +433,7 @@ fn record_from_payload_path_at_root(
         let source_path =
             existing_regular_file_under_root(root, Path::new(&target.source_observation_path))?;
         let source_sha256 = sha256_file(&source_path)?;
-        if source_sha256 != target.source_observation_sha256 {
+        if source_sha256 != *target.source_observation_sha256.as_digest() {
             return integrity("representation_evidence_source_observation_digest_mismatch");
         }
         let before: DeltaObservation = serde_json::from_slice(&fs::read(&source_path)?)?;
@@ -445,7 +443,8 @@ fn record_from_payload_path_at_root(
         let shift = shifts
             .get(&target.observation_id)
             .ok_or_else(|| BrainError::Integrity("representation_evidence_shift_missing".into()))?;
-        let artifact = create_content_addressed_f64(root, &shift.shift)?;
+        let artifact = ArtifactWriteAuthority::for_internal_root(root)?
+            .create_content_addressed_f64(&shift.shift)?;
         if artifact.element_count != request.protocol.sketch_dim {
             return integrity("representation_evidence_artifact_dimension_mismatch");
         }
@@ -462,7 +461,9 @@ fn record_from_payload_path_at_root(
             source_observation_path: target.source_observation_path.clone(),
             source_observation_sha256: target.source_observation_sha256.clone(),
             destination_observation_path: target.destination_observation_path.clone(),
-            destination_observation_sha256: sha256_bytes(&destination_bytes),
+            destination_observation_sha256: ObservationRecordDigest::from(sha256_bytes(
+                &destination_bytes,
+            )),
             representation_artifact: artifact,
         });
     }
@@ -470,7 +471,7 @@ fn record_from_payload_path_at_root(
     let installations_sha256 = installations_sha256(&installed)?;
     let mut receipt = RepresentationEvidenceReceipt {
         schema: REPRESENTATION_EVIDENCE_RECEIPT_SCHEMA.to_string(),
-        source_tree_digest: env!("TIDEX_SOURCE_TREE_DIGEST").to_string(),
+        source_tree_digest: Sha256Digest::parse(env!("TIDEX_SOURCE_TREE_DIGEST"))?,
         request_sha256: request_sha256.clone(),
         source_representation_sha256: capture_sha256,
         representation_protocol_sha256: protocol_sha256,
@@ -484,7 +485,7 @@ fn record_from_payload_path_at_root(
         root,
         LEDGER_KIND,
         "request_sha256",
-        &request_sha256,
+        request_sha256.as_str(),
     )? {
         if existing.payload()? != expected_payload {
             return integrity("representation_evidence_ledger_request_collision");
@@ -508,9 +509,9 @@ fn record_from_payload_path_at_root(
 }
 
 /// Record immutable representation evidence from a strict payload under the
-/// private CEREBRO root. This is the public entry point for verified aperture
-/// producers; it intentionally refuses a root other than
-/// `/home/yo/cerebro`.
+/// private TIDE-X root. This is the public entry point for verified aperture
+/// producers; it intentionally refuses a root other than the configured
+/// private authority.
 pub fn record_representation_evidence(
     root: impl AsRef<Path>,
     source_payload_path: impl AsRef<Path>,
@@ -534,11 +535,7 @@ fn load_verified_representation_evidence_receipt_at_root(
     let receipt: RepresentationEvidenceReceipt =
         serde_json::from_slice(&fs::read(&loaded_receipt_path)?)?;
     if receipt.schema != REPRESENTATION_EVIDENCE_RECEIPT_SCHEMA
-        || receipt.source_tree_digest != env!("TIDEX_SOURCE_TREE_DIGEST")
-        || !valid_lower_sha256(&receipt.request_sha256)
-        || !valid_lower_sha256(&receipt.source_representation_sha256)
-        || !valid_lower_sha256(&receipt.representation_protocol_sha256)
-        || !valid_lower_sha256(&receipt.installations_sha256)
+        || receipt.source_tree_digest.as_str() != env!("TIDEX_SOURCE_TREE_DIGEST")
         || receipt.observation_count == 0
         || receipt.observation_count != receipt.installations.len()
         || receipt.installations_sha256 != installations_sha256(&receipt.installations)?
@@ -551,13 +548,14 @@ fn load_verified_representation_evidence_receipt_at_root(
         .join(PROTOCOLS_RELATIVE)
         .join(format!("{}.json", receipt.representation_protocol_sha256));
     let protocol_path = existing_regular_file_under_root(root, &protocol_path)?;
-    if sha256_file(&protocol_path)? != receipt.representation_protocol_sha256 {
+    if sha256_file(&protocol_path)? != *receipt.representation_protocol_sha256.as_digest() {
         return integrity("representation_evidence_finalization_protocol_digest_mismatch");
     }
     let protocol: SealedRepresentationProtocol = serde_json::from_slice(&fs::read(protocol_path)?)?;
     validate_sealed_representation_protocol(&protocol)?;
     if protocol.source_representation_sha256 != receipt.source_representation_sha256
-        || sha256_bytes(&protocol_bytes(&protocol)?) != receipt.representation_protocol_sha256
+        || sha256_bytes(&protocol_bytes(&protocol)?)
+            != *receipt.representation_protocol_sha256.as_digest()
     {
         return integrity("representation_evidence_finalization_protocol_contract_mismatch");
     }
@@ -565,17 +563,14 @@ fn load_verified_representation_evidence_receipt_at_root(
     let mut observation_ids = BTreeSet::new();
     let mut source_paths = BTreeSet::new();
     let mut destination_paths = BTreeSet::new();
-    let mut previous_id = None::<String>;
+    let mut previous_id = None::<ObservationId>;
     for installation in &receipt.installations {
-        if !valid_observation_id(&installation.observation_id)
-            || !valid_lower_sha256(&installation.source_observation_sha256)
-            || !valid_lower_sha256(&installation.destination_observation_sha256)
-            || !observation_ids.insert(installation.observation_id.clone())
+        if !observation_ids.insert(installation.observation_id.clone())
             || !source_paths.insert(installation.source_observation_path.clone())
             || !destination_paths.insert(installation.destination_observation_path.clone())
             || previous_id
-                .as_deref()
-                .is_some_and(|previous| previous >= installation.observation_id.as_str())
+                .as_ref()
+                .is_some_and(|previous| previous >= &installation.observation_id)
         {
             return integrity("representation_evidence_finalization_installation_identity_invalid");
         }
@@ -590,8 +585,9 @@ fn load_verified_representation_evidence_receipt_at_root(
             Path::new(&installation.destination_observation_path),
         )?;
         let destination_path = existing_regular_file_under_root(root, &destination_path)?;
-        if sha256_file(&source_path)? != installation.source_observation_sha256
-            || sha256_file(&destination_path)? != installation.destination_observation_sha256
+        if sha256_file(&source_path)? != *installation.source_observation_sha256.as_digest()
+            || sha256_file(&destination_path)?
+                != *installation.destination_observation_sha256.as_digest()
         {
             return integrity("representation_evidence_finalization_observation_digest_mismatch");
         }
@@ -619,7 +615,7 @@ fn load_verified_representation_evidence_receipt_at_root(
         root,
         LEDGER_KIND,
         "request_sha256",
-        &receipt.request_sha256,
+        receipt.request_sha256.as_str(),
     )?
     .ok_or_else(|| {
         BrainError::Integrity("representation_evidence_finalization_ledger_missing".into())
@@ -648,8 +644,12 @@ mod tests {
     use crate::security::secure_dir;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn digest(label: &str) -> String {
+    fn digest(label: &str) -> Sha256Digest {
         sha256_bytes(label.as_bytes())
+    }
+
+    fn observation_digest(label: &str) -> ObservationRecordDigest {
+        ObservationRecordDigest::from(digest(label))
     }
 
     fn protocol(capture: &RepresentationCapture) -> SealedRepresentationProtocol {
@@ -672,7 +672,7 @@ mod tests {
 
     fn observation(id: &str) -> DeltaObservation {
         DeltaObservation {
-            observation_id: id.to_string(),
+            observation_id: ObservationId::parse(id).unwrap(),
             from_checkpoint: "base".to_string(),
             to_checkpoint: format!("checkpoint-{id}"),
             generation: 1,
@@ -686,7 +686,7 @@ mod tests {
             parameter_layout_sha256: None,
             representation_artifact: None,
             representation_protocol_sha256: None,
-            provenance_digest: digest(id),
+            provenance_digest: crate::digest::ProvenanceDigest::from(digest(id)),
         }
     }
 
@@ -695,7 +695,7 @@ mod tests {
         let capture = RepresentationCapture {
             schema: REPRESENTATION_CAPTURE_SCHEMA.to_string(),
             observations: vec![RepresentationShift {
-                observation_id: "obs-a".to_string(),
+                observation_id: ObservationId::parse("obs-a").unwrap(),
                 raw_dimension: 8,
                 shift: vec![0.1, 0.2, 0.3],
             }],
@@ -713,24 +713,33 @@ mod tests {
         let capture = RepresentationCapture {
             schema: REPRESENTATION_CAPTURE_SCHEMA.to_string(),
             observations: vec![RepresentationShift {
-                observation_id: "obs-a".to_string(),
+                observation_id: ObservationId::parse("obs-a").unwrap(),
                 raw_dimension: 8,
                 shift: vec![0.1, 0.2, 0.3],
             }],
         };
         let mut sealed = protocol(&capture);
         sealed.source_representation_sha256 = digest("wrong-capture");
+        let fixture_root = std::env::temp_dir().join(format!(
+            "tidex-representation-contract-fixture-{}",
+            std::process::id()
+        ));
         let request = RepresentationEvidenceInstallRequest {
             schema: REPRESENTATION_EVIDENCE_REQUEST_SCHEMA.to_string(),
             protocol: sealed,
             capture,
             installations: vec![RepresentationEvidenceInstallTarget {
-                observation_id: "obs-a".to_string(),
-                source_observation_path: "/home/yo/cerebro/state/x.json".to_string(),
-                source_observation_sha256: digest("source"),
-                destination_observation_path: format!(
-                    "/home/yo/cerebro/{INSTALLED_OBSERVATIONS_RELATIVE}/obs-a.json"
-                ),
+                observation_id: ObservationId::parse("obs-a").unwrap(),
+                source_observation_path: fixture_root
+                    .join("source/x.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                source_observation_sha256: observation_digest("source"),
+                destination_observation_path: fixture_root
+                    .join(INSTALLED_OBSERVATIONS_RELATIVE)
+                    .join("obs-a.json")
+                    .to_string_lossy()
+                    .into_owned(),
             }],
         };
         assert!(validate_request_contract(&request).is_err());
@@ -759,7 +768,7 @@ mod tests {
         let capture = RepresentationCapture {
             schema: REPRESENTATION_CAPTURE_SCHEMA.to_string(),
             observations: vec![RepresentationShift {
-                observation_id: "obs-a".to_string(),
+                observation_id: ObservationId::parse("obs-a").unwrap(),
                 raw_dimension: 8,
                 shift: vec![0.1, -0.2, 0.3],
             }],
@@ -772,9 +781,11 @@ mod tests {
             protocol: protocol(&capture),
             capture,
             installations: vec![RepresentationEvidenceInstallTarget {
-                observation_id: "obs-a".to_string(),
+                observation_id: ObservationId::parse("obs-a").unwrap(),
                 source_observation_path: source_path.to_string_lossy().into_owned(),
-                source_observation_sha256: sha256_bytes(&source_bytes),
+                source_observation_sha256: ObservationRecordDigest::from(sha256_bytes(
+                    &source_bytes,
+                )),
                 destination_observation_path: destination.to_string_lossy().into_owned(),
             }],
         };
@@ -838,5 +849,39 @@ mod tests {
         assert!(load_verified_representation_evidence_receipt_at_root(&root, &outside).is_err());
         fs::remove_file(&outside).unwrap();
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn strict_wire_types_reject_path_ids_raw_digests_and_unknown_fields() {
+        assert!(serde_json::from_value::<RepresentationShift>(json!({
+            "observation_id": "../obs-a",
+            "raw_dimension": 1,
+            "shift": [0.0]
+        }))
+        .is_err());
+        assert!(
+            serde_json::from_value::<SealedRepresentationProtocol>(json!({
+                "schema": REPRESENTATION_PROTOCOL_SCHEMA,
+                "source_representation_sha256": "not-a-digest",
+                "probe_sha256": "0".repeat(64),
+                "probe_text_sha256": "0".repeat(64),
+                "forbidden_vocabulary_sha256": "0".repeat(64),
+                "task_labels_used": false,
+                "probe_vocabulary_overlap": [],
+                "probe_count": 1,
+                "layer_count": 1,
+                "hidden_dim": 1,
+                "raw_dimension_per_observation": 1,
+                "sketch_dim": 1,
+                "sketch_seed": 1
+            }))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<RepresentationCapture>(json!({
+            "schema": REPRESENTATION_CAPTURE_SCHEMA,
+            "observations": [],
+            "unexpected": true
+        }))
+        .is_err());
     }
 }

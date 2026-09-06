@@ -9,6 +9,7 @@ pub mod contracts;
 pub mod digest;
 pub mod dual_space;
 pub mod engine;
+pub mod engine_head;
 pub mod error;
 pub mod functional;
 pub mod gauge;
@@ -33,7 +34,9 @@ pub mod validation;
 pub use authority::PrivateFileReference;
 pub use contracts::*;
 pub use digest::Sha256Digest;
-pub use engine::{BrainEngine, ReconstructionReport, SleepReport};
+pub use engine::{
+    BrainEngine, CanonicalEngineHead, CorpusTransitionRecovery, ReconstructionReport, SleepReport,
+};
 pub use error::{BrainError, BrainResult};
 pub mod causal_credit;
 pub mod memory;

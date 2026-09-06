@@ -89,9 +89,23 @@ pub fn remove_confounders(
     if observations.len() < 2 {
         return Err(BrainError::Invalid("confounder_min_observations".into()));
     }
+    if !ridge.is_finite() || ridge <= 0.0 {
+        return Err(BrainError::Invalid("confounder_ridge_invalid".into()));
+    }
     let dim = observations[0].delta.len();
-    if dim == 0 || observations.iter().any(|o| o.delta.len() != dim) {
+    if dim == 0
+        || observations
+            .iter()
+            .any(|observation| observation.delta.len() != dim)
+    {
         return Err(BrainError::Invalid("delta_dimension_mismatch".into()));
+    }
+    if observations.iter().any(|observation| {
+        !observation.reliability.is_finite()
+            || observation.reliability <= 0.0
+            || observation.reliability > 1.0
+    }) {
+        return Err(BrainError::Invalid("confounder_reliability_invalid".into()));
     }
     let d = Matrix::from_rows(
         &observations
@@ -111,7 +125,7 @@ pub fn remove_confounders(
     let x = raw;
     let weights = observations
         .iter()
-        .map(|o| o.reliability.clamp(0.0, 1.0).max(1e-4))
+        .map(|o| o.reliability)
         .collect::<Vec<_>>();
     let q = x.cols;
     let n = x.rows;

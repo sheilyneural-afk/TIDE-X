@@ -1,15 +1,19 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::contracts::{DeltaObservation, ReconstructionInverseMode, SkillField};
+use crate::digest::ProvenanceDigest;
 use crate::error::{BrainError, BrainResult};
-use crate::linalg::{weighted_normal_solve, Matrix};
-use crate::validation::{independence_group_folds, regression_r2, source_support_indices};
+use crate::identity::{ObservationId, SkillId};
+use crate::linalg::{normalize, weighted_normal_solve, Matrix};
+use crate::validation::{
+    independence_group_folds, regression_r2, source_support_indices, validate_reliability,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RepresentationObservation {
-    pub observation_id: String,
+    pub observation_id: ObservationId,
     pub shift: Vec<f64>,
 }
 
@@ -21,6 +25,18 @@ pub struct DualSpaceModel<'a> {
     pub parameter_inverse_mode: ReconstructionInverseMode,
     pub parameter_promotable: bool,
     pub functional_cv_r2: f64,
+}
+
+/// Precommitted numerical and evidence gates for one dual-space analysis.
+/// Keeping them together prevents call sites from accidentally swapping
+/// several adjacent `f64` thresholds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualSpaceAnalysisConfig {
+    pub ridge: f64,
+    pub minimum_independence_groups: usize,
+    pub minimum_representation_cv_r2: f64,
+    pub minimum_match_accuracy: f64,
+    pub minimum_match_margin: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,10 +52,10 @@ pub struct RepresentationFit {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DualSpaceField {
-    pub skill_id: String,
+    pub skill_id: SkillId,
     pub functional_signature: Vec<f64>,
     pub representation_signature: Vec<f64>,
-    pub provenance_digests: Vec<String>,
+    pub provenance_digests: Vec<ProvenanceDigest>,
     pub parameter_uncertainty: f64,
 }
 
@@ -53,6 +69,9 @@ pub struct DualSpaceReport {
     pub representation_match_accuracy: f64,
     pub representation_mean_matched_cosine: f64,
     pub representation_min_match_margin: f64,
+    pub minimum_representation_cv_r2: f64,
+    pub minimum_match_accuracy: f64,
+    pub minimum_match_margin: f64,
     pub combined_cv_floor: f64,
     pub representation_supported: bool,
     pub dual_space_verified: bool,
@@ -60,7 +79,7 @@ pub struct DualSpaceReport {
 }
 
 fn coefficient_matrix(model: &DualSpaceModel<'_>, observation_count: usize) -> BrainResult<Matrix> {
-    if model.fields.is_empty()
+    if model.fields.len() < 2
         || model.field_coefficients.len() != observation_count
         || model.skill_source_mixtures.len() != model.fields.len()
         || model
@@ -70,7 +89,17 @@ fn coefficient_matrix(model: &DualSpaceModel<'_>, observation_count: usize) -> B
         || model
             .skill_source_mixtures
             .iter()
-            .any(|row| row.len() != observation_count)
+            .any(|row| row.len() != observation_count || row.iter().any(|value| !value.is_finite()))
+        || !model.functional_cv_r2.is_finite()
+        || model.functional_cv_r2 > 1.0
+        || model.fields.iter().any(|field| {
+            !field.uncertainty.is_finite()
+                || field.uncertainty < 0.0
+                || field
+                    .functional_signature
+                    .iter()
+                    .any(|value| !value.is_finite())
+        })
     {
         return Err(BrainError::Invalid("dual_space_field_model_invalid".into()));
     }
@@ -86,13 +115,29 @@ fn ordered_representation_rows(
             "dual_space_representation_count".into(),
         ));
     }
-    let by_id = representations
-        .iter()
-        .map(|observation| (observation.observation_id.as_str(), &observation.shift))
-        .collect::<BTreeMap<_, _>>();
+    let mut by_id = BTreeMap::new();
+    for representation in representations {
+        if by_id
+            .insert(
+                representation.observation_id.as_str(),
+                &representation.shift,
+            )
+            .is_some()
+        {
+            return Err(BrainError::Invalid(
+                "dual_space_representation_id_invalid_or_duplicate".into(),
+            ));
+        }
+    }
+    let mut observation_ids = BTreeSet::new();
     let mut rows = Vec::with_capacity(observations.len());
     let mut dim = None;
     for observation in observations {
+        if !observation_ids.insert(observation.observation_id.as_str()) {
+            return Err(BrainError::Invalid(
+                "dual_space_observation_id_invalid_or_duplicate".into(),
+            ));
+        }
         let shift = by_id
             .get(observation.observation_id.as_str())
             .ok_or_else(|| BrainError::Invalid("dual_space_representation_id_missing".into()))?;
@@ -130,8 +175,8 @@ fn fit_output(
     )?;
     let weights = observation_indices
         .iter()
-        .map(|&index| observations[index].reliability.clamp(1e-4, 1.0))
-        .collect::<Vec<_>>();
+        .map(|&index| validate_reliability(observations[index].reliability, "dual_space"))
+        .collect::<BrainResult<Vec<_>>>()?;
     let mut betas = Vec::with_capacity(rows[0].len());
     for output in 0..rows[0].len() {
         let target = observation_indices
@@ -157,11 +202,20 @@ pub fn fit_representation_map(
     ridge: f64,
     minimum_groups: usize,
 ) -> BrainResult<RepresentationFit> {
+    coefficients.validate("dual_space_coefficients")?;
     if coefficients.rows != observations.len()
         || coefficients.rows != representation_rows.len()
         || coefficients.cols == 0
         || representation_rows.is_empty()
         || representation_rows[0].is_empty()
+        || representation_rows.iter().any(|row| {
+            row.len() != representation_rows[0].len() || row.iter().any(|value| !value.is_finite())
+        })
+        || !ridge.is_finite()
+        || ridge <= 0.0
+        || observations
+            .iter()
+            .any(|observation| validate_reliability(observation.reliability, "dual_space").is_err())
     {
         return Err(BrainError::Invalid(
             "dual_space_representation_fit_shape".into(),
@@ -201,15 +255,6 @@ pub fn fit_representation_map(
     })
 }
 
-fn normalized_or_zero(values: &[f64]) -> BrainResult<Vec<f64>> {
-    let n = crate::linalg::norm(values)?;
-    Ok(if n <= 1e-15 {
-        vec![0.0; values.len()]
-    } else {
-        values.iter().map(|value| value / n).collect()
-    })
-}
-
 fn representation_centroid(
     field_index: usize,
     model: &DualSpaceModel<'_>,
@@ -231,7 +276,7 @@ fn representation_centroid(
         if excluded_group.is_some_and(|group| observations[index].independence_group == group) {
             continue;
         }
-        let weight = observations[index].reliability.clamp(1e-4, 1.0);
+        let weight = validate_reliability(observations[index].reliability, "dual_space")?;
         let sign = if mixture[index] >= 0.0 { 1.0 } else { -1.0 };
         total += weight;
         for dimension in 0..centroid.len() {
@@ -246,26 +291,40 @@ fn representation_centroid(
     for value in &mut centroid {
         *value /= total;
     }
-    normalized_or_zero(&centroid)
+    normalize(&centroid).map_err(|error| match error {
+        BrainError::Numerical(_) => {
+            BrainError::Numerical("dual_space_representation_centroid_degenerate".into())
+        }
+        other => other,
+    })
 }
 
 fn expected_field_for_observation(
     observation_index: usize,
     model: &DualSpaceModel<'_>,
 ) -> BrainResult<(usize, f64)> {
-    let mut best = None::<(usize, f64, f64)>;
+    let mut ranked = Vec::with_capacity(model.fields.len());
     for field_index in 0..model.fields.len() {
         let coefficient = model.skill_source_mixtures[field_index][observation_index];
-        let magnitude = coefficient.abs();
-        if best.is_none_or(|(_, current, _)| magnitude > current) {
-            best = Some((field_index, magnitude, coefficient.signum()));
-        }
+        ranked.push((field_index, coefficient.abs(), coefficient.signum()));
     }
-    let (field_index, _magnitude, sign) = best
-        .filter(|(_, magnitude, _)| *magnitude > 0.0)
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+    let (field_index, magnitude, sign) = ranked
+        .first()
+        .copied()
+        .filter(|(_, value, _)| *value > 0.0)
         .ok_or_else(|| {
             BrainError::Invalid("dual_space_observation_without_field_support".into())
         })?;
+    let ambiguity_tolerance = magnitude * f64::EPSILON.sqrt();
+    if ranked
+        .get(1)
+        .is_some_and(|(_, runner_up, _)| magnitude - runner_up <= ambiguity_tolerance)
+    {
+        return Err(BrainError::Invalid(
+            "dual_space_observation_field_assignment_ambiguous".into(),
+        ));
+    }
     Ok((field_index, if sign < 0.0 { -1.0 } else { 1.0 }))
 }
 
@@ -299,7 +358,12 @@ fn representation_recurrence(
                 .iter()
                 .map(|value| sign * value)
                 .collect::<Vec<_>>();
-            let normalized = normalized_or_zero(&aligned)?;
+            let normalized = normalize(&aligned).map_err(|error| match error {
+                BrainError::Numerical(_) => {
+                    BrainError::Numerical("dual_space_representation_shift_degenerate".into())
+                }
+                other => other,
+            })?;
             let similarities = centroids
                 .iter()
                 .map(|centroid| crate::linalg::cosine(&normalized, centroid))
@@ -345,17 +409,19 @@ pub fn analyze_dual_space(
     model: &DualSpaceModel<'_>,
     observations: &[DeltaObservation],
     representations: &[RepresentationObservation],
-    ridge: f64,
-    minimum_groups: usize,
-    min_match_accuracy: f64,
-    min_match_margin: f64,
+    config: DualSpaceAnalysisConfig,
 ) -> BrainResult<DualSpaceReport> {
     if observations.is_empty()
         || observations.len() != model.field_coefficients.len()
-        || !min_match_accuracy.is_finite()
-        || !(0.0..=1.0).contains(&min_match_accuracy)
-        || !min_match_margin.is_finite()
-        || min_match_margin < 0.0
+        || !config.ridge.is_finite()
+        || config.ridge < 0.0
+        || config.minimum_independence_groups < 2
+        || !config.minimum_representation_cv_r2.is_finite()
+        || config.minimum_representation_cv_r2 > 1.0
+        || !config.minimum_match_accuracy.is_finite()
+        || !(0.0..=1.0).contains(&config.minimum_match_accuracy)
+        || !config.minimum_match_margin.is_finite()
+        || config.minimum_match_margin < 0.0
     {
         return Err(BrainError::Invalid("dual_space_input_contract".into()));
     }
@@ -365,11 +431,16 @@ pub fn analyze_dual_space(
         &coefficients,
         observations,
         &representation_rows,
-        ridge,
-        minimum_groups,
+        config.ridge,
+        config.minimum_independence_groups,
     )?;
     let (match_accuracy, mean_matched_cosine, min_match_margin_observed, recurrence_centroids) =
-        representation_recurrence(model, observations, &representation_rows, minimum_groups)?;
+        representation_recurrence(
+            model,
+            observations,
+            &representation_rows,
+            config.minimum_independence_groups,
+        )?;
     if representation.field_signatures.len() != model.fields.len()
         || recurrence_centroids.len() != model.fields.len()
     {
@@ -399,10 +470,12 @@ pub fn analyze_dual_space(
             parameter_uncertainty: field.uncertainty,
         });
     }
-    let representation_supported =
-        match_accuracy >= min_match_accuracy && min_match_margin_observed > min_match_margin;
+    let representation_supported = representation.grouped_cv_r2
+        >= config.minimum_representation_cv_r2
+        && match_accuracy >= config.minimum_match_accuracy
+        && min_match_margin_observed > config.minimum_match_margin;
     Ok(DualSpaceReport {
-        schema: "cerebro.tidex.dual_space/v3".into(),
+        schema: "cerebro.tidex.dual_space/v4".into(),
         parameter_inverse_mode: model.parameter_inverse_mode,
         parameter_promotable: model.parameter_promotable,
         functional_cv_r2: model.functional_cv_r2,
@@ -410,7 +483,13 @@ pub fn analyze_dual_space(
         representation_match_accuracy: match_accuracy,
         representation_mean_matched_cosine: mean_matched_cosine,
         representation_min_match_margin: min_match_margin_observed,
-        combined_cv_floor: model.functional_cv_r2.min(match_accuracy),
+        minimum_representation_cv_r2: config.minimum_representation_cv_r2,
+        minimum_match_accuracy: config.minimum_match_accuracy,
+        minimum_match_margin: config.minimum_match_margin,
+        combined_cv_floor: model
+            .functional_cv_r2
+            .min(representation.grouped_cv_r2)
+            .min(match_accuracy),
         representation_supported,
         dual_space_verified: model.parameter_promotable && representation_supported,
         fields,
@@ -421,10 +500,11 @@ pub fn analyze_dual_space(
 mod tests {
     use super::*;
     use crate::contracts::ConfounderValue;
+    use crate::digest::Sha256Digest;
 
     fn observation(index: usize, group: usize) -> DeltaObservation {
         DeltaObservation {
-            observation_id: format!("o{index}"),
+            observation_id: ObservationId::parse(format!("o{index}")).unwrap(),
             from_checkpoint: "a".into(),
             to_checkpoint: format!("b{index}"),
             generation: 1,
@@ -441,7 +521,35 @@ mod tests {
             parameter_layout_sha256: None,
             representation_artifact: None,
             representation_protocol_sha256: None,
-            provenance_digest: format!("{index:064x}"),
+            provenance_digest: ProvenanceDigest::from(
+                Sha256Digest::parse(format!("{index:064x}")).unwrap(),
+            ),
+        }
+    }
+
+    fn field(id: &str) -> SkillField {
+        SkillField {
+            skill_id: SkillId::parse(id).unwrap(),
+            reconstruction_id: crate::identity::ReconstructionId::parse(format!(
+                "reconstruction-{id}"
+            ))
+            .unwrap(),
+            lineage_id: crate::identity::LineageId::parse(format!("lineage-{id}")).unwrap(),
+            generation_created: 1,
+            direction: vec![1.0, 0.0],
+            structured_geometry: None,
+            dense_materialization: None,
+            parameter_layout_sha256: None,
+            representation_signature: Vec::new(),
+            singular_value: 1.0,
+            explained_variance: 0.5,
+            persistence: 1.0,
+            coherence: 1.0,
+            uncertainty: 0.1,
+            evidence_support_digests: Vec::new(),
+            support: 3,
+            functional_signature: vec![1.0],
+            parent_skill_ids: Vec::new(),
         }
     }
 
@@ -468,5 +576,67 @@ mod tests {
         assert!(fit.grouped_cv_r2 > 0.999999, "{}", fit.grouped_cv_r2);
         assert!((fit.field_signatures[0][0] - 2.0).abs() < 1e-6);
         assert!((fit.field_signatures[1][1] - 3.0).abs() < 1e-6);
+
+        let mut invalid = observations.clone();
+        invalid[0].reliability = 0.0;
+        assert!(fit_representation_map(&coefficients, &invalid, &rows, 1e-9, 3).is_err());
+        assert!(fit_representation_map(&coefficients, &observations, &rows, 0.0, 3).is_err());
+    }
+
+    #[test]
+    fn directional_matching_cannot_hide_failed_cross_aperture_generalization() {
+        let observations = (0..6).map(|i| observation(i, i / 2)).collect::<Vec<_>>();
+        let field_coefficients = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+        ];
+        let skill_source_mixtures = vec![
+            vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        ];
+        let fields = vec![field("first"), field("second")];
+        let model = DualSpaceModel {
+            fields: &fields,
+            field_coefficients: &field_coefficients,
+            skill_source_mixtures: &skill_source_mixtures,
+            parameter_inverse_mode: ReconstructionInverseMode::Persistent,
+            parameter_promotable: true,
+            functional_cv_r2: 1.0,
+        };
+        let magnitudes = [1.0, 10.0, 100.0];
+        let representations = observations
+            .iter()
+            .enumerate()
+            .map(|(index, observation)| RepresentationObservation {
+                observation_id: observation.observation_id.clone(),
+                shift: if index % 2 == 0 {
+                    vec![magnitudes[index / 2], 0.0]
+                } else {
+                    vec![0.0, magnitudes[index / 2]]
+                },
+            })
+            .collect::<Vec<_>>();
+        let report = analyze_dual_space(
+            &model,
+            &observations,
+            &representations,
+            DualSpaceAnalysisConfig {
+                ridge: 1e-9,
+                minimum_independence_groups: 3,
+                minimum_representation_cv_r2: 0.35,
+                minimum_match_accuracy: 1.0,
+                minimum_match_margin: 0.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.representation_match_accuracy, 1.0);
+        assert!(report.representation_min_match_margin > 0.99);
+        assert!(report.representation_cv_r2 < 0.35);
+        assert!(!report.representation_supported);
+        assert!(!report.dual_space_verified);
     }
 }

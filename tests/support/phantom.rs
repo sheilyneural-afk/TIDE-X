@@ -106,7 +106,10 @@ pub fn cognitive_phantom() -> BrainResult<Phantom> {
         let quadrant =
             usize::from(nuisance_delta[0] >= 0.0) + 2 * usize::from(nuisance_delta[1] >= 0.0);
         observations.push(DeltaObservation {
-            observation_id: format!("phantom-{experiment:03}"),
+            observation_id: cerebro_tidex::identity::ObservationId::parse(format!(
+                "phantom-{experiment:03}"
+            ))
+            .unwrap(),
             from_checkpoint: format!("c{from:02}"),
             to_checkpoint: format!("c{to:02}"),
             generation: experiment as u64 + 1,
@@ -137,7 +140,10 @@ pub fn cognitive_phantom() -> BrainResult<Phantom> {
             parameter_layout_sha256: None,
             representation_artifact: None,
             representation_protocol_sha256: None,
-            provenance_digest: format!("{:064x}", experiment + 1),
+            provenance_digest: cerebro_tidex::digest::ProvenanceDigest::from(
+                cerebro_tidex::digest::Sha256Digest::parse(format!("{:064x}", experiment + 1))
+                    .unwrap(),
+            ),
         });
     }
 

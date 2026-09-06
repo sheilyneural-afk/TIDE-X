@@ -1,6 +1,45 @@
 use crate::artifact::{DeltaArtifactRef, F64ArtifactRef};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use crate::digest::{
+    ObservationRecordDigest, ProvenanceDigest, RepresentationProtocolDigest, Sha256Digest,
+};
+use crate::error::{BrainError, BrainResult};
+use crate::identity::{ApertureId, LineageId, ObservationId, ProbeId, ReconstructionId, SkillId};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+fn deserialize_unique_skill_ids<'de, D>(deserializer: D) -> Result<Vec<SkillId>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let ids = Vec::<SkillId>::deserialize(deserializer)?;
+    if ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
+        return Err(D::Error::custom("duplicate_parent_skill_id"));
+    }
+    Ok(ids)
+}
+
+fn deserialize_unique_skill_fields<'de, D>(deserializer: D) -> Result<Vec<SkillField>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let fields = Vec::<SkillField>::deserialize(deserializer)?;
+    if fields
+        .iter()
+        .map(|field| &field.skill_id)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != fields.len()
+        || fields.iter().any(|field| {
+            field
+                .parent_skill_ids
+                .iter()
+                .any(|parent| parent == &field.skill_id)
+        })
+    {
+        return Err(D::Error::custom("invalid_skill_field_identity_graph"));
+    }
+    Ok(fields)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReconstructionInverseMode {
@@ -26,6 +65,7 @@ pub struct ConfounderValue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentLineage {
     pub run_id: String,
     pub replicate_id: String,
@@ -37,8 +77,9 @@ pub struct ExperimentLineage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DeltaObservation {
-    pub observation_id: String,
+    pub observation_id: ObservationId,
     pub from_checkpoint: String,
     pub to_checkpoint: String,
     pub generation: u64,
@@ -58,14 +99,14 @@ pub struct DeltaObservation {
     /// SHA256 of the content-addressed ParameterBlockLayout describing the
     /// dense artifact's parameter space.
     #[serde(default)]
-    pub parameter_layout_sha256: Option<String>,
+    pub parameter_layout_sha256: Option<Sha256Digest>,
     /// Architecture-internal representation shift measured on a sealed generic
     /// probe protocol. Stored as authenticated f64 tensor evidence.
     #[serde(default)]
     pub representation_artifact: Option<F64ArtifactRef>,
     #[serde(default)]
-    pub representation_protocol_sha256: Option<String>,
-    pub provenance_digest: String,
+    pub representation_protocol_sha256: Option<RepresentationProtocolDigest>,
+    pub provenance_digest: ProvenanceDigest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,7 +135,7 @@ pub struct BlockSubspaceGeometry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillSubspaceGeometry {
-    pub skill_id: String,
+    pub skill_id: SkillId,
     pub source_support_indices: Vec<usize>,
     pub blocks: Vec<BlockSubspaceGeometry>,
     pub max_local_rank: usize,
@@ -105,13 +146,13 @@ pub struct SkillSubspaceGeometry {
 pub struct SkillField {
     /// Durable capability identity. Fresh reconstructions receive a content-derived
     /// candidate id; bank reconciliation preserves this id across later evidence.
-    pub skill_id: String,
+    pub skill_id: SkillId,
     /// Ephemeral identity of the exact reconstruction/evidence support.
     #[serde(default)]
-    pub reconstruction_id: String,
+    pub reconstruction_id: ReconstructionId,
     /// Stable lineage anchor used to distinguish legacy/unversioned fields.
     #[serde(default)]
-    pub lineage_id: String,
+    pub lineage_id: LineageId,
     pub generation_created: u64,
     /// Canonical discovery-space direction (e.g. sketch/tomography space).
     /// This is NOT the complete executable capability.
@@ -124,7 +165,7 @@ pub struct SkillField {
     #[serde(default)]
     pub dense_materialization: Option<DeltaArtifactRef>,
     #[serde(default)]
-    pub parameter_layout_sha256: Option<String>,
+    pub parameter_layout_sha256: Option<Sha256Digest>,
     /// Cross-aperture representation identity signature, attached only after
     /// independent P10/P19 validation.
     #[serde(default)]
@@ -139,23 +180,24 @@ pub struct SkillField {
     /// authoritative evidence is available; it must never count repeated
     /// reconstructions of the same observations.
     #[serde(default)]
-    pub evidence_support_digests: Vec<String>,
+    pub evidence_support_digests: Vec<ObservationRecordDigest>,
     pub support: usize,
     #[serde(default)]
     pub functional_signature: Vec<f64>,
-    #[serde(default)]
-    pub parent_skill_ids: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_unique_skill_ids")]
+    pub parent_skill_ids: Vec<SkillId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SkillBank {
     pub generation: u64,
+    #[serde(deserialize_with = "deserialize_unique_skill_fields")]
     pub fields: Vec<SkillField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProtectedDirection {
-    pub probe_id: String,
+    pub probe_id: ProbeId,
     pub direction: Vec<f64>,
     pub importance: f64,
 }
@@ -170,7 +212,7 @@ pub struct ProtectedCortex {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApertureCandidate {
-    pub aperture_id: String,
+    pub aperture_id: ApertureId,
     pub sensing_vector: Vec<f64>,
     pub noise_variance: f64,
     pub cost: f64,
@@ -197,6 +239,8 @@ pub struct BrainConfig {
     pub min_identifiability_signal_to_noise: f64,
     pub require_structured_geometry_for_promotion: bool,
     pub require_dual_space_for_promotion: bool,
+    #[serde(default = "default_min_representation_cv_r2")]
+    pub min_representation_cv_r2: f64,
     pub min_representation_match_accuracy: f64,
     pub min_representation_match_margin: f64,
 }
@@ -221,8 +265,77 @@ impl Default for BrainConfig {
             min_identifiability_signal_to_noise: 1.0,
             require_structured_geometry_for_promotion: true,
             require_dual_space_for_promotion: true,
+            min_representation_cv_r2: 0.35,
             min_representation_match_accuracy: 1.0,
             min_representation_match_margin: 0.0,
+        }
+    }
+}
+
+fn default_min_representation_cv_r2() -> f64 {
+    0.35
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionBlocker {
+    CycleConsistencyFailed,
+    FunctionalCrossValidationFailed,
+    NoSkillFields,
+    SkillCoherenceFailed,
+    SkillPersistenceFailed,
+    InsufficientDeclaredApertures,
+    ApertureIndependenceUnresolved,
+    SkillIdentifiabilityUnresolved,
+    TomographyIllConditioned,
+    ReconstructionErrorHigh,
+    PersistentObservationCoverageIncomplete,
+    PersistentClusterAssignmentInconsistentAcrossSpaces,
+    PersistentClusterIdentityMarginUnresolved,
+    PersistentCoherenceGapNotIdentifiable,
+    PersistentHoldoutAlignmentNonpositive,
+    StructuredGeometryRequiredForPromotion,
+    DualSpaceRepresentationGeneralizationUnverified,
+    DualSpaceRepresentationSignatureMissing,
+}
+
+impl PromotionBlocker {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CycleConsistencyFailed => "cycle_consistency_failed",
+            Self::FunctionalCrossValidationFailed => "functional_cross_validation_failed",
+            Self::NoSkillFields => "no_skill_fields",
+            Self::SkillCoherenceFailed => "skill_coherence_failed",
+            Self::SkillPersistenceFailed => "skill_persistence_failed",
+            Self::InsufficientDeclaredApertures => "insufficient_declared_apertures",
+            Self::ApertureIndependenceUnresolved => "aperture_independence_unresolved",
+            Self::SkillIdentifiabilityUnresolved => "skill_identifiability_unresolved",
+            Self::TomographyIllConditioned => "tomography_ill_conditioned",
+            Self::ReconstructionErrorHigh => "reconstruction_error_high",
+            Self::PersistentObservationCoverageIncomplete => {
+                "persistent_observation_coverage_incomplete"
+            }
+            Self::PersistentClusterAssignmentInconsistentAcrossSpaces => {
+                "persistent_cluster_assignment_inconsistent_across_spaces"
+            }
+            Self::PersistentClusterIdentityMarginUnresolved => {
+                "persistent_cluster_identity_margin_unresolved"
+            }
+            Self::PersistentCoherenceGapNotIdentifiable => {
+                "persistent_coherence_gap_not_identifiable"
+            }
+            Self::PersistentHoldoutAlignmentNonpositive => {
+                "persistent_holdout_alignment_nonpositive"
+            }
+            Self::StructuredGeometryRequiredForPromotion => {
+                "structured_geometry_required_for_promotion"
+            }
+            Self::DualSpaceRepresentationGeneralizationUnverified => {
+                "dual_space_representation_generalization_unverified"
+            }
+            Self::DualSpaceRepresentationSignatureMissing => {
+                "dual_space_representation_signature_missing"
+            }
         }
     }
 }
@@ -230,6 +343,123 @@ impl Default for BrainConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PromotionDecision {
     pub allowed: bool,
-    pub reasons: Vec<String>,
+    pub reasons: Vec<PromotionBlocker>,
     pub metrics: BTreeMap<String, f64>,
+}
+
+impl PromotionDecision {
+    /// Promotion is a strict conjunction: a persisted decision cannot claim
+    /// success while naming a failed gate, nor smuggle a non-finite metric into
+    /// an otherwise valid receipt.
+    pub fn validate(&self) -> BrainResult<()> {
+        if self.allowed != self.reasons.is_empty()
+            || self.metrics.keys().any(|key| key.trim().is_empty())
+            || self.metrics.values().any(|value| !value.is_finite())
+        {
+            return Err(BrainError::Integrity(
+                "promotion_decision_contract_invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill(id: &str) -> SkillField {
+        SkillField {
+            skill_id: SkillId::parse(id).unwrap(),
+            reconstruction_id: ReconstructionId::unassigned(),
+            lineage_id: LineageId::unassigned(),
+            generation_created: 1,
+            direction: vec![1.0],
+            structured_geometry: None,
+            dense_materialization: None,
+            parameter_layout_sha256: None,
+            representation_signature: Vec::new(),
+            singular_value: 1.0,
+            explained_variance: 1.0,
+            persistence: 1.0,
+            coherence: 1.0,
+            uncertainty: 0.0,
+            evidence_support_digests: Vec::new(),
+            support: 1,
+            functional_signature: Vec::new(),
+            parent_skill_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn promotion_is_a_strict_conjunction_with_stable_wire_blockers() {
+        let blocked = PromotionDecision {
+            allowed: false,
+            reasons: vec![PromotionBlocker::FunctionalCrossValidationFailed],
+            metrics: BTreeMap::from([("functional_cv_r2".into(), 0.2)]),
+        };
+        assert!(blocked.validate().is_ok());
+        assert_eq!(
+            serde_json::to_string(&blocked.reasons).unwrap(),
+            "[\"functional_cross_validation_failed\"]"
+        );
+        let contradictory = PromotionDecision {
+            allowed: true,
+            ..blocked
+        };
+        assert!(contradictory.validate().is_err());
+    }
+
+    #[test]
+    fn skill_bank_deserialization_rejects_duplicate_identities() {
+        let field = serde_json::to_value(skill("cap-one")).unwrap();
+        let wire = serde_json::json!({"generation": 2, "fields": [field.clone(), field]});
+        assert!(serde_json::from_value::<SkillBank>(wire).is_err());
+    }
+
+    #[test]
+    fn lineage_parents_are_typed_unique_and_wire_compatible() {
+        let mut field = serde_json::to_value(skill("cap-current")).unwrap();
+        field["parent_skill_ids"] = serde_json::json!(["cap-parent-a", "cap-parent-b"]);
+        let parsed: SkillField = serde_json::from_value(field.clone()).unwrap();
+        assert_eq!(parsed.parent_skill_ids[0], "cap-parent-a");
+        assert_eq!(serde_json::to_value(parsed).unwrap(), field);
+
+        field["parent_skill_ids"] = serde_json::json!(["cap-parent-a", "cap-parent-a"]);
+        assert!(serde_json::from_value::<SkillField>(field.clone()).is_err());
+        field["parent_skill_ids"] = serde_json::json!(["../foreign-skill"]);
+        assert!(serde_json::from_value::<SkillField>(field).is_err());
+
+        let mut self_parent = serde_json::to_value(skill("cap-current")).unwrap();
+        self_parent["parent_skill_ids"] = serde_json::json!(["cap-current"]);
+        let bank = serde_json::json!({"generation": 2, "fields": [self_parent]});
+        assert!(serde_json::from_value::<SkillBank>(bank).is_err());
+    }
+
+    #[test]
+    fn observation_wire_rejects_path_identity_bad_digest_and_unknown_fields() {
+        let valid = serde_json::json!({
+            "observation_id": "obs-1",
+            "from_checkpoint": "base",
+            "to_checkpoint": "next",
+            "generation": 1,
+            "delta": [0.1],
+            "reliability": 1.0,
+            "independence_group": "group-1",
+            "provenance_digest": "a".repeat(64)
+        });
+        assert!(serde_json::from_value::<DeltaObservation>(valid.clone()).is_ok());
+
+        let mut path_id = valid.clone();
+        path_id["observation_id"] = serde_json::json!("../obs-1");
+        assert!(serde_json::from_value::<DeltaObservation>(path_id).is_err());
+
+        let mut bad_digest = valid.clone();
+        bad_digest["provenance_digest"] = serde_json::json!("raw");
+        assert!(serde_json::from_value::<DeltaObservation>(bad_digest).is_err());
+
+        let mut unknown = valid;
+        unknown["unsealed_evidence"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<DeltaObservation>(unknown).is_err());
+    }
 }
