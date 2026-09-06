@@ -186,9 +186,22 @@ bash quality/gate0-release.sh
 bash quality/gate1-tooling.sh
 bash quality/gate2-verification.sh
 bash quality/gate3-assurance.sh
+bash quality/gate4-release-readiness.sh
 ```
 
 P3 es acumulativa sobre P2 y añade model checking determinista acotado, pruebas concurrentes/recovery obligatorias y un recibo de aseguramiento SHA-256 externo al checkout. El snapshot que la superó está congelado en `43588d43d76269258efd6928b098369030f049cb`. Esta evidencia no debe describirse como “verificación formal universal”.
+
+## Release Readiness (P4)
+
+P4 añade una capa de distribución técnica sobre P3. Las fronteras son:
+
+- `quality/build-release-bundle.sh`: exige Git limpio, hace dos builds independientes de los ocho binarios con `--release --bins --offline --locked`, exige igualdad bit a bit, genera `release-manifest.json`, `SHA256SUMS`, SBOM SPDX 2.3 y un `.tar.zst` determinista fuera del checkout.
+- `quality/verify-release.sh`: valida identidad, conjunto exacto de ocho binarios, hashes/tamaños, permisos, SBOM, miembros del archive y, cuando se solicita, las firmas OpenPGP del fingerprint autorizado.
+- `quality/sign-release.sh`: firma manifest/checksums y opcionalmente archive/checksum externo sin generar ni elegir una clave implícita.
+- `quality/manage-release-installation.sh`: mantiene releases versionadas, `activation.json` como autoridad, `current` como puntero derivado, upgrade, rollback y uninstall de releases inactivas sin borrar `TIDEX_PRIVATE_ROOT`.
+- `quality/gate4-release-readiness.sh`: ejecuta P3 acumulativa y después exige reproducibilidad del bundle completo, firma real con una identidad efímera de prueba, instalación firmada, upgrade, recuperación del puntero derivado, rollback, roll-forward, uninstall y preservación del estado privado.
+
+Gate4 distingue **readiness técnica** de **promoción pública**. La puerta técnica no crea una identidad criptográfica persistente ni decide una licencia legal. `Cargo.toml` sigue sin declarar `license`/`license-file`; además, una firma de producción debe realizarse posteriormente con una clave autorizada por el propietario. El receipt externo de Gate4 registra estos límites en vez de ocultarlos.
 
 ## Firma de release (P4)
 

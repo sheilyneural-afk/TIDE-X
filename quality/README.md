@@ -153,15 +153,29 @@ Ejecución:
 quality/gate3-assurance.sh
 ```
 
-## P4: frontera de firma disponible
+## Puerta 4: Release Readiness técnica
 
-Como primera pieza de Release Readiness, `quality/sign-release.sh` implementa una frontera OpenPGP fail-closed. Rechaza releases dentro del checkout, symlinks en la ruta de release, manifests/checksums no regulares, rutas no canónicas o escapadas en `SHA256SUMS`, subjects no regulares, checksum mismatch, fingerprint ambiguo/no completo y claves secretas sin capacidad de firma.
+`quality/gate4-release-readiness.sh` es acumulativa sobre P3. Sólo se ejecuta sobre Git limpio, toma un snapshot de modos/tamaños/SHA-256 del checkout y exige el mismo snapshot al terminar.
 
-La selección de autoridad es explícita mediante `TIDEX_RELEASE_GPG_KEY=<fingerprint de 40 hex>`. Las firmas internas se publican como `SHA256SUMS.asc` y `release-manifest.json.asc` sólo después de verificarlas contra el mismo fingerprint. Si se pasa el archive P4 como segundo argumento, debe ser hermano del directorio de release, llamarse exactamente `<release-id>.tar.zst` y verificar contra `<archive>.sha256`; entonces también se firman ambos ficheros externos. Una firma ya existente se acepta únicamente si vuelve a verificar para el subject exacto y la clave autorizada. No existe generación automática ni fallback a otra clave.
+La producción del artefacto usa `quality/build-release-bundle.sh`. Cada invocación realiza dos builds independientes de los ocho binarios con Cargo offline/locked y falla si cualquier ejecutable difiere byte a byte. Después genera un SBOM SPDX 2.3 normalizado, `release-manifest.json`, `SHA256SUMS` y un `.tar.zst` determinista. El manifest liga commit/tree Git, `TIDEX_SOURCE_TREE_DIGEST`, toolchain, `Cargo.toml`, `Cargo.lock`, hashes de los ocho binarios, SBOM y hashes del builder, signer, verifier y gestor de instalación. Gate4 ejecuta el builder dos veces más y compara el contenedor completo, incluidos modos y SHA-256, para comprobar reproducibilidad a nivel de bundle.
 
-La implementación fue probada con una clave secreta efímera creada en un `GNUPGHOME` temporal: rechazo sin clave, firma real, verificación exacta de las cuatro firmas del bundle P4, replay idempotente y rechazo tras alterar tanto un payload protegido por `SHA256SUMS` como el archive protegido por su checksum externo. Esa prueba de desarrollo no es una firma de distribución; una release pública requiere una clave autorizada persistente configurada por el propietario del proyecto.
+`quality/verify-release.sh` es la autoridad común de estructura. Rechaza payloads extra, symlinks, ficheros escribibles por grupo/otros, binarios no ejecutables, subjects no declarados, hash/tamaño divergente, identidad SBOM incorrecta, miembros de archive inesperados y contenido del archive que no coincida con el directorio verificado. Con `TIDEX_RELEASE_REQUIRE_SIGNATURE=1`, exige firmas OpenPGP válidas para el fingerprint completo suministrado en `TIDEX_RELEASE_GPG_KEY`.
 
-P4 todavía no está superada: faltan el bundle de los ocho binarios, manifiesto/SBOM definitivos, instalación/activación/rollback/desinstalación aislados y la puerta acumulativa `gate4`.
+`quality/sign-release.sh` delega toda la estructura al verifier y sólo añade la frontera criptográfica. Exige una clave secreta seleccionada por fingerprint completo; firma `SHA256SUMS`, `release-manifest.json`, el archive y su checksum externo cuando se proporciona el transporte. No genera claves, no elige una por defecto y no reemplaza silenciosamente firmas existentes.
+
+`quality/manage-release-installation.sh` mantiene `installation.json` y `activation.json` como autoridades fuera del checkout. Las releases viven en `releases/<release-id>`; `current` es únicamente un symlink derivado y puede reconstruirse desde `activation.json` sin avanzar su revisión. El gestor exige install-root no escribible por terceros, state-root privado, lock real no-symlink, target compatible, releases verificadas y autoridades no escribibles. `rollback` sólo usa una `previous` autenticada y `uninstall` rechaza la release activa y preserva siempre el state-root externo.
+
+Para la evidencia de rollback, Gate4 no relabela fixtures: construye la release actual y una segunda identidad real desde `HEAD^` en un clon local temporal. Ambas se firman con una clave efímera confinada a `/tmp`, se instalan con verificación de firma obligatoria y se recorre previous -> current -> rollback -> current -> uninstall de previous. También se ejecuta el binario instalado contra el state-root de prueba y se exige el rechazo fail-closed `integrity:active_skill_bank_missing` cuando no existe un banco activo.
+
+Una ejecución técnica exitosa genera un receipt `cerebro.tidex.release_readiness_receipt/v1` fuera del checkout y devuelve `result=technical-passed`. Esto **no equivale a promoción pública**: la identidad OpenPGP usada por la puerta es de prueba y se destruye al terminar. La promoción pública permanece separada y el receipt enumera blockers observados. En el estado actual del repositorio, `Cargo.toml` no declara `license` ni `license-file`, por lo que la puerta no inventa una licencia y registra `product_license_undeclared`; además registra que no se ha realizado una firma de distribución de producción.
+
+Ejecución:
+
+```text
+quality/gate4-release-readiness.sh
+```
+
+`QUALITY_P4_RECEIPT_PATH` permite seleccionar un receipt externo. Gate4 rechaza cualquier destino dentro del checkout.
 
 ## Límite de la evidencia
 
@@ -209,9 +223,9 @@ debe crecer:
    "termina" el espacio.
 7. Actualizar RustSec en una tarea con red, firmar la fecha y digest de la
    snapshot y después ejecutar la puerta reproducible sin red.
-8. Mantener el recibo de calidad P3 y, en futuras puertas, vincular cada ejecución
-   a commit, toolchains, configuración, duración, cobertura y digests de resultados.
+8. Mantener los receipts P3/P4 y vincular cada ejecución a commit, toolchains,
+   configuración, duración, cobertura cuando corresponda y digests de resultados.
 
 El umbral no se sube con pruebas vacías ni excluyendo código difícil. Los
 informes de cobertura permiten convertir líneas, funciones y regiones no
-cubiertas en trabajo verificable; P0-P3 no afirman cobertura universal de ramas.
+cubiertas en trabajo verificable; P0-P4 no afirman cobertura universal de ramas.
