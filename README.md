@@ -1,35 +1,45 @@
 # CEREBRO TIDE-X
 
-CEREBRO TIDE-X es un motor Rust para adquisición de evidencia, reconstrucción de subespacios de habilidad, consolidación de memoria, aprendizaje adaptativo y ejecución gobernada. Su diseño prioriza autoridad explícita, persistencia direccionada por contenido, operaciones idempotentes, recuperación fail-closed y evidencia reproducible de calidad.
+CEREBRO TIDE-X es un motor Rust para adquisición de evidencia, reconstrucción de subespacios de habilidad, consolidación de memoria, aprendizaje adaptativo y ejecución gobernada. Su diseño prioriza autoridad explícita, persistencia direccionada por contenido, idempotencia en rutas críticas, recuperación fail-closed y evidencia de calidad vinculada por hashes.
 
-Este repositorio no declara por sí solo conformidad DO-178C, ISO 26262, ASIL D ni otra certificación normativa externa. Las puertas `P0`, `P1` y `P2` son controles internos reproducibles del proyecto. `P3` añade aseguramiento acotado de concurrencia y recuperación, pero tampoco constituye una prueba universal del kernel, filesystem, hardware o entorno de despliegue.
+Este repositorio no declara por sí solo conformidad DO-178C, ISO 26262, ASIL D ni otra certificación normativa externa. Las puertas `P0` a `P3` son controles internos automatizados del proyecto y fijan toolchains, dependencias y snapshots para hacer sus ejecuciones repetibles bajo un entorno compatible. `P3` añade aseguramiento acotado de concurrencia y recuperación, pero tampoco constituye una prueba universal del kernel, filesystem, hardware o entorno de despliegue.
 
 ## Estado de calidad
 
-El commit `c8bbb6e8694ecf41df7b82c4962ddfedeeed3dda` cerró Puerta 2 con:
+Puerta 2 quedó congelada inicialmente en el commit `c8bbb6e8694ecf41df7b82c4962ddfedeeed3dda`. Puerta 3 se ejecutó después sobre ese commit más el candidato P3 y el snapshot exacto que superó la puerta se congeló finalmente en:
 
-- P0 acumulativa: formato, Clippy con `-D warnings`, pruebas `--all-targets`, auditoría de dependencias y arranque vacío fail-closed.
-- P1 acumulativa: cobertura, Miri, ASan, LSan, TSan y fuzzing de 100.000 ejecuciones por target configurado.
-- P2: cobertura global 86,91% líneas / 80,14% funciones / 87,57% regiones; Miri ampliado a `low_rank_math`, `linalg`, `trust_region` y `transport`; TSan sobre todos los targets; snapshot SHA-256 pre/post sin mutación del checkout.
+```text
+43588d43d76269258efd6928b098369030f049cb
+```
 
-Pisos críticos P2 medidos:
+La ejecución P3 fue acumulativa: volvió a ejecutar P0, P1 y P2 antes de sus propios controles. En esa corrida:
 
-| Componente | Líneas |
-| --- | ---: |
-| `src/engine/runtime.rs` | 80,18% |
-| `src/engine/transition.rs` | 75,58% |
-| `src/engine/support.rs` | 83,77% |
-| `src/engine/analysis.rs` | 85,30% |
-| `src/isolated_execution.rs` | 87,33% |
-| `src/digest.rs` | 98,97% |
+- P0 pasó formato, Clippy con `-D warnings`, pruebas `--all-targets`, auditoría/políticas de dependencias y arranque vacío fail-closed.
+- P1 pasó cobertura, Miri, ASan, LSan obligatorio por herencia de P2, TSan y 100.000 ejecuciones de cada uno de los dos targets de fuzz configurados.
+- P2 pasó de nuevo con Miri ampliado sobre `low_rank_math`, `linalg`, `trust_region` y `transport`, TSan sobre `--all-targets` y snapshot SHA-256 pre/post sin mutación del checkout.
+- P3 pasó sus 17 pruebas de aseguramiento obligatorias, incluidos los dos modelos deterministas acotados, concurrencia real de `engine_authority`, carreras/adversarios de filesystem y recuperación del corpus.
 
-La definición detallada de las puertas está en [`quality/README.md`](quality/README.md).
+Última cobertura P2 medida dentro de la corrida P3:
+
+| Componente | Líneas | Funciones | Regiones |
+| --- | ---: | ---: | ---: |
+| `src/engine/runtime.rs` | 80,18% | 77,12% | 81,49% |
+| `src/engine/transition.rs` | 75,80% | 70,00% | 76,40% |
+| `src/engine/support.rs` | 83,77% | 81,40% | 85,71% |
+| `src/engine/analysis.rs` | 85,30% | 79,69% | 86,37% |
+| `src/isolated_execution.rs` | 87,33% | 82,86% | 89,25% |
+| `src/digest.rs` | 98,97% | 98,18% | 98,50% |
+| **Global** | **86,97%** | **80,24%** | **87,62%** |
+
+El receipt de aquella ejecución P3 se generó fuera del checkout. Como la puerta se ejecutó antes de crear el commit final, su campo `head_commit` identifica el padre `c8bbb6e...`; la vinculación con `43588d4...` se comprobó después comparando el manifiesto SHA-256 completo y los metadatos del checkout, que coincidieron exactamente. Por tanto, el commit `43588d4...` contiene el mismo snapshot de archivos que pasó P3, aunque el receipt original no fue reescrito para fingir un HEAD posterior.
+
+La definición detallada de las puertas y los límites de esta evidencia están en [`quality/README.md`](quality/README.md).
 
 ## Toolchain
 
 `rust-toolchain.toml` fija el toolchain estable `1.96.0` con `clippy` y `rustfmt`. Las puertas que necesitan Miri o sanitizadores usan además el nightly fijado por sus propios scripts de calidad y verifican su commit de toolchain.
 
-`Cargo.toml` declara `rust-version = "1.85"` como versión mínima de lenguaje/compilador admitida por el paquete; no es la versión con la que se certifican las puertas actuales.
+`Cargo.toml` declara `rust-version = "1.85"` como MSRV del paquete. Esa declaración no sustituye una prueba de la suite completa con Rust 1.85; las puertas actuales se ejecutan con el toolchain estable fijado en `1.96.0`.
 
 El crate aplica:
 
@@ -62,11 +72,11 @@ sudo install -d -m 0700 /var/lib/tidex-brain
 export TIDEX_PRIVATE_ROOT=/var/lib/tidex-brain
 ```
 
-Los helpers internos `secure_dir` y `secure_file` fijan respectivamente `0700` y `0600` cuando crean/protegen artefactos administrados por el motor.
+Los helpers internos `secure_dir` y `secure_file` no crean rutas: cuando se aplican a una ruta existente, fijan respectivamente los modos `0700` y `0600`.
 
 ## Compilación
 
-Compilación reproducible sin resolución de red:
+Compilación release con dependencias bloqueadas y sin resolución de red:
 
 ```bash
 cargo build --release --bins --offline --locked
@@ -119,13 +129,13 @@ Para alcance declarado se usa `--scope declared-paths` junto con uno o más `--p
 La sintaxis implementada es:
 
 ```text
-adaptive_learning_cycle start <session-id> <learning-target.json> <policy.json>
-adaptive_learning_cycle next <session-id>
-adaptive_learning_cycle assimilate <session-id> <experiment-evidence.json>
-adaptive_learning_cycle show <session-id>
-adaptive_learning_cycle controller-train <controller-training-dataset.json> <controller-policy.json> <controller-binding.json>
-adaptive_learning_cycle controller-show <session-id>
-adaptive_learning_cycle controller-compose <invocation.json>
+adaptive-learning-cycle start <session-id> <learning-target.json> <policy.json>
+adaptive-learning-cycle next <session-id>
+adaptive-learning-cycle assimilate <session-id> <experiment-evidence.json>
+adaptive-learning-cycle show <session-id>
+adaptive-learning-cycle controller-train <controller-training-dataset.json> <controller-policy.json> <controller-binding.json>
+adaptive-learning-cycle controller-show <session-id>
+adaptive-learning-cycle controller-compose <invocation.json>
 ```
 
 Las operaciones persistentes usan `TIDEX_PRIVATE_ROOT`. `controller-compose` exige una invocación confinada en la raíz privada.
@@ -140,7 +150,7 @@ autonomous-learning-plan learning-target.json
 
 ### `ledger-diagnose`
 
-No acepta argumentos. Verifica el ledger de la raíz configurada y emite sus eventos y cabeza verificada:
+No define opciones de CLI propias. La implementación actual no inspecciona `argv`, por lo que argumentos adicionales se ignoran. Verifica el ledger de la raíz configurada y emite sus eventos y cabeza verificada:
 
 ```bash
 export TIDEX_PRIVATE_ROOT=/var/lib/tidex-brain
@@ -178,7 +188,7 @@ bash quality/gate2-verification.sh
 bash quality/gate3-assurance.sh
 ```
 
-P3 es acumulativa sobre P2 y añade model checking determinista acotado, pruebas concurrentes/recovery obligatorias y un recibo de aseguramiento SHA-256 externo al checkout. No debe describirse como “verificación formal universal”.
+P3 es acumulativa sobre P2 y añade model checking determinista acotado, pruebas concurrentes/recovery obligatorias y un recibo de aseguramiento SHA-256 externo al checkout. El snapshot que la superó está congelado en `43588d43d76269258efd6928b098369030f049cb`. Esta evidencia no debe describirse como “verificación formal universal”.
 
 ## Dependencias y licencias
 
