@@ -1,31 +1,32 @@
-use crate::digest::{sha256_file, Sha256Digest};
+use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
-use crate::security::{secure_dir, secure_file};
 use rustix::fs::{
-    flock, fstat, open, openat2, renameat_with, FileType, FlockOperation, Mode, OFlags,
-    RenameFlags, ResolveFlags, Stat,
+    fchmod, flock, fstat, linkat, mkdirat, open, openat, openat2, renameat, renameat_with,
+    unlinkat, AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags,
+    Stat,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs::File;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_IMMUTABLE_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 const PRIVATE_READ_BUFFER_BYTES: usize = 64 * 1024;
+const PRIVATE_TREE_MAX_DEPTH: usize = 256;
 const PRIVATE_RESOLUTION: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS);
 
 /// Reserve a unique private staging file beside an immutable destination.
 ///
-/// The returned descriptor is already opened with `create_new` and mode 0600,
-/// so streaming producers can write directly into it without a path-open race.
+/// The returned descriptor is opened with `CREAT|EXCL` relative to a verified
+/// parent directory fd, so no pathname exists to race between check and create.
 /// [`install_private_immutable_file`] performs the final sync, digest check and
 /// no-overwrite installation.
 pub fn create_private_staging_file(
@@ -33,38 +34,47 @@ pub fn create_private_staging_file(
     destination: &Path,
 ) -> BrainResult<(PathBuf, File)> {
     ensure_private_parent(root, destination)?;
-    let parent = destination
+    let relative = root_relative_path(root, destination)?;
+    let parent_relative = relative
         .parent()
-        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?;
-    let parent = existing_directory_under_root(root, parent)?;
+        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?
+        .to_path_buf();
     let file_name = destination
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| BrainError::Invalid("private_file_name_invalid".into()))?;
+    let root_fd = open_private_root_fd(root)?;
+    let parent_fd = if parent_relative.as_os_str().is_empty() {
+        open_private_root_fd(root)?
+    } else {
+        open_private_dir_fd(&root_fd, &parent_relative)?
+    };
     loop {
         let sequence = NEXT_IMMUTABLE_TEMPORARY.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
+        let temp_name = format!(
             ".{file_name}.{}.{}.immutable.tmp",
             std::process::id(),
             sequence
-        ));
+        );
+        let temporary = root.join(&parent_relative).join(&temp_name);
         root_relative_path(root, &temporary)?;
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-        {
-            Ok(file) => return Ok((temporary, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
+        match openat(
+            &parent_fd,
+            temp_name.as_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(raw_fd) => return Ok((temporary, File::from(raw_fd))),
+            Err(e) if e == rustix::io::Errno::EXIST => continue,
+            Err(e) => return Err(rustix_error(e)),
         }
     }
 }
 
 /// Produce a complete private staging file through a streaming callback.
 /// Failed producers never leave a partial staging object behind.
+/// The file is secured and hashed through its open descriptor; no pathname
+/// reopening occurs after the initial creation.
 pub fn stage_private_file<F>(
     root: &Path,
     destination: &Path,
@@ -73,26 +83,40 @@ pub fn stage_private_file<F>(
 where
     F: FnOnce(&mut File) -> BrainResult<()>,
 {
+    let (path, digest, _) = stage_private_file_with_identity(root, destination, produce)?;
+    Ok((path, digest))
+}
+
+pub(crate) fn stage_private_file_with_identity<F>(
+    root: &Path,
+    destination: &Path,
+    produce: F,
+) -> BrainResult<(PathBuf, Sha256Digest, PrivateStagingIdentity)>
+where
+    F: FnOnce(&mut File) -> BrainResult<()>,
+{
     let (temporary, mut file) = create_private_staging_file(root, destination)?;
-    let result = produce(&mut file)
-        .and_then(|()| secure_file(&temporary))
-        .and_then(|()| file.sync_all().map_err(BrainError::from));
+    let created_stat = fstat(&file).map_err(rustix_error)?;
+    let created_identity = PrivateStagingIdentity::from_stat(&created_stat);
+    let result = (|| -> BrainResult<Sha256Digest> {
+        produce(&mut file)?;
+        fd_secure_file(&file)?;
+        file.sync_all()?;
+        sha256_fd(&mut file)
+    })();
     drop(file);
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        if let Some(parent) = temporary.parent() {
-            let _ = sync_private_directory(root, parent);
-        }
-        return Err(error);
-    }
-    match sha256_file(&temporary) {
-        Ok(digest) => Ok((temporary, digest)),
+    match result {
+        Ok(digest) => Ok((temporary, digest, created_identity)),
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            if let Some(parent) = temporary.parent() {
-                let _ = sync_private_directory(root, parent);
+            match unlink_private_file_if_same_inode(
+                root,
+                &temporary,
+                &created_identity,
+                "private_file_staging_replaced_before_cleanup",
+            ) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error),
             }
-            Err(error)
         }
     }
 }
@@ -102,6 +126,21 @@ where
 /// This is deliberately generic only over file identity. It does not erase the
 /// semantic type of the payload: Delta/F64 artifacts, receipts and JSON records
 /// keep their own domain structures on top of this reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrivateStagingIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl PrivateStagingIdentity {
+    fn from_stat(stat: &Stat) -> Self {
+        Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PrivateFileReference {
     pub path: PathBuf,
@@ -198,7 +237,7 @@ impl PrivateFileReference {
 /// authenticated private files.  This is the only appropriate reader for a
 /// bounded, ephemeral CLI input that has not yet been admitted as an
 /// immutable artifact.
-pub fn read_untrusted_private_file_bounded(
+pub fn read_existing_private_file_bounded(
     root: &Path,
     raw: &Path,
     max_bytes: u64,
@@ -207,10 +246,49 @@ pub fn read_untrusted_private_file_bounded(
     read_opened_private_file_bounded(opened.file, &opened.stat, max_bytes)
 }
 
+/// Open one existing private regular file as a descriptor-bound read capability.
+/// Path confinement, root identity, symlink rejection, owner and permission
+/// checks are completed before the `File` is returned. Consumers that need to
+/// stream or seek large artifacts must retain this descriptor rather than
+/// validating a pathname and reopening it later.
+pub(crate) fn open_existing_private_file(root: &Path, raw: &Path) -> BrainResult<File> {
+    Ok(open_private_reference(root, raw)?.file)
+}
+
+pub fn read_untrusted_private_file_bounded(
+    root: &Path,
+    raw: &Path,
+    max_bytes: u64,
+) -> BrainResult<Vec<u8>> {
+    read_existing_private_file_bounded(root, raw, max_bytes)
+}
+
 struct OpenedPrivateFile {
     path: PathBuf,
     file: File,
     stat: Stat,
+}
+
+fn open_confined_regular_file(root: &Path, raw: &Path) -> BrainResult<OpenedPrivateFile> {
+    let relative = root_relative_path(root, raw)?;
+    let root_fd = open_private_root_fd(root)?;
+    let fd = openat2(
+        &root_fd,
+        &relative,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        PRIVATE_RESOLUTION,
+    )
+    .map_err(rustix_error)?;
+    let stat = fstat(&fd).map_err(rustix_error)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(BrainError::Integrity("private_file_not_regular".into()));
+    }
+    Ok(OpenedPrivateFile {
+        path: root.join(relative),
+        file: File::from(fd),
+        stat,
+    })
 }
 
 fn open_private_reference(root: &Path, raw: &Path) -> BrainResult<OpenedPrivateFile> {
@@ -420,6 +498,146 @@ fn rustix_error(error: rustix::io::Errno) -> BrainError {
     BrainError::Io(std::io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
+/// Open the private authority root as a verified directory descriptor.
+/// This root fd anchors all subsequent fd-relative write operations, eliminating
+/// any pathname reopening window between verification and mutation.
+fn open_private_root_fd(root: &Path) -> BrainResult<File> {
+    if root == Path::new("/")
+        || root
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(BrainError::Invalid("private_root_path_invalid".into()));
+    }
+    let filesystem_root = open(
+        Path::new("/"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(rustix_error)?;
+    let relative_root = root
+        .strip_prefix(Path::new("/"))
+        .map_err(|_| BrainError::Invalid("private_root_path_invalid".into()))?;
+    let root_fd = openat2(
+        &filesystem_root,
+        relative_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        PRIVATE_RESOLUTION,
+    )
+    .map_err(rustix_error)?;
+    let stat = fstat(&root_fd).map_err(rustix_error)?;
+    validate_private_root_stat(&stat)?;
+    Ok(File::from(root_fd))
+}
+
+/// Open a private directory relative to an already-verified root descriptor
+/// using the same BENEATH/NO_SYMLINKS/NO_MAGICLINKS resolution policy as reads.
+fn open_private_dir_fd(root_fd: &File, relative: &Path) -> BrainResult<File> {
+    let fd = openat2(
+        root_fd,
+        relative,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        PRIVATE_RESOLUTION,
+    )
+    .map_err(rustix_error)?;
+    let stat = fstat(&fd).map_err(rustix_error)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return Err(BrainError::Integrity("private_dir_fd_not_directory".into()));
+    }
+    Ok(File::from(fd))
+}
+
+/// Set file permissions to 0o600 through an open descriptor, eliminating the
+/// TOCTOU window between a pathname check and a pathname chmod.
+fn unlink_name_if_same_inode(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    expected: &PrivateStagingIdentity,
+    replacement_error: &str,
+) -> BrainResult<()> {
+    let current_fd = match openat2(
+        parent,
+        Path::new(name),
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        PRIVATE_RESOLUTION,
+    ) {
+        Ok(fd) => fd,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
+        Err(error) => return Err(rustix_error(error)),
+    };
+    let current = fstat(&current_fd).map_err(rustix_error)?;
+    if current.st_dev != expected.device || current.st_ino != expected.inode {
+        return Err(BrainError::Integrity(replacement_error.into()));
+    }
+    unlinkat(parent, name, AtFlags::empty()).map_err(rustix_error)?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+fn unlink_private_file_if_same_inode(
+    root: &Path,
+    path: &Path,
+    expected: &PrivateStagingIdentity,
+    replacement_error: &str,
+) -> BrainResult<()> {
+    let relative = root_relative_path(root, path)?;
+    let parent_relative = relative
+        .parent()
+        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?;
+    let name = relative
+        .file_name()
+        .ok_or_else(|| BrainError::Invalid("private_file_name_invalid".into()))?;
+    let root_fd = open_private_root_fd(root)?;
+    let parent_fd = if parent_relative.as_os_str().is_empty() {
+        root_fd
+    } else {
+        open_private_dir_fd(&root_fd, parent_relative)?
+    };
+    unlink_name_if_same_inode(&parent_fd, name, expected, replacement_error)
+}
+
+pub(crate) fn remove_private_staging_file(
+    root: &Path,
+    path: &Path,
+    identity: &PrivateStagingIdentity,
+) -> BrainResult<()> {
+    unlink_private_file_if_same_inode(
+        root,
+        path,
+        identity,
+        "private_file_staging_replaced_before_cleanup",
+    )
+}
+
+fn fd_secure_file(fd: &File) -> BrainResult<()> {
+    fchmod(fd, Mode::from_bits_truncate(0o600)).map_err(rustix_error)
+}
+
+/// Set directory permissions to 0o700 through an open descriptor.
+fn fd_secure_dir(fd: &File) -> BrainResult<()> {
+    fchmod(fd, Mode::from_bits_truncate(0o700)).map_err(rustix_error)
+}
+
+/// Compute SHA-256 of a file's full content from position 0 using only the
+/// already-open descriptor. No pathname resolution occurs after the caller
+/// has opened the fd.
+fn sha256_fd(file: &mut File) -> BrainResult<Sha256Digest> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; PRIVATE_READ_BUFFER_BYTES];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Sha256Digest::parse(format!("{:x}", hasher.finalize()))
+}
+
 /// Convert an absolute private path into a component-safe relative path.
 /// Parent components, root prefixes and other non-normal components are never
 /// accepted, so later joins cannot escape the already verified root.
@@ -442,192 +660,231 @@ pub fn root_relative_path(root: &Path, raw: &Path) -> BrainResult<PathBuf> {
     Ok(relative.to_path_buf())
 }
 
-/// Reject symlinks at every existing path component, not only at the leaf.
-/// This is the stronger path algorithm already used by representation evidence.
-fn assert_existing_components_not_symlinks(root: &Path, relative: &Path) -> BrainResult<()> {
-    let mut cursor = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            return Err(BrainError::Invalid("private_file_path_not_confined".into()));
-        };
-        cursor.push(name);
-        let metadata = fs::symlink_metadata(&cursor)?;
-        if metadata.file_type().is_symlink() {
-            return Err(BrainError::Integrity(
-                "private_file_symlink_forbidden".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Check every existing component of a prospective private path.  Unlike the
-/// strict resolver above, a missing suffix is allowed so callers can safely
-/// distinguish a vacant target from a hostile symlink or non-directory that
-/// already exists on its route.
-fn assert_existing_prefix_not_symlinks(root: &Path, relative: &Path) -> BrainResult<()> {
-    let mut cursor = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            return Err(BrainError::Invalid("private_file_path_not_confined".into()));
-        };
-        cursor.push(name);
-        match fs::symlink_metadata(&cursor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(BrainError::Integrity(
-                    "private_file_symlink_forbidden".into(),
-                ));
-            }
-            Ok(metadata) if !metadata.file_type().is_file() && !metadata.file_type().is_dir() => {
-                return Err(BrainError::Integrity(
-                    "private_file_path_component_invalid".into(),
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
-/// Resolve an existing regular file without permitting symlink traversal or
-/// lexical escape from the supplied, already trusted private root.
-pub fn verify_existing_file(
-    root: &Path,
-    raw: &Path,
-    expected_sha256: Option<&Sha256Digest>,
-) -> BrainResult<PathBuf> {
-    let path = existing_regular_file_under_root(root, raw)?;
-    if let Some(expected) = expected_sha256 {
-        if sha256_file(&path)? != *expected {
-            return Err(BrainError::Integrity(
-                "private_file_reference_digest_mismatch".into(),
-            ));
-        }
-    }
-    Ok(path)
-}
-
+/// Return the confined lexical name of an existing private regular file.
+/// The validation itself is descriptor-bound; the returned `PathBuf` is not a
+/// capability and callers that consume bytes must open/read through authority.
 pub fn existing_regular_file_under_root(root: &Path, raw: &Path) -> BrainResult<PathBuf> {
-    let relative = root_relative_path(root, raw)?;
-    assert_existing_components_not_symlinks(root, &relative)?;
-    let path = root.join(&relative);
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.file_type().is_file() {
-        return Err(BrainError::Integrity("private_file_not_regular".into()));
-    }
-    let canonical = path.canonicalize()?;
-    let canonical_root = root.canonicalize()?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(BrainError::Integrity(
-            "private_file_path_outside_root".into(),
-        ));
-    }
-    Ok(path)
+    Ok(open_confined_regular_file(root, raw)?.path)
 }
 
-/// Resolve a regular file when present without creating any filesystem state.
-/// A missing leaf is a normal `None`; every present component is still checked
-/// for symlink traversal before that result is returned.
+/// Descriptor-bound optional regular-file preflight. Missing path components
+/// are a normal `None`; symlinks, special files and invalid permissions fail.
 pub fn existing_regular_file_if_present(root: &Path, raw: &Path) -> BrainResult<Option<PathBuf>> {
-    let relative = root_relative_path(root, raw)?;
-    assert_existing_prefix_not_symlinks(root, &relative)?;
-    let path = root.join(&relative);
-    match fs::symlink_metadata(&path) {
-        Ok(_) => existing_regular_file_under_root(root, &path).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    match open_confined_regular_file(root, raw) {
+        Ok(opened) => Ok(Some(opened.path)),
+        Err(BrainError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
-/// Resolve an existing private directory without permitting a symlink at any
-/// component.  Authority code must use this rather than `is_dir()` followed by
-/// a later read/rename: the latter can silently traverse a replaced parent.
+/// Return the confined lexical name of an existing private directory. The
+/// directory is opened with `openat2` under the verified root before success.
 pub fn existing_directory_under_root(root: &Path, raw: &Path) -> BrainResult<PathBuf> {
     let relative = root_relative_path(root, raw)?;
-    assert_existing_components_not_symlinks(root, &relative)?;
-    let path = root.join(&relative);
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.file_type().is_dir() {
-        return Err(BrainError::Integrity(
-            "private_directory_not_directory".into(),
-        ));
-    }
-    let canonical = path.canonicalize()?;
-    let canonical_root = root.canonicalize()?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(BrainError::Integrity(
-            "private_directory_path_outside_root".into(),
-        ));
-    }
-    Ok(path)
+    let root_fd = open_private_root_fd(root)?;
+    let _directory_fd = open_private_dir_fd(&root_fd, &relative)?;
+    Ok(root.join(relative))
 }
 
-/// Resolve a private directory when present without creating it.  This is the
-/// directory counterpart to `existing_regular_file_if_present` and is used for
-/// topology preflights before a transaction mutates any sibling.
+/// Descriptor-bound optional directory preflight.
 pub fn existing_directory_if_present(root: &Path, raw: &Path) -> BrainResult<Option<PathBuf>> {
     let relative = root_relative_path(root, raw)?;
-    assert_existing_prefix_not_symlinks(root, &relative)?;
-    let path = root.join(&relative);
-    match fs::symlink_metadata(&path) {
-        Ok(_) => existing_directory_under_root(root, &path).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    let root_fd = open_private_root_fd(root)?;
+    match open_private_dir_fd(&root_fd, &relative) {
+        Ok(_) => Ok(Some(root.join(relative))),
+        Err(BrainError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
-fn collect_private_tree_entries(
-    root: &Path,
-    base: &Path,
-    directory: &Path,
-    entries: &mut Vec<PrivateTreeEntry>,
+fn ensure_same_private_tree_object(
+    before: &Stat,
+    after: &Stat,
+    expected_type: FileType,
+    label: &str,
 ) -> BrainResult<()> {
-    let directory = existing_directory_under_root(root, directory)?;
-    let mut children = fs::read_dir(&directory)?
-        .map(|entry| entry.map(|value| value.path()))
-        .collect::<Result<Vec<_>, _>>()?;
-    children.sort_by(|left, right| {
-        left.as_os_str()
-            .as_bytes()
-            .cmp(right.as_os_str().as_bytes())
-    });
-    for child in children {
-        let metadata = fs::symlink_metadata(&child)?;
-        if metadata.file_type().is_symlink() {
-            return Err(BrainError::Integrity(
-                "private_directory_tree_symlink_forbidden".into(),
-            ));
-        }
-        let relative_path = child
-            .strip_prefix(base)
-            .map_err(|_| BrainError::Integrity("private_directory_tree_path_escape".into()))?
-            .to_path_buf();
-        if metadata.file_type().is_dir() {
-            existing_directory_under_root(root, &child)?;
-            entries.push(PrivateTreeEntry {
-                relative_path,
-                kind: b'd',
-                file_size: 0,
-                file_sha256: None,
-            });
-            collect_private_tree_entries(root, base, &child, entries)?;
-        } else if metadata.file_type().is_file() {
-            let child = existing_regular_file_under_root(root, &child)?;
-            entries.push(PrivateTreeEntry {
-                relative_path,
-                kind: b'f',
-                file_size: metadata.len(),
-                file_sha256: Some(sha256_file(&child)?),
-            });
-        } else {
-            return Err(BrainError::Integrity(
-                "private_directory_tree_special_file_forbidden".into(),
-            ));
-        }
+    if FileType::from_raw_mode(before.st_mode) != expected_type
+        || FileType::from_raw_mode(after.st_mode) != expected_type
+        || before.st_dev != after.st_dev
+        || before.st_ino != after.st_ino
+    {
+        return Err(BrainError::Integrity(label.into()));
     }
     Ok(())
+}
+
+fn ensure_private_directory_stable(before: &Stat, after: &Stat) -> BrainResult<()> {
+    ensure_same_private_tree_object(
+        before,
+        after,
+        FileType::Directory,
+        "private_directory_tree_directory_replaced",
+    )?;
+    if before.st_mode != after.st_mode
+        || before.st_size != after.st_size
+        || before.st_mtime != after.st_mtime
+        || before.st_mtime_nsec != after.st_mtime_nsec
+        || before.st_ctime != after.st_ctime
+        || before.st_ctime_nsec != after.st_ctime_nsec
+    {
+        return Err(BrainError::Integrity(
+            "private_directory_tree_mutated_during_inspection".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn private_tree_child_names(directory: &File) -> BrainResult<Vec<OsString>> {
+    let mut stream = Dir::read_from(directory).map_err(rustix_error)?;
+    let mut names = Vec::new();
+    for entry in &mut stream {
+        let entry = entry.map_err(rustix_error)?;
+        let raw = entry.file_name().to_bytes();
+        if raw == b"." || raw == b".." {
+            continue;
+        }
+        names.push(OsString::from_vec(raw.to_vec()));
+    }
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    Ok(names)
+}
+
+/// Enumerate one existing private directory from a held descriptor and return
+/// only its confined lexical child names. A concurrent namespace mutation
+/// changes directory metadata and causes the enumeration to fail closed.
+pub(crate) fn list_existing_private_directory(
+    root: &Path,
+    directory: &Path,
+) -> BrainResult<Vec<PathBuf>> {
+    let relative = root_relative_path(root, directory)?;
+    let root_fd = open_private_root_fd(root)?;
+    let directory_fd = open_private_dir_fd(&root_fd, &relative)?;
+    let before = fstat(&directory_fd).map_err(rustix_error)?;
+    let names = private_tree_child_names(&directory_fd)?;
+    let after = fstat(&directory_fd).map_err(rustix_error)?;
+    ensure_private_directory_stable(&before, &after)?;
+    Ok(names
+        .into_iter()
+        .map(|name| root.join(&relative).join(name))
+        .collect())
+}
+
+fn collect_private_tree_entries_descriptor_bound(
+    root_stat: &Stat,
+    directory: File,
+    opened_directory_stat: Stat,
+    relative_directory: &Path,
+    entries: &mut Vec<PrivateTreeEntry>,
+    visited_directories: &mut BTreeSet<(u64, u64)>,
+    depth: usize,
+) -> BrainResult<()> {
+    if depth > PRIVATE_TREE_MAX_DEPTH {
+        return Err(BrainError::Invalid(
+            "private_directory_tree_depth_limit_exceeded".into(),
+        ));
+    }
+    ensure_same_private_tree_object(
+        &opened_directory_stat,
+        &opened_directory_stat,
+        FileType::Directory,
+        "private_directory_tree_directory_invalid",
+    )?;
+    if !visited_directories.insert((opened_directory_stat.st_dev, opened_directory_stat.st_ino)) {
+        return Err(BrainError::Integrity(
+            "private_directory_tree_cycle_or_alias".into(),
+        ));
+    }
+
+    let names = private_tree_child_names(&directory)?;
+    for name in names {
+        let child_relative = relative_directory.join(&name);
+        let inspected_fd = openat2(
+            &directory,
+            Path::new(&name),
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            PRIVATE_RESOLUTION,
+        )
+        .map_err(rustix_error)?;
+        let inspected_stat = fstat(&inspected_fd).map_err(rustix_error)?;
+        match FileType::from_raw_mode(inspected_stat.st_mode) {
+            FileType::Directory => {
+                let opened_fd = openat2(
+                    &directory,
+                    Path::new(&name),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    PRIVATE_RESOLUTION,
+                )
+                .map_err(rustix_error)?;
+                let opened_stat = fstat(&opened_fd).map_err(rustix_error)?;
+                ensure_same_private_tree_object(
+                    &inspected_stat,
+                    &opened_stat,
+                    FileType::Directory,
+                    "private_directory_tree_child_replaced",
+                )?;
+                entries.push(PrivateTreeEntry {
+                    relative_path: child_relative.clone(),
+                    kind: b'd',
+                    file_size: 0,
+                    file_sha256: None,
+                });
+                collect_private_tree_entries_descriptor_bound(
+                    root_stat,
+                    File::from(opened_fd),
+                    opened_stat,
+                    &child_relative,
+                    entries,
+                    visited_directories,
+                    depth + 1,
+                )?;
+            }
+            FileType::RegularFile => {
+                let data_fd = openat2(
+                    &directory,
+                    Path::new(&name),
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    PRIVATE_RESOLUTION,
+                )
+                .map_err(rustix_error)?;
+                let opened_stat = fstat(&data_fd).map_err(rustix_error)?;
+                ensure_same_private_tree_object(
+                    &inspected_stat,
+                    &opened_stat,
+                    FileType::RegularFile,
+                    "private_directory_tree_child_replaced",
+                )?;
+                validate_private_file_stat(root_stat, &opened_stat)?;
+                let file_size = u64::try_from(opened_stat.st_size).map_err(|_| {
+                    BrainError::Integrity("private_directory_tree_file_size_invalid".into())
+                })?;
+                let mut file = File::from(data_fd);
+                let digest = sha256_fd(&mut file)?;
+                let final_stat = fstat(&file).map_err(rustix_error)?;
+                ensure_private_file_stable(&opened_stat, &final_stat)?;
+                entries.push(PrivateTreeEntry {
+                    relative_path: child_relative,
+                    kind: b'f',
+                    file_size,
+                    file_sha256: Some(digest),
+                });
+            }
+            FileType::Symlink => {
+                return Err(BrainError::Integrity(
+                    "private_directory_tree_symlink_forbidden".into(),
+                ));
+            }
+            _ => {
+                return Err(BrainError::Integrity(
+                    "private_directory_tree_special_file_forbidden".into(),
+                ));
+            }
+        }
+    }
+    let final_directory_stat = fstat(&directory).map_err(rustix_error)?;
+    ensure_private_directory_stable(&opened_directory_stat, &final_directory_stat)
 }
 
 /// Authenticate the complete contents and topology of a private directory.
@@ -637,9 +894,22 @@ pub fn inspect_private_directory(
     root: &Path,
     directory: &Path,
 ) -> BrainResult<PrivateDirectoryIdentity> {
-    let directory = existing_directory_under_root(root, directory)?;
+    let relative = root_relative_path(root, directory)?;
+    let root_fd = open_private_root_fd(root)?;
+    let root_stat = fstat(&root_fd).map_err(rustix_error)?;
+    let directory_fd = open_private_dir_fd(&root_fd, &relative)?;
+    let directory_stat = fstat(&directory_fd).map_err(rustix_error)?;
     let mut entries = Vec::new();
-    collect_private_tree_entries(root, &directory, &directory, &mut entries)?;
+    let mut visited_directories = BTreeSet::new();
+    collect_private_tree_entries_descriptor_bound(
+        &root_stat,
+        directory_fd,
+        directory_stat,
+        Path::new(""),
+        &mut entries,
+        &mut visited_directories,
+        0,
+    )?;
     entries.sort_by(|left, right| {
         left.relative_path
             .as_os_str()
@@ -679,10 +949,11 @@ pub fn inspect_private_directory(
 /// Atomically move a complete private directory to a vacant destination.
 ///
 /// Linux `renameat2(RENAME_NOREPLACE)` closes the preflight/rename overwrite
-/// race. The complete tree identity is checked before and after the move, and
-/// the moved directory plus both parents are synced before success. A retry
-/// after a completed rename is accepted only when the source is absent and the
-/// destination still has the exact expected identity.
+/// race. Parent directories are opened via `openat2` with BENEATH resolution
+/// before the rename so the kernel holds the inodes independently of any
+/// subsequent pathname change.  The post-rename destination open uses
+/// `openat` relative to the held parent fd with `O_NOFOLLOW`, so no new
+/// pathname traversal occurs after the rename.
 pub fn move_private_directory_transactional(
     root: &Path,
     source: &Path,
@@ -728,8 +999,21 @@ pub fn move_private_directory_transactional(
     let destination_name = destination.file_name().ok_or_else(|| {
         BrainError::Invalid("private_directory_move_destination_name_missing".into())
     })?;
-    let source_parent_file = File::open(&source_parent)?;
-    let destination_parent_file = File::open(&destination_parent)?;
+    // Open parent directories as descriptors before the rename so they anchor
+    // the operation independently of any subsequent pathname change.
+    let root_fd = open_private_root_fd(root)?;
+    let source_parent_relative = root_relative_path(root, &source_parent)?;
+    let destination_parent_relative = root_relative_path(root, &destination_parent)?;
+    let source_parent_file = if source_parent_relative.as_os_str().is_empty() {
+        open_private_root_fd(root)?
+    } else {
+        open_private_dir_fd(&root_fd, &source_parent_relative)?
+    };
+    let destination_parent_file = if destination_parent_relative.as_os_str().is_empty() {
+        open_private_root_fd(root)?
+    } else {
+        open_private_dir_fd(&root_fd, &destination_parent_relative)?
+    };
     renameat_with(
         &source_parent_file,
         source_name,
@@ -738,8 +1022,19 @@ pub fn move_private_directory_transactional(
         RenameFlags::NOREPLACE,
     )
     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-    secure_dir(destination)?;
-    File::open(destination)?.sync_all()?;
+    // Open the moved directory relative to the held destination parent fd
+    // with O_NOFOLLOW, eliminating the post-rename pathname-open window.
+    let dest_moved_fd = File::from(
+        openat(
+            &destination_parent_file,
+            destination_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(rustix_error)?,
+    );
+    fd_secure_dir(&dest_moved_fd)?;
+    dest_moved_fd.sync_all()?;
     destination_parent_file.sync_all()?;
     if source_parent != destination_parent {
         source_parent_file.sync_all()?;
@@ -754,58 +1049,66 @@ pub fn move_private_directory_transactional(
 }
 
 /// Securely create only missing directory components below the private root.
-/// Existing symlinks or non-directory components fail closed.
+/// Uses `mkdirat` relative to a running parent descriptor and `fchmod` through
+/// that same descriptor, closing the create→chmod TOCTOU window per component.
 pub fn ensure_private_parent(root: &Path, destination: &Path) -> BrainResult<()> {
     let relative = root_relative_path(root, destination)?;
     let parent = relative
         .parent()
         .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?;
-    let mut cursor = root.to_path_buf();
+    let mut current_fd = open_private_root_fd(root)?;
     for component in parent.components() {
         let Component::Normal(name) = component else {
             return Err(BrainError::Invalid("private_file_path_not_confined".into()));
         };
-        cursor.push(name);
-        match fs::symlink_metadata(&cursor) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(BrainError::Integrity(
-                        "private_file_symlink_forbidden".into(),
-                    ));
-                }
-                if !metadata.file_type().is_dir() {
-                    return Err(BrainError::Integrity(
-                        "private_file_parent_not_directory".into(),
-                    ));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&cursor) {
+        let child_fd = match openat(
+            &current_fd,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(raw_fd) => File::from(raw_fd),
+            Err(e) if e == rustix::io::Errno::NOENT => {
+                match mkdirat(&current_fd, name, Mode::from_bits_truncate(0o700)) {
                     Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let metadata = fs::symlink_metadata(&cursor)?;
-                        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                            return Err(BrainError::Integrity(
-                                "private_file_parent_not_directory".into(),
-                            ));
-                        }
-                    }
-                    Err(error) => return Err(error.into()),
+                    Err(e) if e == rustix::io::Errno::EXIST => {}
+                    Err(e) => return Err(rustix_error(e)),
                 }
+                let raw_fd = openat(
+                    &current_fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(rustix_error)?;
+                File::from(raw_fd)
             }
-            Err(error) => return Err(error.into()),
+            Err(e) if e == rustix::io::Errno::NOTDIR || e == rustix::io::Errno::LOOP => {
+                return Err(BrainError::Integrity(
+                    "private_file_parent_not_directory".into(),
+                ));
+            }
+            Err(e) => return Err(rustix_error(e)),
+        };
+        let stat = fstat(&child_fd).map_err(rustix_error)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(BrainError::Integrity(
+                "private_file_parent_not_directory".into(),
+            ));
         }
-        secure_dir(&cursor)?;
+        fd_secure_dir(&child_fd)?;
+        current_fd = child_fd;
     }
     Ok(())
 }
 
 /// Create a private directory tree only through non-symlink components, then
-/// return the exact directory.  This is for transaction roots and immutable
-/// stores; callers must not use unrestricted `create_dir_all` below authority
-/// state because a pre-existing parent can redirect writes.
+/// return the exact directory path.  Uses `mkdirat` relative to a running
+/// parent descriptor and `fchmod` through that descriptor, closing the
+/// create→chmod TOCTOU window per component.
 pub fn ensure_private_directory(root: &Path, directory: &Path) -> BrainResult<PathBuf> {
     let relative = root_relative_path(root, directory)?;
+    let mut current_fd = open_private_root_fd(root)?;
     let mut cursor = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(name) = component else {
@@ -814,33 +1117,45 @@ pub fn ensure_private_directory(root: &Path, directory: &Path) -> BrainResult<Pa
             ));
         };
         cursor.push(name);
-        match fs::symlink_metadata(&cursor) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                    return Err(BrainError::Integrity(
-                        "private_directory_target_invalid".into(),
-                    ));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&cursor) {
+        let child_fd = match openat(
+            &current_fd,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(raw_fd) => File::from(raw_fd),
+            Err(e) if e == rustix::io::Errno::NOENT => {
+                match mkdirat(&current_fd, name, Mode::from_bits_truncate(0o700)) {
                     Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let metadata = fs::symlink_metadata(&cursor)?;
-                        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                            return Err(BrainError::Integrity(
-                                "private_directory_target_invalid".into(),
-                            ));
-                        }
-                    }
-                    Err(error) => return Err(error.into()),
+                    Err(e) if e == rustix::io::Errno::EXIST => {}
+                    Err(e) => return Err(rustix_error(e)),
                 }
+                let raw_fd = openat(
+                    &current_fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(rustix_error)?;
+                File::from(raw_fd)
             }
-            Err(error) => return Err(error.into()),
+            Err(e) if e == rustix::io::Errno::NOTDIR || e == rustix::io::Errno::LOOP => {
+                return Err(BrainError::Integrity(
+                    "private_directory_target_invalid".into(),
+                ));
+            }
+            Err(e) => return Err(rustix_error(e)),
+        };
+        let stat = fstat(&child_fd).map_err(rustix_error)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(BrainError::Integrity(
+                "private_directory_target_invalid".into(),
+            ));
         }
-        secure_dir(&cursor)?;
+        fd_secure_dir(&child_fd)?;
+        current_fd = child_fd;
     }
-    existing_directory_under_root(root, directory)
+    Ok(cursor)
 }
 
 /// Install immutable bytes or verify the exact existing content. No overwrite
@@ -908,24 +1223,46 @@ pub fn install_private_immutable_file(
         ));
     }
     ensure_private_parent(root, destination)?;
-    let temporary = existing_regular_file_under_root(root, temporary)?;
-    let temporary_parent = temporary
-        .parent()
-        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?
-        .to_path_buf();
-    let destination_parent = destination
-        .parent()
-        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?
-        .to_path_buf();
+    let root_fd = open_private_root_fd(root)?;
 
+    // Staging file: descriptor-bound open + verify
+    let staging_relative = root_relative_path(root, temporary)?;
+    let staging_parent_relative = staging_relative
+        .parent()
+        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?
+        .to_path_buf();
+    let staging_name = temporary
+        .file_name()
+        .ok_or_else(|| BrainError::Invalid("private_file_name_invalid".into()))?;
+    let staging_parent_fd = if staging_parent_relative.as_os_str().is_empty() {
+        open_private_root_fd(root)?
+    } else {
+        open_private_dir_fd(&root_fd, &staging_parent_relative)?
+    };
+    let opened_staging = open_private_reference(root, temporary)?;
+    let staging_identity = PrivateStagingIdentity::from_stat(&opened_staging.stat);
+    let mut staging_fd = opened_staging.file;
+
+    // Destination parent fd
+    let dest_relative = root_relative_path(root, destination)?;
+    let dest_parent_relative = dest_relative
+        .parent()
+        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?
+        .to_path_buf();
+    let dest_name = destination
+        .file_name()
+        .ok_or_else(|| BrainError::Invalid("private_file_name_invalid".into()))?;
+    let dest_parent_fd = if dest_parent_relative.as_os_str().is_empty() {
+        open_private_root_fd(root)?
+    } else {
+        open_private_dir_fd(&root_fd, &dest_parent_relative)?
+    };
+
+    // Secure, sync and verify staging content entirely through the open descriptor.
     let prepared = (|| -> BrainResult<()> {
-        secure_file(&temporary)?;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&temporary)?
-            .sync_all()?;
-        if sha256_file(&temporary)? != *expected {
+        fd_secure_file(&staging_fd)?;
+        staging_fd.sync_all()?;
+        if sha256_fd(&mut staging_fd)? != *expected {
             return Err(BrainError::Integrity(
                 "private_file_staged_content_mismatch".into(),
             ));
@@ -933,50 +1270,90 @@ pub fn install_private_immutable_file(
         Ok(())
     })();
     if let Err(error) = prepared {
-        let _ = fs::remove_file(&temporary);
-        let _ = sync_private_directory(root, &temporary_parent);
-        return Err(error);
+        return match unlink_name_if_same_inode(
+            &staging_parent_fd,
+            staging_name,
+            &staging_identity,
+            "private_file_staging_replaced_before_cleanup",
+        ) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(cleanup_error),
+        };
     }
 
-    let installed = match fs::hard_link(&temporary, destination) {
+    // Create hard link via /proc/self/fd/<n> so the verified staging inode —
+    // not the staging pathname — becomes the link target, eliminating the
+    // staging-path TOCTOU window entirely.
+    let proc_path = format!("/proc/self/fd/{}", staging_fd.as_raw_fd());
+    let installed = match linkat(
+        &staging_parent_fd,
+        proc_path.as_str(),
+        &dest_parent_fd,
+        dest_name,
+        AtFlags::SYMLINK_FOLLOW,
+    ) {
         Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A hostile symlink or non-file collision is never a benign race.
-            if let Err(validation_error) = existing_regular_file_under_root(root, destination) {
-                let _ = fs::remove_file(&temporary);
-                let _ = sync_private_directory(root, &temporary_parent);
-                return Err(validation_error);
+        Err(e) if e == rustix::io::Errno::EXIST => {
+            if let Err(validation_error) = open_existing_private_file(root, destination) {
+                return match unlink_name_if_same_inode(
+                    &staging_parent_fd,
+                    staging_name,
+                    &staging_identity,
+                    "private_file_staging_replaced_before_cleanup",
+                ) {
+                    Ok(()) => Err(validation_error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                };
             }
             false
         }
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            let _ = sync_private_directory(root, &temporary_parent);
-            return Err(error.into());
+        Err(e) => {
+            let operation_error = rustix_error(e);
+            return match unlink_name_if_same_inode(
+                &staging_parent_fd,
+                staging_name,
+                &staging_identity,
+                "private_file_staging_replaced_before_cleanup",
+            ) {
+                Ok(()) => Err(operation_error),
+                Err(cleanup_error) => Err(cleanup_error),
+            };
         }
     };
 
+    // Post-link: open destination relative to the held parent fd with O_NOFOLLOW.
     let finalize = (|| -> BrainResult<()> {
         if installed {
-            secure_file(destination)?;
-            let mut options = OpenOptions::new();
-            options.read(true).write(true);
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            options.custom_flags(0o400000); // O_NOFOLLOW
-            options.open(destination)?.sync_all()?;
+            let dest_fd = File::from(
+                openat(
+                    &dest_parent_fd,
+                    dest_name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(rustix_error)?,
+            );
+            fd_secure_file(&dest_fd)?;
+            dest_fd.sync_all()?;
+            dest_parent_fd.sync_all()?;
         }
         Ok(())
     })();
     let cleanup = (|| -> BrainResult<()> {
-        fs::remove_file(&temporary)?;
-        sync_private_directory(root, &temporary_parent)?;
-        if destination_parent != temporary_parent {
-            sync_private_directory(root, &destination_parent)?;
+        unlink_name_if_same_inode(
+            &staging_parent_fd,
+            staging_name,
+            &staging_identity,
+            "private_file_staging_replaced_before_cleanup",
+        )?;
+        if dest_parent_relative != staging_parent_relative && installed {
+            dest_parent_fd.sync_all()?;
         }
         Ok(())
     })();
     finalize?;
     cleanup?;
+
     if installed {
         verify_immutable_content(root, destination, expected)?;
     }
@@ -985,6 +1362,12 @@ pub fn install_private_immutable_file(
 
 /// Move a private regular file to a vacant private destination without an
 /// overwrite window, with crash-recoverable link-then-unlink semantics.
+///
+/// Source is opened via descriptor-bound resolution and content-verified by fd.
+/// The hard link is created via `/proc/self/fd/<n>` so the verified source inode
+/// becomes the link target.  Post-link operations use `openat` relative to the
+/// held destination parent fd with `O_NOFOLLOW`; source removal uses `unlinkat`
+/// relative to the held source parent fd.
 ///
 /// If a crash leaves both names visible, a retry completes the transaction
 /// only when both names identify the same inode. A distinct pre-existing
@@ -1000,52 +1383,110 @@ pub fn move_private_file_transactional(
             "private_file_move_source_equals_destination".into(),
         ));
     }
-    let Some(source) = existing_regular_file_if_present(root, source)? else {
+    let Some(source_path) = existing_regular_file_if_present(root, source)? else {
         // Completed crash/retry state: the source name was already durably
         // removed. Exact destination identity is the only accepted witness.
         verify_immutable_content(root, destination, expected)?;
         return Ok(());
     };
-    if sha256_file(&source)? != *expected {
+    // Open and verify source content through descriptor-bound resolution.
+    let opened_source = open_private_reference(root, &source_path)?;
+    let mut source_fd = opened_source.file;
+    if sha256_fd(&mut source_fd)? != *expected {
         return Err(BrainError::Integrity(
             "private_file_move_source_digest_mismatch".into(),
         ));
     }
+    let source_stat = fstat(&source_fd).map_err(rustix_error)?;
     ensure_private_parent(root, destination)?;
-    let source_parent = source
+    let root_fd = open_private_root_fd(root)?;
+    let source_relative = root_relative_path(root, &source_path)?;
+    let source_parent_relative = source_relative
         .parent()
         .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?
         .to_path_buf();
-    let destination_parent = destination
+    let source_name = source_path
+        .file_name()
+        .ok_or_else(|| BrainError::Invalid("private_file_name_invalid".into()))?;
+    let source_parent_fd = if source_parent_relative.as_os_str().is_empty() {
+        open_private_root_fd(root)?
+    } else {
+        open_private_dir_fd(&root_fd, &source_parent_relative)?
+    };
+    let dest_relative = root_relative_path(root, destination)?;
+    let dest_parent_relative = dest_relative
         .parent()
         .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?
         .to_path_buf();
-
-    let source_metadata = fs::metadata(&source)?;
-    match fs::hard_link(&source, destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let destination = existing_regular_file_under_root(root, destination)?;
-            let destination_metadata = fs::metadata(destination)?;
-            if source_metadata.dev() != destination_metadata.dev()
-                || source_metadata.ino() != destination_metadata.ino()
-            {
+    let dest_name = destination
+        .file_name()
+        .ok_or_else(|| BrainError::Invalid("private_file_name_invalid".into()))?;
+    let dest_parent_fd = if dest_parent_relative.as_os_str().is_empty() {
+        open_private_root_fd(root)?
+    } else {
+        open_private_dir_fd(&root_fd, &dest_parent_relative)?
+    };
+    // Link via /proc/self/fd/<n> to bind the verified source inode to dest.
+    let proc_path = format!("/proc/self/fd/{}", source_fd.as_raw_fd());
+    let dest_fd = match linkat(
+        &source_parent_fd,
+        proc_path.as_str(),
+        &dest_parent_fd,
+        dest_name,
+        AtFlags::SYMLINK_FOLLOW,
+    ) {
+        Ok(()) => File::from(
+            openat(
+                &dest_parent_fd,
+                dest_name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(rustix_error)?,
+        ),
+        Err(e) if e == rustix::io::Errno::EXIST => {
+            let dest_fd = File::from(
+                openat(
+                    &dest_parent_fd,
+                    dest_name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(rustix_error)?,
+            );
+            let dest_stat = fstat(&dest_fd).map_err(rustix_error)?;
+            if source_stat.st_dev != dest_stat.st_dev || source_stat.st_ino != dest_stat.st_ino {
                 return Err(BrainError::Integrity(
                     "private_file_move_destination_already_exists".into(),
                 ));
             }
+            dest_fd
         }
-        Err(error) => return Err(error.into()),
+        Err(e) => return Err(rustix_error(e)),
+    };
+    fd_secure_file(&dest_fd)?;
+    dest_fd.sync_all()?;
+    dest_parent_fd.sync_all()?;
+    // Revalidate source inode before unlinking: if source_name was replaced
+    // between linkat and here, we must not remove the intruder's file.
+    let current_source = File::from(
+        openat(
+            &source_parent_fd,
+            source_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(rustix_error)?,
+    );
+    let current_stat = fstat(&current_source).map_err(rustix_error)?;
+    drop(current_source);
+    if current_stat.st_dev != source_stat.st_dev || current_stat.st_ino != source_stat.st_ino {
+        return Err(BrainError::Integrity(
+            "private_file_move_source_replaced_before_unlink".into(),
+        ));
     }
-    secure_file(destination)?;
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    options.custom_flags(0o400000); // O_NOFOLLOW
-    options.open(destination)?.sync_all()?;
-    sync_private_directory(root, &destination_parent)?;
-    fs::remove_file(&source)?;
-    sync_private_directory(root, &source_parent)?;
+    unlinkat(&source_parent_fd, source_name, AtFlags::empty()).map_err(rustix_error)?;
+    source_parent_fd.sync_all()?;
     verify_immutable_content(root, destination, expected)
 }
 
@@ -1055,15 +1496,18 @@ fn stage_private_bytes(
     bytes: &[u8],
     expected: &Sha256Digest,
 ) -> BrainResult<PathBuf> {
-    let (temporary, actual) = stage_private_file(root, path, |file| {
-        file.write_all(bytes)?;
-        Ok(())
-    })?;
+    let (temporary, actual, created_identity) =
+        stage_private_file_with_identity(root, path, |file| {
+            file.write_all(bytes)?;
+            Ok(())
+        })?;
     if actual != *expected {
-        let _ = fs::remove_file(&temporary);
-        if let Some(parent) = temporary.parent() {
-            let _ = sync_private_directory(root, parent);
-        }
+        unlink_private_file_if_same_inode(
+            root,
+            &temporary,
+            &created_identity,
+            "private_file_staging_replaced_before_cleanup",
+        )?;
         return Err(BrainError::Integrity(
             "private_file_staged_content_mismatch".into(),
         ));
@@ -1072,74 +1516,176 @@ fn stage_private_bytes(
 }
 
 fn verify_immutable_content(root: &Path, path: &Path, expected: &Sha256Digest) -> BrainResult<()> {
-    let verified = existing_regular_file_under_root(root, path)?;
-    if sha256_file(&verified)? != *expected {
+    let relative = root_relative_path(root, path)?;
+    let root_fd = open_private_root_fd(root)?;
+    let root_stat = fstat(&root_fd).map_err(rustix_error)?;
+    let mut file_fd = File::from(
+        openat2(
+            &root_fd,
+            &relative,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            PRIVATE_RESOLUTION,
+        )
+        .map_err(rustix_error)?,
+    );
+    let file_stat = fstat(&file_fd).map_err(rustix_error)?;
+    validate_private_file_stat(&root_stat, &file_stat)?;
+    if sha256_fd(&mut file_fd)? != *expected {
         return Err(BrainError::Integrity(
             "private_file_immutable_content_mismatch".into(),
         ));
     }
-    secure_file(&verified)
-}
-
-fn sync_private_directory(root: &Path, directory: &Path) -> BrainResult<()> {
-    let directory = existing_directory_under_root(root, directory)?;
-    fs::File::open(directory)?.sync_all()?;
-    Ok(())
+    fd_secure_file(&file_fd)
 }
 
 /// Atomically replace a mutable private file after validating its entire path.
 /// Immutable receipts and artifacts must use an immutable writer instead.  The
 /// caller remains responsible for deciding which pointer paths are mutable.
+///
+/// The entire write chain is descriptor-bound:
+/// - Temp file is created with `openat(parent_fd, …, CREAT|EXCL)`, relative to
+///   the verified parent directory descriptor.
+/// - Rename uses `renameat(parent_fd, temp, parent_fd, dest)` — no pathname.
+/// - Destination is re-opened with `openat(parent_fd, dest, O_NOFOLLOW)` so
+///   an adversary cannot redirect the post-rename open to a symlink.
+/// - All chmod, hash and sync operations use the destination fd directly.
 pub fn replace_private_file_atomic(
     root: &Path,
     path: &Path,
     bytes: &[u8],
     expected_sha256: Option<&Sha256Digest>,
 ) -> BrainResult<Sha256Digest> {
+    replace_private_file_atomic_inner(root, path, bytes, expected_sha256, || Ok(()))
+}
+
+fn replace_private_file_atomic_inner<F>(
+    root: &Path,
+    path: &Path,
+    bytes: &[u8],
+    expected_sha256: Option<&Sha256Digest>,
+    after_rename: F,
+) -> BrainResult<Sha256Digest>
+where
+    F: FnOnce() -> BrainResult<()>,
+{
     let digest = Sha256Digest::digest_bytes(bytes);
     if expected_sha256.is_some_and(|expected| expected != &digest) {
         return Err(BrainError::Integrity(
             "private_file_atomic_expected_digest_mismatch".into(),
         ));
     }
+    // Preflight path validation via pathname (read-only, not security-critical
+    // for TOCTOU since all subsequent writes are anchored to the parent fd).
     let _ = existing_regular_file_if_present(root, path)?;
     ensure_private_parent(root, path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?;
-    let parent = existing_directory_under_root(root, parent)?;
     let file_name = path
         .file_name()
-        .and_then(|value| value.to_str())
+        .and_then(|v| v.to_str())
         .ok_or_else(|| BrainError::Invalid("private_file_name_invalid".into()))?;
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    root_relative_path(root, &temporary)?;
-    match fs::symlink_metadata(&temporary) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Ok(_) => {
-            return Err(BrainError::Integrity(
-                "private_file_atomic_temporary_exists".into(),
-            ));
-        }
-        Err(error) => return Err(error.into()),
+    let relative = root_relative_path(root, path)?;
+    let parent_relative = relative
+        .parent()
+        .ok_or_else(|| BrainError::Invalid("private_file_parent_missing".into()))?
+        .to_path_buf();
+    // Open root and parent via descriptor-bound resolution.  All subsequent
+    // operations use fds anchored to these inodes; no pathname is reopened.
+    let root_fd = open_private_root_fd(root)?;
+    let parent_fd = if parent_relative.as_os_str().is_empty() {
+        open_private_root_fd(root)?
+    } else {
+        open_private_dir_fd(&root_fd, &parent_relative)?
+    };
+    // Create temp relative to the verified parent descriptor (CREAT|EXCL).
+    let sequence = NEXT_IMMUTABLE_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+    let temp_name = format!(
+        ".{file_name}.{}.{}.atomic.tmp",
+        std::process::id(),
+        sequence
+    );
+    let mut temp_file = File::from(
+        openat(
+            &parent_fd,
+            temp_name.as_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|e| {
+            if e == rustix::io::Errno::EXIST {
+                BrainError::Integrity("private_file_atomic_temporary_exists".into())
+            } else {
+                rustix_error(e)
+            }
+        })?,
+    );
+    // Write, secure and sync through the open descriptor.
+    let write_result = (|| -> BrainResult<()> {
+        temp_file.write_all(bytes)?;
+        fd_secure_file(&temp_file)?;
+        temp_file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = unlinkat(&parent_fd, temp_name.as_str(), AtFlags::empty());
+        let _ = parent_fd.sync_all();
+        return Err(e);
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temporary, path)?;
-    secure_file(path)?;
-    let installed = existing_regular_file_under_root(root, path)?;
-    if sha256_file(&installed)? != digest {
+    let temp_stat = fstat(&temp_file).map_err(rustix_error)?;
+    // Atomic rename via fd-relative renameat — replaces any existing dest.
+    // For mutable pointer files this is intentional; immutable objects use
+    // NOREPLACE via install_private_immutable_file instead.
+    if let Err(e) = renameat(&parent_fd, temp_name.as_str(), &parent_fd, file_name) {
+        let _ = unlinkat(&parent_fd, temp_name.as_str(), AtFlags::empty());
+        let _ = parent_fd.sync_all();
+        return Err(BrainError::Io(std::io::Error::from_raw_os_error(
+            e.raw_os_error(),
+        )));
+    }
+    after_rename()?;
+    // Re-open destination relative to the same parent descriptor with O_NOFOLLOW.
+    // The parent_fd holds the inode that just accepted the rename, so no
+    // adversarial substitution can redirect this open to a different file.
+    let mut dest_fd = File::from(
+        openat(
+            &parent_fd,
+            file_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(rustix_error)?,
+    );
+    // Verify permissions, ownership and content through the descriptor.
+    let root_stat = fstat(&root_fd).map_err(rustix_error)?;
+    let dest_stat = fstat(&dest_fd).map_err(rustix_error)?;
+    validate_private_file_stat(&root_stat, &dest_stat)?;
+    if dest_stat.st_dev != temp_stat.st_dev || dest_stat.st_ino != temp_stat.st_ino {
+        return Err(BrainError::Integrity(
+            "private_file_atomic_postrename_identity_mismatch".into(),
+        ));
+    }
+    fd_secure_file(&dest_fd)?;
+    if sha256_fd(&mut dest_fd)? != digest {
         return Err(BrainError::Integrity(
             "private_file_atomic_postwrite_mismatch".into(),
         ));
     }
-    fs::File::open(parent)?.sync_all()?;
+    dest_fd.sync_all()?;
+    let rebound_fd = File::from(
+        openat(
+            &parent_fd,
+            file_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(rustix_error)?,
+    );
+    let rebound_stat = fstat(&rebound_fd).map_err(rustix_error)?;
+    if rebound_stat.st_dev != temp_stat.st_dev || rebound_stat.st_ino != temp_stat.st_ino {
+        return Err(BrainError::Integrity(
+            "private_file_atomic_destination_replaced_after_verification".into(),
+        ));
+    }
+    parent_fd.sync_all()?;
     Ok(digest)
 }
 
@@ -1176,6 +1722,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::secure_dir;
+    use std::fs;
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Barrier};
@@ -1582,6 +2130,29 @@ mod tests {
         fs::remove_file(root.join("state")).unwrap();
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn atomic_pointer_replacement_rejects_postrename_inode_substitution() {
+        let root = root("atomic-pointer-postrename-race");
+        let path = root.join("state/current.json");
+        let hostile = root.join("state/hostile.json");
+        ensure_private_parent(&root, &path).unwrap();
+        fs::write(&hostile, b"trusted").unwrap();
+        let expected = Sha256Digest::digest_bytes(b"trusted");
+
+        let result =
+            replace_private_file_atomic_inner(&root, &path, b"trusted", Some(&expected), || {
+                fs::rename(&hostile, &path)?;
+                Ok(())
+            });
+        assert!(matches!(
+            result,
+            Err(BrainError::Integrity(message))
+                if message == "private_file_atomic_postrename_identity_mismatch"
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"trusted");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

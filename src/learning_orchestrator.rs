@@ -4,9 +4,9 @@ use crate::active::{
 };
 pub use crate::authority::PrivateFileReference as EvidenceReference;
 use crate::authority::{
-    create_private_immutable, ensure_private_directory, existing_directory_if_present,
-    existing_regular_file_if_present, existing_regular_file_under_root,
-    replace_private_file_atomic,
+    create_private_immutable, existing_directory_if_present, existing_regular_file_if_present,
+    existing_regular_file_under_root, read_existing_private_file_bounded,
+    replace_private_file_atomic, with_private_authority_lock,
 };
 use crate::contracts::{ApertureCandidate, DeltaObservation};
 use crate::digest::{
@@ -17,15 +17,16 @@ use crate::error::{BrainError, BrainResult};
 use crate::identity::{ApertureId, CapabilityId, LearningTargetId, ObservationId, SessionId};
 use crate::ledger;
 use crate::linalg::{dot, norm, Matrix};
-use crate::security::{secure_file, verify_private_root};
+use crate::security::verify_private_root;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+#[cfg(test)]
+use std::fs;
 use std::path::{Path, PathBuf};
+
+const MAX_LEARNING_AUTHORITY_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LearningTarget {
@@ -771,13 +772,6 @@ pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Delegate all directory creation to the shared authority primitive.  The
-/// path is always interpreted under an already-verified CEREBRO root, so an
-/// existing symlink or non-directory parent fails before any chmod/open.
-pub(crate) fn ensure_private_dir(root: &Path, path: &Path) -> BrainResult<PathBuf> {
-    ensure_private_directory(root, path)
-}
-
 /// Return an existing regular private file, rejecting a symlink at the leaf
 /// or any parent.  A missing leaf is distinct from an invalid existing entry
 /// so immutable writers can safely reserve a new content-addressed path.
@@ -883,50 +877,11 @@ fn validate_learning_state_topology(root: &Path, session_id: &str) -> BrainResul
     Ok(())
 }
 
-struct SessionLock {
-    root: PathBuf,
-    path: PathBuf,
-}
-
-impl Drop for SessionLock {
-    fn drop(&mut self) {
-        if existing_regular_file_under_root(&self.root, &self.path).is_ok() {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn acquire_session_lock(root: &Path, session_id: &str) -> BrainResult<SessionLock> {
-    validate_learning_state_topology(root, session_id)?;
-    let path = lock_path(root, session_id);
-    let parent = path
-        .parent()
-        .ok_or_else(|| BrainError::Invalid("learning_lock_parent_missing".into()))?;
-    if private_regular_file_if_present(root, &path)?.is_some() {
-        return Err(BrainError::Integrity(
-            "adaptive_learning_session_locked_or_unavailable".into(),
-        ));
-    }
-    ensure_private_dir(root, parent)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|error| {
-            BrainError::Integrity(format!(
-                "adaptive_learning_session_locked_or_unavailable:{error}"
-            ))
-        })?;
-    file.write_all(session_id.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    secure_file(&path)?;
-    existing_regular_file_under_root(root, &path)?;
-    Ok(SessionLock {
-        root: root.to_path_buf(),
-        path,
-    })
+fn with_session_lock<T, F>(root: &Path, session_id: &str, operation: F) -> BrainResult<T>
+where
+    F: FnOnce() -> BrainResult<T>,
+{
+    with_private_authority_lock(root, &lock_path(root, session_id), operation)
 }
 
 pub(crate) fn confined_existing_file(
@@ -964,12 +919,10 @@ fn validate_experiment_evidence(
             "adaptive_learning_experiment_evidence_contract_invalid".into(),
         ));
     }
-    let observation_path = confined_existing_file(
-        root,
-        &evidence.observation.path,
-        Some(&evidence.observation.sha256),
-    )?;
-    let observation: DeltaObservation = serde_json::from_slice(&fs::read(observation_path)?)?;
+    let observation_raw = evidence
+        .observation
+        .read_verified_bounded(root, MAX_LEARNING_AUTHORITY_JSON_BYTES)?;
+    let observation: DeltaObservation = serde_json::from_slice(&observation_raw)?;
     if observation.observation_id != evidence.observation_id
         || observation.independence_group != aperture_id.as_str()
         || observation.delta.is_empty()
@@ -1070,11 +1023,18 @@ fn validate_cycle(root: &Path, cycle: &AdaptiveLearningCycle) -> BrainResult<()>
                 "adaptive_learning_completed_evidence_identity_invalid".into(),
             ));
         }
-        let path = experiment_evidence_path(root, digest.as_str());
-        let path = confined_existing_file(root, &path, Some(digest.as_str())).map_err(|_| {
-            BrainError::Integrity("adaptive_learning_completed_evidence_artifact_invalid".into())
-        })?;
-        let persisted: LearningExperimentEvidence = serde_json::from_slice(&fs::read(&path)?)?;
+        let reference = EvidenceReference::new(
+            experiment_evidence_path(root, digest.as_str()),
+            digest.as_digest().clone(),
+        );
+        let raw = reference
+            .read_verified_bounded(root, MAX_LEARNING_AUTHORITY_JSON_BYTES)
+            .map_err(|_| {
+                BrainError::Integrity(
+                    "adaptive_learning_completed_evidence_artifact_invalid".into(),
+                )
+            })?;
+        let persisted: LearningExperimentEvidence = serde_json::from_slice(&raw)?;
         if !same_experiment_evidence(&persisted, evidence) {
             return Err(BrainError::Integrity(
                 "adaptive_learning_completed_evidence_content_mismatch".into(),
@@ -1136,10 +1096,14 @@ fn load_receipt_by_sha(
     root: &Path,
     digest: &AdaptiveLearningReceiptDigest,
 ) -> BrainResult<AdaptiveLearningReceipt> {
-    let path = receipt_path(root, digest.as_str());
-    let path = confined_existing_file(root, &path, Some(digest.as_str()))
+    let reference = EvidenceReference::new(
+        receipt_path(root, digest.as_str()),
+        digest.as_digest().clone(),
+    );
+    let raw = reference
+        .read_verified_bounded(root, MAX_LEARNING_AUTHORITY_JSON_BYTES)
         .map_err(|_| BrainError::Integrity("adaptive_learning_receipt_artifact_invalid".into()))?;
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    Ok(serde_json::from_slice(&raw)?)
 }
 
 fn verify_receipt_ledger_binding(
@@ -1336,11 +1300,15 @@ fn load_current_receipt_under_root(
         ));
     }
     validate_learning_state_topology(root, session_id)?;
-    let path =
-        confined_existing_file(root, pointer_path(root, session_id), None).map_err(|_| {
-            BrainError::Integrity("adaptive_learning_current_pointer_missing_or_invalid".into())
-        })?;
-    let pointer: AdaptiveLearningPointer = serde_json::from_slice(&fs::read(path)?)?;
+    let pointer_raw = read_existing_private_file_bounded(
+        root,
+        &pointer_path(root, session_id),
+        MAX_LEARNING_AUTHORITY_JSON_BYTES,
+    )
+    .map_err(|_| {
+        BrainError::Integrity("adaptive_learning_current_pointer_missing_or_invalid".into())
+    })?;
+    let pointer: AdaptiveLearningPointer = serde_json::from_slice(&pointer_raw)?;
     if pointer.schema != "cerebro.tidex.adaptive_learning_pointer/v1"
         || pointer.session_id.as_str() != session_id
     {
@@ -1438,54 +1406,55 @@ fn start_persistent_adaptive_learning_under_root(
     validate_target(target)?;
     validate_policy(policy)?;
     validate_learning_state_topology(root, session_id)?;
-    let _lock = acquire_session_lock(root, session_id)?;
-    if private_regular_file_if_present(root, &pointer_path(root, session_id))?.is_some()
-        || private_regular_file_if_present(root, &marker_path(root, session_id))?.is_some()
-    {
-        return Err(BrainError::Integrity(
-            "adaptive_learning_session_id_already_reserved".into(),
-        ));
-    }
-    let target_digest = target_digest(target)?;
-    let policy_digest = policy_digest(policy)?;
-    let session_id = SessionId::parse(session_id)?;
-    let marker = json!({
-        "schema":"cerebro.tidex.adaptive_learning_session_marker/v1",
-        "session_id":&session_id,
-        "target_digest":&target_digest,
-        "policy_digest":&policy_digest,
-    });
-    write_new_private(
-        root,
-        &marker_path(root, session_id.as_str()),
-        &serde_json::to_vec_pretty(&marker)?,
-    )?;
-    let session = start_adaptive_learning(target, policy)?;
-    let cycle = AdaptiveLearningCycle {
-        schema: "cerebro.tidex.adaptive_learning_cycle/v1".into(),
-        session_id: session_id.clone(),
-        target: target.clone(),
-        target_digest: target_digest.clone(),
-        policy_digest: policy_digest.clone(),
-        session,
-        pending_step: None,
-        completed_evidence: Vec::new(),
-        completed_evidence_sha256: Vec::new(),
-    };
-    persist_receipt_under_root(
-        root,
-        AdaptiveLearningReceipt {
-            schema: "cerebro.tidex.adaptive_learning_receipt/v1".into(),
-            event_kind: AdaptiveLearningEventKind::SessionStarted,
-            generation: 0,
-            session_id,
-            target_digest,
-            policy_digest,
-            prior_receipt_sha256: None,
-            evidence_sha256: None,
-            cycle,
-        },
-    )
+    with_session_lock(root, session_id, || {
+        if private_regular_file_if_present(root, &pointer_path(root, session_id))?.is_some()
+            || private_regular_file_if_present(root, &marker_path(root, session_id))?.is_some()
+        {
+            return Err(BrainError::Integrity(
+                "adaptive_learning_session_id_already_reserved".into(),
+            ));
+        }
+        let target_digest = target_digest(target)?;
+        let policy_digest = policy_digest(policy)?;
+        let session_id = SessionId::parse(session_id)?;
+        let marker = json!({
+            "schema":"cerebro.tidex.adaptive_learning_session_marker/v1",
+            "session_id":&session_id,
+            "target_digest":&target_digest,
+            "policy_digest":&policy_digest,
+        });
+        write_new_private(
+            root,
+            &marker_path(root, session_id.as_str()),
+            &serde_json::to_vec_pretty(&marker)?,
+        )?;
+        let session = start_adaptive_learning(target, policy)?;
+        let cycle = AdaptiveLearningCycle {
+            schema: "cerebro.tidex.adaptive_learning_cycle/v1".into(),
+            session_id: session_id.clone(),
+            target: target.clone(),
+            target_digest: target_digest.clone(),
+            policy_digest: policy_digest.clone(),
+            session,
+            pending_step: None,
+            completed_evidence: Vec::new(),
+            completed_evidence_sha256: Vec::new(),
+        };
+        persist_receipt_under_root(
+            root,
+            AdaptiveLearningReceipt {
+                schema: "cerebro.tidex.adaptive_learning_receipt/v1".into(),
+                event_kind: AdaptiveLearningEventKind::SessionStarted,
+                generation: 0,
+                session_id,
+                target_digest,
+                policy_digest,
+                prior_receipt_sha256: None,
+                evidence_sha256: None,
+                cycle,
+            },
+        )
+    })
 }
 
 /// Start the only persistent, receipt-backed adaptive-learning lifecycle.
@@ -1504,33 +1473,34 @@ fn issue_next_persistent_learning_aperture_under_root(
     session_id: &str,
 ) -> BrainResult<LoadedAdaptiveLearningReceipt> {
     validate_learning_state_topology(root, session_id)?;
-    let _lock = acquire_session_lock(root, session_id)?;
-    let current = load_current_receipt_under_root(root, session_id)?;
-    if current.receipt.cycle.pending_step.is_some() {
-        return Err(BrainError::Integrity(
-            "adaptive_learning_pending_aperture_must_be_assimilated".into(),
-        ));
-    }
-    let step = next_learning_aperture(
-        &current.receipt.cycle.target,
-        &current.receipt.cycle.session,
-    )?;
-    let mut cycle = current.receipt.cycle.clone();
-    cycle.pending_step = Some(step);
-    persist_receipt_under_root(
-        root,
-        AdaptiveLearningReceipt {
-            schema: "cerebro.tidex.adaptive_learning_receipt/v1".into(),
-            event_kind: AdaptiveLearningEventKind::ApertureIssued,
-            generation: current.receipt.generation.saturating_add(1),
-            session_id: current.receipt.session_id.clone(),
-            target_digest: current.receipt.target_digest.clone(),
-            policy_digest: current.receipt.policy_digest.clone(),
-            prior_receipt_sha256: Some(current.receipt_sha256),
-            evidence_sha256: None,
-            cycle,
-        },
-    )
+    with_session_lock(root, session_id, || {
+        let current = load_current_receipt_under_root(root, session_id)?;
+        if current.receipt.cycle.pending_step.is_some() {
+            return Err(BrainError::Integrity(
+                "adaptive_learning_pending_aperture_must_be_assimilated".into(),
+            ));
+        }
+        let step = next_learning_aperture(
+            &current.receipt.cycle.target,
+            &current.receipt.cycle.session,
+        )?;
+        let mut cycle = current.receipt.cycle.clone();
+        cycle.pending_step = Some(step);
+        persist_receipt_under_root(
+            root,
+            AdaptiveLearningReceipt {
+                schema: "cerebro.tidex.adaptive_learning_receipt/v1".into(),
+                event_kind: AdaptiveLearningEventKind::ApertureIssued,
+                generation: current.receipt.generation.saturating_add(1),
+                session_id: current.receipt.session_id.clone(),
+                target_digest: current.receipt.target_digest.clone(),
+                policy_digest: current.receipt.policy_digest.clone(),
+                prior_receipt_sha256: Some(current.receipt_sha256),
+                evidence_sha256: None,
+                cycle,
+            },
+        )
+    })
 }
 
 /// Atomically issue exactly one canonical next aperture. A second issue is
@@ -1547,8 +1517,7 @@ fn read_experiment_evidence_from_path(
     root: &Path,
     path: &Path,
 ) -> BrainResult<(LearningExperimentEvidence, Vec<u8>, LearningEvidenceDigest)> {
-    let canonical = confined_existing_file(root, path, None)?;
-    let raw = fs::read(canonical)?;
+    let raw = read_existing_private_file_bounded(root, path, MAX_LEARNING_AUTHORITY_JSON_BYTES)?;
     let digest = LearningEvidenceDigest::from(Sha256Digest::digest_bytes(&raw));
     let evidence: LearningExperimentEvidence = serde_json::from_slice(&raw)?;
     Ok((evidence, raw, digest))
@@ -1581,64 +1550,65 @@ fn assimilate_persistent_learning_evidence_under_root(
 ) -> BrainResult<LoadedAdaptiveLearningReceipt> {
     validate_learning_state_topology(root, session_id)?;
     // Authenticate the caller-provided experiment envelope before obtaining a
-    // lock, so a hostile evidence path cannot leave a new lock or directory.
-    let _ = confined_existing_file(root, evidence_path, None)?;
-    let _lock = acquire_session_lock(root, session_id)?;
-    let current = load_current_receipt_under_root(root, session_id)?;
-    let pending = current
-        .receipt
-        .cycle
-        .pending_step
-        .as_ref()
-        .ok_or_else(|| BrainError::Integrity("adaptive_learning_no_pending_aperture".into()))?;
-    let (evidence, raw, evidence_digest) = read_experiment_evidence_from_path(root, evidence_path)?;
-    validate_experiment_evidence(
-        root,
-        &evidence,
-        &current.receipt.session_id,
-        &current.receipt.target_digest,
-        &pending.aperture_id,
-        &pending.capability_weights,
-    )?;
-    if current
-        .receipt
-        .cycle
-        .completed_evidence_sha256
-        .iter()
-        .any(|digest| digest == &evidence_digest)
-    {
-        return Err(BrainError::Integrity(
-            "adaptive_learning_evidence_already_assimilated".into(),
-        ));
-    }
-    persist_experiment_evidence(root, &evidence_digest, &raw)?;
-    let updated_session = assimilate_learning_result(
-        &current.receipt.cycle.target,
-        &current.receipt.cycle.session,
-        pending,
-        evidence.observed_value,
-    )?;
-    let mut cycle = current.receipt.cycle.clone();
-    cycle.session = updated_session;
-    cycle.pending_step = None;
-    cycle.completed_evidence.push(evidence);
-    cycle
-        .completed_evidence_sha256
-        .push(evidence_digest.clone());
-    persist_receipt_under_root(
-        root,
-        AdaptiveLearningReceipt {
-            schema: "cerebro.tidex.adaptive_learning_receipt/v1".into(),
-            event_kind: AdaptiveLearningEventKind::ResultAssimilated,
-            generation: current.receipt.generation.saturating_add(1),
-            session_id: current.receipt.session_id.clone(),
-            target_digest: current.receipt.target_digest.clone(),
-            policy_digest: current.receipt.policy_digest.clone(),
-            prior_receipt_sha256: Some(current.receipt_sha256),
-            evidence_sha256: Some(evidence_digest),
-            cycle,
-        },
-    )
+    // lock, so a hostile evidence path cannot create any learning state.
+    let _ =
+        read_existing_private_file_bounded(root, evidence_path, MAX_LEARNING_AUTHORITY_JSON_BYTES)?;
+    with_session_lock(root, session_id, || {
+        let current = load_current_receipt_under_root(root, session_id)?;
+        let pending =
+            current.receipt.cycle.pending_step.as_ref().ok_or_else(|| {
+                BrainError::Integrity("adaptive_learning_no_pending_aperture".into())
+            })?;
+        let (evidence, raw, evidence_digest) =
+            read_experiment_evidence_from_path(root, evidence_path)?;
+        validate_experiment_evidence(
+            root,
+            &evidence,
+            &current.receipt.session_id,
+            &current.receipt.target_digest,
+            &pending.aperture_id,
+            &pending.capability_weights,
+        )?;
+        if current
+            .receipt
+            .cycle
+            .completed_evidence_sha256
+            .iter()
+            .any(|digest| digest == &evidence_digest)
+        {
+            return Err(BrainError::Integrity(
+                "adaptive_learning_evidence_already_assimilated".into(),
+            ));
+        }
+        persist_experiment_evidence(root, &evidence_digest, &raw)?;
+        let updated_session = assimilate_learning_result(
+            &current.receipt.cycle.target,
+            &current.receipt.cycle.session,
+            pending,
+            evidence.observed_value,
+        )?;
+        let mut cycle = current.receipt.cycle.clone();
+        cycle.session = updated_session;
+        cycle.pending_step = None;
+        cycle.completed_evidence.push(evidence);
+        cycle
+            .completed_evidence_sha256
+            .push(evidence_digest.clone());
+        persist_receipt_under_root(
+            root,
+            AdaptiveLearningReceipt {
+                schema: "cerebro.tidex.adaptive_learning_receipt/v1".into(),
+                event_kind: AdaptiveLearningEventKind::ResultAssimilated,
+                generation: current.receipt.generation.saturating_add(1),
+                session_id: current.receipt.session_id.clone(),
+                target_digest: current.receipt.target_digest.clone(),
+                policy_digest: current.receipt.policy_digest.clone(),
+                prior_receipt_sha256: Some(current.receipt_sha256),
+                evidence_sha256: Some(evidence_digest),
+                cycle,
+            },
+        )
+    })
 }
 
 /// Assimilate a real, content-addressed experiment evidence envelope. Missing,
@@ -1990,7 +1960,7 @@ mod tests {
         fs::create_dir_all(root.join("state/learning_sessions")).unwrap();
         symlink(&outside, root.join("state/learning_sessions/locks")).unwrap();
 
-        assert!(acquire_session_lock(&root, "session-symlink-locks").is_err());
+        assert!(with_session_lock(&root, "session-symlink-locks", || Ok(())).is_err());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
 
         fs::remove_dir_all(&root).unwrap();

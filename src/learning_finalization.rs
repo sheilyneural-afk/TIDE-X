@@ -7,7 +7,7 @@
 //! re-verifiable engine input. Python can therefore never provide a free-form
 //! observation list to promotion.
 
-use crate::authority::PrivateFileReference;
+use crate::authority::{read_existing_private_file_bounded, PrivateFileReference};
 use crate::contracts::DeltaObservation;
 use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
@@ -21,10 +21,12 @@ use crate::representation_evidence::{
 use crate::security::verify_private_root;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const LEARNING_FINALIZATION_INPUT_SCHEMA: &str = "cerebro.tidex.learning_finalization_input/v1";
+const MAX_LEARNING_FINALIZATION_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Immutable mapping from an adaptive source observation to its sole staged
 /// sealed-representation destination. The engine finalizes only the latter.
@@ -88,19 +90,19 @@ fn read_confined_observation(
     root: &Path,
     reference: &PrivateFileReference,
 ) -> BrainResult<(PathBuf, Vec<u8>, DeltaObservation)> {
-    let (path, raw) = reference.read_verified_with_path(root)?;
+    let raw = reference.read_verified_bounded(root, MAX_LEARNING_FINALIZATION_JSON_BYTES)?;
     let observation: DeltaObservation = serde_json::from_slice(&raw)?;
-    Ok((path, raw, observation))
+    Ok((reference.path.clone(), raw, observation))
 }
 
 fn checked_representation_receipt_reference(
     root: &Path,
     raw: &Path,
 ) -> BrainResult<PrivateFileReference> {
-    let path = crate::authority::existing_regular_file_under_root(root, raw)?;
-    let bytes = fs::read(&path)?;
+    let bytes =
+        read_existing_private_file_bounded(root, raw, MAX_LEARNING_FINALIZATION_JSON_BYTES)?;
     Ok(PrivateFileReference::new(
-        path,
+        raw.to_path_buf(),
         Sha256Digest::digest_bytes(&bytes),
     ))
 }

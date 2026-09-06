@@ -18,8 +18,9 @@ use crate::acquisition_contract::{
     SourceCaptureSession, SystemEnvelope,
 };
 use crate::authority::{
-    ensure_private_directory, install_private_immutable_file, stage_private_file,
-    write_or_verify_immutable, PrivateFileReference,
+    ensure_private_directory, install_private_immutable_file, remove_private_staging_file,
+    stage_private_file, stage_private_file_with_identity, write_or_verify_immutable,
+    PrivateFileReference, PrivateStagingIdentity,
 };
 use crate::digest::{CaptureReceiptDigest, Sha256Digest, SystemEnvelopeDigest};
 use crate::error::{BrainError, BrainResult};
@@ -251,8 +252,7 @@ impl RetainedSourceAdapter {
             BrainError::Invalid("retained_source_projection_parent_missing".into())
         })?;
         ensure_private_directory(&self.private_root, parent)?;
-        fs::create_dir(&root)?;
-        crate::security::secure_dir(&root)?;
+        ensure_private_directory(&self.private_root, &root)?;
 
         let objects = self
             .receipt
@@ -387,25 +387,28 @@ where
         session.verify_private_root_binding(private_root)?;
         let destination = vault_object_path_for_pending(private_root, entry.sha256());
         let mut captured_entry_sha256 = None;
-        let (staging, content_sha256) = stage_private_file(private_root, &destination, |file| {
-            let digest = copy_manifest_file_descriptor_bound(
-                &session,
-                entry.relative_path(),
-                entry.byte_len(),
-                file,
-            )?;
-            captured_entry_sha256 = Some(digest);
-            Ok(())
-        })?;
+        let (staging, content_sha256, staging_identity) =
+            stage_private_file_with_identity(private_root, &destination, |file| {
+                let digest = copy_manifest_file_descriptor_bound(
+                    &session,
+                    entry.relative_path(),
+                    entry.byte_len(),
+                    file,
+                )?;
+                captured_entry_sha256 = Some(digest);
+                Ok(())
+            })?;
         if captured_entry_sha256.as_ref() != Some(entry.sha256()) {
-            let _ = std::fs::remove_file(&staging);
+            remove_private_staging_file(private_root, &staging, &staging_identity)?;
             return Err(BrainError::Integrity(
                 "content_vault_source_entry_digest_mismatch".into(),
             ));
         }
         total = next_total;
         staged.push(StagedRetainedSourceObject {
+            private_root: private_root.to_path_buf(),
             staging,
+            staging_identity,
             retained: RetainedSourceObject {
                 source_relative_path: entry.relative_path().to_path_buf(),
                 source_entry_sha256: entry.sha256().clone(),
@@ -468,16 +471,19 @@ where
 }
 
 struct StagedRetainedSourceObject {
+    private_root: PathBuf,
     staging: PathBuf,
+    staging_identity: PrivateStagingIdentity,
     retained: RetainedSourceObject,
 }
 
 impl Drop for StagedRetainedSourceObject {
     fn drop(&mut self) {
-        // Installation removes this name on every terminal outcome.  If an
-        // earlier phase aborts, this best-effort cleanup prevents completed
-        // staging files from accumulating as pseudo-artifacts.
-        let _ = fs::remove_file(&self.staging);
+        // Installation removes this name on every terminal outcome. If an
+        // earlier phase aborts, only remove the exact inode that was staged;
+        // a replaced name is left untouched and the operation remains closed.
+        let _ =
+            remove_private_staging_file(&self.private_root, &self.staging, &self.staging_identity);
     }
 }
 

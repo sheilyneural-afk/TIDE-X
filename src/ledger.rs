@@ -1,19 +1,17 @@
 use crate::authority::{
-    ensure_private_parent, existing_regular_file_under_root, root_relative_path,
+    read_existing_private_file_bounded, replace_private_file_atomic, with_private_authority_lock,
 };
 use crate::error::{BrainError, BrainResult};
-use crate::security::secure_file;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 const EVENT_SCHEMA_V2: &str = "cerebro.tidex.ledger_event/v2";
 const DOMAIN_V1: &[u8] = b"CEREBRO:TIDEX:LEDGER:v1\0";
 const DOMAIN_V2: &[u8] = b"CEREBRO:TIDEX:LEDGER:v2\0";
+const MAX_LEDGER_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LedgerEvent {
@@ -93,106 +91,18 @@ fn hash_event_v2(seq: u64, prev: &str, kind: &str, payload_json: &str) -> String
 fn ledger_path(root: &Path) -> PathBuf {
     root.join("state").join("ledger.jsonl")
 }
+
 fn lock_path(root: &Path) -> PathBuf {
     root.join("state").join(".ledger.lock")
 }
 
-/// The ledger is an authority boundary, so even a read must never follow an
-/// untrusted root or `state/` symlink.  The caller's private root is expected
-/// to already be authenticated by its subsystem; this verifies the local path
-/// shape needed before the shared authority helpers walk children beneath it.
-fn validate_ledger_root(root: &Path) -> BrainResult<()> {
-    let metadata = fs::symlink_metadata(root)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        return Err(BrainError::Integrity("ledger_private_root_invalid".into()));
-    }
-    Ok(())
-}
-
-/// Validate the ledger's existing parent without creating it. Read-only ledger
-/// operations must remain read-only when no ledger has been initialized, but
-/// must fail if an existing parent is a link or a non-directory.
-fn validate_existing_ledger_parent(root: &Path, path: &Path) -> BrainResult<()> {
-    validate_ledger_root(root)?;
-    let relative = root_relative_path(root, path)?;
-    let parent = relative
-        .parent()
-        .ok_or_else(|| BrainError::Integrity("ledger_parent_missing".into()))?;
-    let parent_path = root.join(parent);
-    match fs::symlink_metadata(&parent_path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                return Err(BrainError::Integrity("ledger_parent_invalid".into()));
-            }
-            let canonical_root = root.canonicalize()?;
-            let canonical_parent = parent_path.canonicalize()?;
-            if !canonical_parent.starts_with(&canonical_root) {
-                return Err(BrainError::Integrity(
-                    "ledger_parent_outside_private_root".into(),
-                ));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(())
-}
-
-/// Return the ledger only if it is an existing, regular private file.  This
-/// rejects both a symlinked ledger leaf and a symlinked intermediate `state/`
-/// directory before any ledger bytes are opened.
-fn existing_ledger_file(root: &Path) -> BrainResult<Option<PathBuf>> {
+fn read_ledger_bytes(root: &Path) -> BrainResult<Option<Vec<u8>>> {
     let path = ledger_path(root);
-    validate_existing_ledger_parent(root, &path)?;
-    match fs::symlink_metadata(&path) {
-        Ok(_) => Ok(Some(existing_regular_file_under_root(root, &path)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    match read_existing_private_file_bounded(root, &path, MAX_LEDGER_BYTES) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(BrainError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-}
-
-struct Lock {
-    root: PathBuf,
-    path: PathBuf,
-}
-impl Drop for Lock {
-    fn drop(&mut self) {
-        // Never follow a replacement symlink while releasing a lock. If the
-        // lock path was tampered with, leave it in place and make the next
-        // operation fail closed rather than deleting an arbitrary file.
-        if existing_regular_file_under_root(&self.root, &self.path).is_ok() {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-fn acquire(root: &Path) -> BrainResult<Lock> {
-    let path = lock_path(root);
-    validate_ledger_root(root)?;
-    ensure_private_parent(root, &path)?;
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(BrainError::Integrity("ledger_lock_path_invalid".into()));
-        }
-        Ok(_) => {
-            return Err(BrainError::Integrity(
-                "ledger_locked_or_unavailable:lock_exists".into(),
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let _ = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|error| BrainError::Integrity(format!("ledger_locked_or_unavailable:{error}")))?;
-    let verified = existing_regular_file_under_root(root, &path)?;
-    secure_file(&verified)?;
-    Ok(Lock {
-        root: root.to_path_buf(),
-        path,
-    })
 }
 
 fn verify_v2_event(event: &LedgerEvent, seq: u64, prev: &str) -> BrainResult<()> {
@@ -201,8 +111,6 @@ fn verify_v2_event(event: &LedgerEvent, seq: u64, prev: &str) -> BrainResult<()>
             "ledger_chain_sequence_or_parent_mismatch".into(),
         ));
     }
-    // Payload must remain valid JSON, but chain integrity is over the exact
-    // stored string bytes, not a floating-point round trip.
     let _: Value = serde_json::from_str(&event.payload_json)?;
     let expected = hash_event_v2(
         event.seq,
@@ -231,22 +139,17 @@ fn verify_v1_event(event: &LegacyLedgerEventV1, seq: u64, prev: &str) -> BrainRe
     Ok(())
 }
 
-pub fn verify(root: &Path) -> BrainResult<LedgerStatus> {
-    let Some(path) = existing_ledger_file(root)? else {
-        return Ok(LedgerStatus {
-            events: 0,
-            head: "0".repeat(64),
-        });
-    };
-    let file = OpenOptions::new().read(true).open(&path)?;
+fn verify_ledger_bytes(bytes: &[u8]) -> BrainResult<LedgerStatus> {
     let mut prev = "0".repeat(64);
     let mut seq = 0u64;
-    for line in BufReader::new(file).lines() {
+    for line in BufReader::new(bytes).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        seq += 1;
+        seq = seq
+            .checked_add(1)
+            .ok_or_else(|| BrainError::Integrity("ledger_sequence_overflow".into()))?;
         let raw: Value = serde_json::from_str(&line)?;
         let is_v2 = raw
             .get("schema")
@@ -268,58 +171,116 @@ pub fn verify(root: &Path) -> BrainResult<LedgerStatus> {
     })
 }
 
-/// Append is intentionally crate-private.  A valid hash chain is not, by
-/// itself, authority to manufacture a TIDE-X event: public runtime entry
-/// points must first validate the specific receipt-backed transaction they
-/// are recording.
+pub fn verify(root: &Path) -> BrainResult<LedgerStatus> {
+    match read_ledger_bytes(root)? {
+        Some(bytes) => verify_ledger_bytes(&bytes),
+        None => Ok(LedgerStatus {
+            events: 0,
+            head: "0".repeat(64),
+        }),
+    }
+}
+
+/// Return one verified V2 ledger snapshot for diagnostics without reopening the
+/// ledger after chain verification. Legacy V1 records are deliberately rejected
+/// here because `LedgerEvent` represents only the current wire schema.
+pub fn verified_v2_snapshot(root: &Path) -> BrainResult<(LedgerStatus, Vec<LedgerEvent>)> {
+    let Some(bytes) = read_ledger_bytes(root)? else {
+        return Ok((
+            LedgerStatus {
+                events: 0,
+                head: "0".repeat(64),
+            },
+            Vec::new(),
+        ));
+    };
+    let status = verify_ledger_bytes(&bytes)?;
+    let mut events = Vec::new();
+    for line in BufReader::new(bytes.as_slice()).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let raw: Value = serde_json::from_str(&line)?;
+        if raw.get("schema").and_then(Value::as_str) != Some(EVENT_SCHEMA_V2) {
+            return Err(BrainError::Integrity(
+                "ledger_diagnostic_snapshot_contains_legacy_event".into(),
+            ));
+        }
+        events.push(serde_json::from_value(raw)?);
+    }
+    if events.len() as u64 != status.events {
+        return Err(BrainError::Integrity(
+            "ledger_diagnostic_snapshot_count_mismatch".into(),
+        ));
+    }
+    Ok((status, events))
+}
+
+/// Append is intentionally crate-private. A ledger update is performed as one
+/// descriptor-bound, process-locked atomic replacement rather than an in-place
+/// append. This makes verification and publication operate on one authenticated
+/// snapshot and prevents partial-line crash states or verify→reopen races.
 pub(crate) fn append(root: &Path, kind: &str, payload: Value) -> BrainResult<LedgerEvent> {
     if kind.trim().is_empty() {
         return Err(BrainError::Invalid("ledger_kind_empty".into()));
     }
-    let _guard = acquire(root)?;
-    let status = verify(root)?;
-    let seq = status.events + 1;
-    let payload_json = canonical_payload_json(&payload)?;
-    // Prove before committing that the exact string can be parsed, while never
-    // using the parsed value to derive the event hash.
-    let _: Value = serde_json::from_str(&payload_json)?;
-    let event_hash = hash_event_v2(seq, &status.head, kind, &payload_json);
-    let event = LedgerEvent {
-        schema: EVENT_SCHEMA_V2.into(),
-        seq,
-        prev_hash: status.head,
-        kind: kind.to_string(),
-        payload_json,
-        event_hash,
-    };
-    let path = ledger_path(root);
-    let mut file = match fs::symlink_metadata(&path) {
-        Ok(_) => {
-            let verified = existing_regular_file_under_root(root, &path)?;
-            OpenOptions::new().append(true).mode(0o600).open(verified)?
+    let lock = lock_path(root);
+    with_private_authority_lock(root, &lock, || {
+        let mut current = read_ledger_bytes(root)?.unwrap_or_default();
+        let status = verify_ledger_bytes(&current)?;
+        let seq = status
+            .events
+            .checked_add(1)
+            .ok_or_else(|| BrainError::Integrity("ledger_sequence_overflow".into()))?;
+        let payload_json = canonical_payload_json(&payload)?;
+        let _: Value = serde_json::from_str(&payload_json)?;
+        let event_hash = hash_event_v2(seq, &status.head, kind, &payload_json);
+        let event = LedgerEvent {
+            schema: EVENT_SCHEMA_V2.into(),
+            seq,
+            prev_hash: status.head,
+            kind: kind.to_string(),
+            payload_json,
+            event_hash,
+        };
+        let mut line = serde_json::to_vec(&event)?;
+        line.push(b'\n');
+        let next_len = current
+            .len()
+            .checked_add(line.len())
+            .ok_or_else(|| BrainError::Invalid("ledger_size_overflow".into()))?;
+        if u64::try_from(next_len)
+            .map_err(|_| BrainError::Invalid("ledger_size_overflow".into()))?
+            > MAX_LEDGER_BYTES
+        {
+            return Err(BrainError::Invalid("ledger_size_limit_exceeded".into()));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?,
-        Err(error) => return Err(error.into()),
-    };
-    serde_json::to_writer(&mut file, &event)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    let verified = existing_regular_file_under_root(root, &path)?;
-    secure_file(&verified)?;
-    Ok(event)
+        current.extend_from_slice(&line);
+        replace_private_file_atomic(root, &ledger_path(root), &current, None)?;
+        let persisted = read_ledger_bytes(root)?
+            .ok_or_else(|| BrainError::Integrity("ledger_missing_after_atomic_replace".into()))?;
+        if persisted != current {
+            return Err(BrainError::Integrity(
+                "ledger_atomic_replace_content_mismatch".into(),
+            ));
+        }
+        let persisted_status = verify_ledger_bytes(&persisted)?;
+        if persisted_status.events != seq || persisted_status.head != event.event_hash {
+            return Err(BrainError::Integrity(
+                "ledger_atomic_replace_chain_mismatch".into(),
+            ));
+        }
+        Ok(event)
+    })
 }
 
 pub fn contains_event_hash(root: &Path, target_hash: &str) -> BrainResult<bool> {
-    let _ = verify(root)?;
-    let Some(path) = existing_ledger_file(root)? else {
+    let Some(bytes) = read_ledger_bytes(root)? else {
         return Ok(false);
     };
-    let file = OpenOptions::new().read(true).open(path)?;
-    for line in BufReader::new(file).lines() {
+    let _ = verify_ledger_bytes(&bytes)?;
+    for line in BufReader::new(bytes.as_slice()).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -338,13 +299,12 @@ pub fn find_v2_event_by_payload_string(
     key: &str,
     expected: &str,
 ) -> BrainResult<Option<LedgerEvent>> {
-    let _ = verify(root)?;
-    let Some(path) = existing_ledger_file(root)? else {
+    let Some(bytes) = read_ledger_bytes(root)? else {
         return Ok(None);
     };
-    let file = OpenOptions::new().read(true).open(path)?;
+    let _ = verify_ledger_bytes(&bytes)?;
     let mut matched = None;
-    for line in BufReader::new(file).lines() {
+    for line in BufReader::new(bytes.as_slice()).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -373,6 +333,7 @@ pub fn find_v2_event_by_payload_string(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
     use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
 

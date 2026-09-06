@@ -1,21 +1,11 @@
-use cerebro_tidex::ledger::{self, LedgerEvent};
+use cerebro_tidex::ledger;
 use cerebro_tidex::security::configured_private_root;
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::io::{BufRead, BufReader};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = configured_private_root()?;
-    let status = ledger::verify(&root)?;
-    let path = root.join("state/ledger.jsonl");
-    let file = fs::File::open(&path)?;
-    let mut parsed = 0u64;
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let raw = line?;
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let event: LedgerEvent = serde_json::from_str(&raw)?;
+    let (status, events) = ledger::verified_v2_snapshot(&root)?;
+    for (line_index, event) in events.iter().enumerate() {
         let payload = event.payload()?;
         let payload_sha256 = format!("{:x}", Sha256::digest(event.payload_json.as_bytes()));
         println!(
@@ -28,14 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             payload_sha256,
             serde_json::to_string(&payload)?
         );
-        parsed += 1;
-    }
-    if parsed != status.events {
-        return Err(format!(
-            "ledger parsed event count mismatch:{}:{}",
-            parsed, status.events
-        )
-        .into());
     }
     println!("verified_events={}", status.events);
     println!("verified_head={}", status.head);

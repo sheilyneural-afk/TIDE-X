@@ -1,6 +1,6 @@
 use crate::authority::{
-    ensure_private_directory, existing_regular_file_if_present, existing_regular_file_under_root,
-    install_private_immutable_file, root_relative_path, stage_private_file,
+    ensure_private_directory, existing_regular_file_if_present, install_private_immutable_file,
+    open_existing_private_file, root_relative_path, stage_private_file,
 };
 pub use crate::digest::sha256_file;
 use crate::digest::Sha256Digest;
@@ -8,10 +8,9 @@ use crate::error::{BrainError, BrainResult};
 use crate::security::{secure_dir, verify_private_root};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"TIDEXD01";
 const F64_MAGIC: &[u8; 8] = b"TIDEXF64";
@@ -44,14 +43,19 @@ fn valid_id(id: &str) -> bool {
 /// remaining root-level indirection, which would otherwise let a symlinked
 /// root redirect the whole artifact store outside its declared authority.
 fn verified_artifact_root(root: &Path) -> BrainResult<PathBuf> {
-    if !root.is_absolute() {
+    if !root.is_absolute()
+        || root == Path::new("/")
+        || root
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
         return Err(BrainError::Invalid("artifact_root_must_be_absolute".into()));
     }
     let metadata = fs::symlink_metadata(root)?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return Err(BrainError::Integrity("artifact_root_invalid".into()));
     }
-    Ok(root.canonicalize()?)
+    Ok(root.to_path_buf())
 }
 
 fn writable_artifact_root(root: &Path) -> BrainResult<PathBuf> {
@@ -127,15 +131,9 @@ fn component_name(path: &Path) -> Option<&str> {
     path.file_name()?.to_str()
 }
 
-fn open_verified_read(path: &Path) -> BrainResult<File> {
-    // Authority validates every component before this open.  Linux's
-    // O_NOFOLLOW closes the remaining leaf replacement window between that
-    // validation and the descriptor acquisition; writes use create_new.
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    options.custom_flags(0o400000); // O_NOFOLLOW
-    Ok(options.open(path)?)
+fn open_verified_read(root: &Path, path: &Path) -> BrainResult<File> {
+    let root = verified_artifact_root(root)?;
+    open_existing_private_file(&root, path)
 }
 
 fn artifact_dir(root: &Path) -> PathBuf {
@@ -191,15 +189,14 @@ fn verified_dvec_path_under_root(root: &Path, path: &Path) -> BrainResult<PathBu
     {
         return Err(BrainError::Integrity("artifact_path_root_mismatch".into()));
     }
-    existing_regular_file_under_root(&root, path)
+    Ok(path.to_path_buf())
 }
 
-fn inspect_dvec_under_root(root: &Path, path: &Path) -> BrainResult<DeltaArtifactRef> {
+fn inspect_open_dvec_under_root(root: &Path, path: &Path) -> BrainResult<(DeltaArtifactRef, File)> {
     let path = verified_dvec_path_under_root(root, path)?;
-    let file = open_verified_read(&path)?;
+    let mut file = open_verified_read(root, &path)?;
     let size = file.metadata()?.len();
-    let mut reader = BufReader::new(file);
-    let count = read_header(&mut reader)?;
+    let count = read_header(&mut file)?;
     let expected = HEADER_BYTES
         .checked_add(
             count
@@ -212,11 +209,11 @@ fn inspect_dvec_under_root(root: &Path, path: &Path) -> BrainResult<DeltaArtifac
             "artifact_size_mismatch:{size}:{expected}"
         )));
     }
-    reader.seek(SeekFrom::Start(0))?;
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 1 << 20];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -230,18 +227,26 @@ fn inspect_dvec_under_root(root: &Path, path: &Path) -> BrainResult<DeltaArtifac
             ));
         }
     }
-    Ok(DeltaArtifactRef {
-        path,
-        sha256,
-        parameter_count: count,
-    })
+    file.seek(SeekFrom::Start(0))?;
+    Ok((
+        DeltaArtifactRef {
+            path,
+            sha256,
+            parameter_count: count,
+        },
+        file,
+    ))
 }
 
-fn verified_delta_reference_under_root(
+fn inspect_dvec_under_root(root: &Path, path: &Path) -> BrainResult<DeltaArtifactRef> {
+    Ok(inspect_open_dvec_under_root(root, path)?.0)
+}
+
+fn verified_delta_reference_open_under_root(
     root: &Path,
     reference: &DeltaArtifactRef,
-) -> BrainResult<PathBuf> {
-    let inspected = inspect_dvec_under_root(root, &reference.path)?;
+) -> BrainResult<(DeltaArtifactRef, File)> {
+    let (inspected, file) = inspect_open_dvec_under_root(root, &reference.path)?;
     if inspected.sha256 != reference.sha256
         || inspected.parameter_count != reference.parameter_count
     {
@@ -254,7 +259,16 @@ fn verified_delta_reference_under_root(
             "content_addressed_artifact_reference_path_mismatch".into(),
         ));
     }
-    Ok(inspected.path)
+    Ok((inspected, file))
+}
+
+fn verified_delta_reference_under_root(
+    root: &Path,
+    reference: &DeltaArtifactRef,
+) -> BrainResult<PathBuf> {
+    Ok(verified_delta_reference_open_under_root(root, reference)?
+        .0
+        .path)
 }
 
 /// Verify a dense-vector reference under the caller's already trusted root.
@@ -278,12 +292,11 @@ fn write_dvec_values(file: &mut File, values: &[f32]) -> BrainResult<()> {
 }
 
 fn dvec_matches_values(root: &Path, path: &Path, values: &[f32]) -> BrainResult<bool> {
-    let inspected = inspect_dvec_under_root(root, path)?;
+    let (inspected, file) = inspect_open_dvec_under_root(root, path)?;
     if inspected.parameter_count != values.len() as u64 {
         return Ok(false);
     }
-    let path = verified_dvec_path_under_root(root, path)?;
-    let mut reader = BufReader::with_capacity(1 << 20, open_verified_read(&path)?);
+    let mut reader = BufReader::with_capacity(1 << 20, file);
     if read_header(&mut reader)? != values.len() as u64 {
         return Ok(false);
     }
@@ -316,10 +329,17 @@ fn create_dvec_under_root(root: &Path, id: &str, values: &[f32]) -> BrainResult<
 }
 
 pub fn read_dvec_f32(root: &Path, reference: &DeltaArtifactRef) -> BrainResult<Vec<f32>> {
-    let path = verified_delta_reference_under_root(root, reference)?;
-    let mut reader = BufReader::with_capacity(1 << 20, open_verified_read(&path)?);
+    let (inspected, file) = verified_delta_reference_open_under_root(root, reference)?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
     let count = read_header(&mut reader)?;
-    let mut values = Vec::with_capacity(count as usize);
+    if count != inspected.parameter_count {
+        return Err(BrainError::Integrity(
+            "artifact_header_reference_count_mismatch".into(),
+        ));
+    }
+    let capacity = usize::try_from(count)
+        .map_err(|_| BrainError::Invalid("artifact_parameter_count_too_large".into()))?;
+    let mut values = Vec::with_capacity(capacity);
     let mut raw = [0u8; 4];
     for _ in 0..count {
         reader.read_exact(&mut raw)?;
@@ -428,15 +448,17 @@ fn verified_f64_path_under_root(root: &Path, path: &Path) -> BrainResult<PathBuf
             "f64_artifact_path_root_mismatch".into(),
         ));
     }
-    existing_regular_file_under_root(&root, path)
+    Ok(path.to_path_buf())
 }
 
-fn inspect_f64_artifact_under_root(root: &Path, path: &Path) -> BrainResult<F64ArtifactRef> {
+fn inspect_open_f64_artifact_under_root(
+    root: &Path,
+    path: &Path,
+) -> BrainResult<(F64ArtifactRef, File)> {
     let path = verified_f64_path_under_root(root, path)?;
-    let file = open_verified_read(&path)?;
+    let mut file = open_verified_read(root, &path)?;
     let size = file.metadata()?.len();
-    let mut reader = BufReader::new(file);
-    let count = read_f64_header(&mut reader)?;
+    let count = read_f64_header(&mut file)?;
     let expected = HEADER_BYTES
         .checked_add(
             count
@@ -449,11 +471,11 @@ fn inspect_f64_artifact_under_root(root: &Path, path: &Path) -> BrainResult<F64A
             "f64_artifact_size_mismatch:{size}:{expected}"
         )));
     }
-    reader.seek(SeekFrom::Start(0))?;
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 1 << 20];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -465,18 +487,26 @@ fn inspect_f64_artifact_under_root(root: &Path, path: &Path) -> BrainResult<F64A
             "f64_content_addressed_name_digest_mismatch".into(),
         ));
     }
-    Ok(F64ArtifactRef {
-        path,
-        sha256,
-        element_count: count,
-    })
+    file.seek(SeekFrom::Start(0))?;
+    Ok((
+        F64ArtifactRef {
+            path,
+            sha256,
+            element_count: count,
+        },
+        file,
+    ))
 }
 
-fn verified_f64_reference_under_root(
+fn inspect_f64_artifact_under_root(root: &Path, path: &Path) -> BrainResult<F64ArtifactRef> {
+    Ok(inspect_open_f64_artifact_under_root(root, path)?.0)
+}
+
+fn verified_f64_reference_open_under_root(
     root: &Path,
     reference: &F64ArtifactRef,
-) -> BrainResult<PathBuf> {
-    let inspected = inspect_f64_artifact_under_root(root, &reference.path)?;
+) -> BrainResult<(F64ArtifactRef, File)> {
+    let (inspected, file) = inspect_open_f64_artifact_under_root(root, &reference.path)?;
     if inspected.sha256 != reference.sha256 || inspected.element_count != reference.element_count {
         return Err(BrainError::Integrity(
             "f64_artifact_reference_mismatch".into(),
@@ -487,7 +517,7 @@ fn verified_f64_reference_under_root(
             "f64_content_addressed_reference_path_mismatch".into(),
         ));
     }
-    Ok(inspected.path)
+    Ok((inspected, file))
 }
 
 fn write_f64_values(file: &mut File, values: &[f64]) -> BrainResult<()> {
@@ -502,12 +532,11 @@ fn write_f64_values(file: &mut File, values: &[f64]) -> BrainResult<()> {
 }
 
 fn f64_matches_values(root: &Path, path: &Path, values: &[f64]) -> BrainResult<bool> {
-    let inspected = inspect_f64_artifact_under_root(root, path)?;
+    let (inspected, file) = inspect_open_f64_artifact_under_root(root, path)?;
     if inspected.element_count != values.len() as u64 {
         return Ok(false);
     }
-    let path = verified_f64_path_under_root(root, path)?;
-    let mut reader = BufReader::with_capacity(1 << 20, open_verified_read(&path)?);
+    let mut reader = BufReader::with_capacity(1 << 20, file);
     if read_f64_header(&mut reader)? != values.len() as u64 {
         return Ok(false);
     }
@@ -575,10 +604,17 @@ fn create_content_addressed_f64_under_root(
 }
 
 pub fn read_f64_artifact(root: &Path, reference: &F64ArtifactRef) -> BrainResult<Vec<f64>> {
-    let path = verified_f64_reference_under_root(root, reference)?;
-    let mut reader = BufReader::with_capacity(1 << 20, open_verified_read(&path)?);
+    let (inspected, file) = verified_f64_reference_open_under_root(root, reference)?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
     let count = read_f64_header(&mut reader)?;
-    let mut values = Vec::with_capacity(count as usize);
+    if count != inspected.element_count {
+        return Err(BrainError::Integrity(
+            "f64_artifact_header_reference_count_mismatch".into(),
+        ));
+    }
+    let capacity = usize::try_from(count)
+        .map_err(|_| BrainError::Invalid("f64_artifact_element_count_too_large".into()))?;
+    let mut values = Vec::with_capacity(capacity);
     let mut raw = [0u8; 8];
     for _ in 0..count {
         reader.read_exact(&mut raw)?;
@@ -609,11 +645,14 @@ pub fn sketch_dvec(
     if sketch_dim < 16 {
         return Err(BrainError::Invalid("sketch_dimension_too_small".into()));
     }
-    let path = verified_dvec_path_under_root(root, path)?;
-    // Validate the complete immutable object before the streaming pass.
-    inspect_dvec_under_root(root, &path)?;
-    let mut r = BufReader::with_capacity(1 << 20, open_verified_read(&path)?);
+    let (inspected, file) = inspect_open_dvec_under_root(root, path)?;
+    let mut r = BufReader::with_capacity(1 << 20, file);
     let count = read_header(&mut r)?;
+    if count != inspected.parameter_count {
+        return Err(BrainError::Integrity(
+            "artifact_header_reference_count_mismatch".into(),
+        ));
+    }
     let mut out = vec![0.0; sketch_dim];
     let mut raw = [0u8; 4];
     for i in 0..count {
@@ -634,15 +673,13 @@ pub fn sketch_dvec(
 /// This enables tensor/block tomography with memory proportional to one model
 /// block rather than the full parameter vector.
 pub fn read_dvec_range(root: &Path, path: &Path, start: u64, len: usize) -> BrainResult<Vec<f64>> {
-    let path = verified_dvec_path_under_root(root, path)?;
-    let inspected = inspect_dvec_under_root(root, &path)?;
+    let (inspected, mut file) = inspect_open_dvec_under_root(root, path)?;
     let end = start
         .checked_add(len as u64)
         .ok_or_else(|| BrainError::Invalid("artifact_range_overflow".into()))?;
     if end > inspected.parameter_count {
         return Err(BrainError::Invalid("artifact_range_out_of_bounds".into()));
     }
-    let mut file = open_verified_read(&path)?;
     let byte_offset = HEADER_BYTES
         .checked_add(
             start
@@ -651,7 +688,8 @@ pub fn read_dvec_range(root: &Path, path: &Path, start: u64, len: usize) -> Brai
         )
         .ok_or_else(|| BrainError::Invalid("artifact_range_overflow".into()))?;
     file.seek(SeekFrom::Start(byte_offset))?;
-    let mut reader = BufReader::with_capacity((len * 4).clamp(4096, 1 << 20), file);
+    let buffer_capacity = len.saturating_mul(4).clamp(4096, 1 << 20);
+    let mut reader = BufReader::with_capacity(buffer_capacity, file);
     let mut values = Vec::with_capacity(len);
     let mut raw = [0u8; 4];
     for _ in 0..len {
@@ -683,8 +721,7 @@ fn combination_readers(
     let mut readers = Vec::with_capacity(sources.len());
     let mut count = None;
     for (reference, _) in sources {
-        let path = verified_delta_reference_under_root(root, reference)?;
-        let inspected = inspect_dvec_under_root(root, &path)?;
+        let (inspected, file) = verified_delta_reference_open_under_root(root, reference)?;
         if let Some(expected) = count {
             if expected != inspected.parameter_count {
                 return Err(BrainError::Invalid(
@@ -694,7 +731,7 @@ fn combination_readers(
         } else {
             count = Some(inspected.parameter_count);
         }
-        let mut reader = BufReader::with_capacity(1 << 20, open_verified_read(&path)?);
+        let mut reader = BufReader::with_capacity(1 << 20, file);
         let header_count = read_header(&mut reader)?;
         if header_count != inspected.parameter_count {
             return Err(BrainError::Integrity(
@@ -773,12 +810,11 @@ fn linear_combination_matches(
     if count != expected_count {
         return Ok(false);
     }
-    let inspected = inspect_dvec_under_root(root, path)?;
+    let (inspected, file) = inspect_open_dvec_under_root(root, path)?;
     if inspected.parameter_count != count {
         return Ok(false);
     }
-    let path = verified_dvec_path_under_root(root, path)?;
-    let mut target = BufReader::with_capacity(1 << 20, open_verified_read(&path)?);
+    let mut target = BufReader::with_capacity(1 << 20, file);
     if read_header(&mut target)? != count {
         return Ok(false);
     }
@@ -954,6 +990,30 @@ mod tests {
                 .expect("system clock before epoch")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn opened_dvec_descriptor_is_not_redirected_by_path_replacement() {
+        let root = isolated_root("descriptor-replacement");
+        fs::create_dir_all(&root).unwrap();
+        let original = create_content_addressed_dvec(&root, &[1.25, -2.5, 3.75]).unwrap();
+        let replacement = create_dvec(&root, "replacement", &[9.0, 8.0, 7.0]).unwrap();
+        let (inspected, file) = inspect_open_dvec_under_root(&root, &original.path).unwrap();
+        assert_eq!(inspected, original);
+
+        fs::rename(&replacement.path, &original.path).unwrap();
+
+        let mut reader = BufReader::with_capacity(1 << 20, file);
+        assert_eq!(read_header(&mut reader).unwrap(), 3);
+        let mut values = Vec::new();
+        let mut raw = [0u8; 4];
+        for _ in 0..3 {
+            reader.read_exact(&mut raw).unwrap();
+            values.push(f32::from_le_bytes(raw));
+        }
+        assert_eq!(values, vec![1.25, -2.5, 3.75]);
+        assert!(read_dvec_f32(&root, &original).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

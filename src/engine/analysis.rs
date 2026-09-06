@@ -252,16 +252,13 @@ impl BrainEngine {
             .root
             .join("state/representation_protocols/by-sha")
             .join(format!("{}.json", protocol_sha.to_ascii_lowercase()));
-        let protocol_path =
-            existing_regular_file_under_root(&self.root, &protocol_path).map_err(|_| {
-                BrainError::Integrity("representation_protocol_artifact_invalid".into())
-            })?;
-        if file_sha256(&protocol_path)? != protocol_sha.to_ascii_lowercase() {
-            return Err(BrainError::Integrity(
-                "representation_protocol_artifact_invalid".into(),
-            ));
-        }
-        let protocol: serde_json::Value = serde_json::from_slice(&fs::read(&protocol_path)?)?;
+        let protocol_bytes =
+            PrivateFileReference::new(protocol_path, protocol_sha.as_digest().clone())
+                .read_verified_bounded(&self.root, MAX_ENGINE_JSON_BYTES)
+                .map_err(|_| {
+                    BrainError::Integrity("representation_protocol_artifact_invalid".into())
+                })?;
+        let protocol: serde_json::Value = serde_json::from_slice(&protocol_bytes)?;
         let string_digest = |key: &str| -> BrainResult<String> {
             let value = protocol
                 .get(key)

@@ -1,6 +1,6 @@
 #![allow(clippy::needless_range_loop)]
 
-use crate::authority::existing_regular_file_under_root;
+use crate::authority::{read_existing_private_file_bounded, with_private_authority_lock};
 use crate::contracts::{DeltaObservation, SkillBank, SkillField};
 use crate::digest::{
     AdaptiveLearningReceiptDigest, ControllerDatasetDigest, LearnedControllerPolicyDigest,
@@ -17,22 +17,25 @@ use crate::identity::{ObservationId, SessionId};
 #[cfg(test)]
 use crate::learning_orchestrator::sha256_bytes;
 use crate::learning_orchestrator::{
-    confined_existing_file, ensure_private_dir, load_persistent_adaptive_learning_receipt,
+    confined_existing_file, load_persistent_adaptive_learning_receipt,
     private_directory_if_present, private_regular_file_if_present, write_new_private,
     write_private_atomic, EvidenceReference, LoadedAdaptiveLearningReceipt,
 };
 use crate::ledger;
 use crate::linalg::{weighted_normal_solve, Matrix};
 use crate::parametric_program::{apply_parametric_transition, compose_skill_fields};
-use crate::security::{secure_file, verify_private_root};
+#[cfg(test)]
+use crate::security::secure_file;
+use crate::security::verify_private_root;
 use crate::validation::regression_r2;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+#[cfg(test)]
+use std::fs;
 use std::path::{Path, PathBuf};
+
+const MAX_CONTROLLER_AUTHORITY_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ControllerExample {
@@ -558,50 +561,11 @@ fn validate_controller_state_topology(root: &Path, session_id: &str) -> BrainRes
     Ok(())
 }
 
-struct ControllerLock {
-    root: PathBuf,
-    path: PathBuf,
-}
-
-impl Drop for ControllerLock {
-    fn drop(&mut self) {
-        if existing_regular_file_under_root(&self.root, &self.path).is_ok() {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn acquire_controller_lock(root: &Path, session_id: &str) -> BrainResult<ControllerLock> {
-    validate_controller_state_topology(root, session_id)?;
-    let path = controller_lock_path(root, session_id);
-    let parent = path
-        .parent()
-        .ok_or_else(|| BrainError::Integrity("learned_controller_lock_parent_missing".into()))?;
-    if private_regular_file_if_present(root, &path)?.is_some() {
-        return Err(BrainError::Integrity(
-            "learned_controller_session_locked_or_unavailable".into(),
-        ));
-    }
-    ensure_private_dir(root, parent)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|error| {
-            BrainError::Integrity(format!(
-                "learned_controller_session_locked_or_unavailable:{error}"
-            ))
-        })?;
-    file.write_all(session_id.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    secure_file(&path)?;
-    existing_regular_file_under_root(root, &path)?;
-    Ok(ControllerLock {
-        root: root.to_path_buf(),
-        path,
-    })
+fn with_controller_lock<T, F>(root: &Path, session_id: &str, operation: F) -> BrainResult<T>
+where
+    F: FnOnce() -> BrainResult<T>,
+{
+    with_private_authority_lock(root, &controller_lock_path(root, session_id), operation)
 }
 
 fn parse_referenced_json<T: serde::de::DeserializeOwned>(
@@ -613,28 +577,30 @@ fn parse_referenced_json<T: serde::de::DeserializeOwned>(
             "learned_controller_evidence_reference_digest_invalid".into(),
         ));
     }
-    let path = confined_existing_file(root, &reference.path, Some(&reference.sha256))?;
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    let raw = reference.read_verified_bounded(root, MAX_CONTROLLER_AUTHORITY_JSON_BYTES)?;
+    Ok(serde_json::from_slice(&raw)?)
 }
 
 fn active_bank_under_root(
     root: &Path,
     expected_digest: &SkillBankDigest,
 ) -> BrainResult<SkillBank> {
-    let active_path = confined_existing_file(
-        root,
+    let active_reference = EvidenceReference::new(
         root.join("state/skill_bank.json"),
-        Some(expected_digest.as_str()),
-    )?;
-    let bank: SkillBank = serde_json::from_slice(&fs::read(&active_path)?)?;
+        expected_digest.as_digest().clone(),
+    );
+    let active_raw =
+        active_reference.read_verified_bounded(root, MAX_CONTROLLER_AUTHORITY_JSON_BYTES)?;
+    let bank: SkillBank = serde_json::from_slice(&active_raw)?;
     let _ = canonical_field_ids(&bank.fields)?;
-    let historical_path = confined_existing_file(
-        root,
+    let historical_reference = EvidenceReference::new(
         root.join("state/skill_banks/by-sha")
             .join(format!("{expected_digest}.json")),
-        Some(expected_digest.as_str()),
-    )?;
-    let historical: SkillBank = serde_json::from_slice(&fs::read(historical_path)?)?;
+        expected_digest.as_digest().clone(),
+    );
+    let historical_raw =
+        historical_reference.read_verified_bounded(root, MAX_CONTROLLER_AUTHORITY_JSON_BYTES)?;
+    let historical: SkillBank = serde_json::from_slice(&historical_raw)?;
     if historical != bank {
         return Err(BrainError::Integrity(
             "learned_controller_active_bank_history_content_mismatch".into(),
@@ -1053,9 +1019,12 @@ fn load_controller_receipt_by_sha(
     root: &Path,
     digest: &LearnedControllerReceiptDigest,
 ) -> BrainResult<LearnedControllerReceipt> {
-    let path = controller_receipt_path(root, digest.as_str());
-    let path = confined_existing_file(root, &path, Some(digest.as_str()))?;
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    let reference = EvidenceReference::new(
+        controller_receipt_path(root, digest.as_str()),
+        digest.as_digest().clone(),
+    );
+    let raw = reference.read_verified_bounded(root, MAX_CONTROLLER_AUTHORITY_JSON_BYTES)?;
+    Ok(serde_json::from_slice(&raw)?)
 }
 
 fn verify_controller_ledger_binding(
@@ -1169,11 +1138,15 @@ fn load_current_controller_receipt_under_root(
         ));
     }
     validate_controller_state_topology(root, session_id)?;
-    let path = confined_existing_file(root, controller_pointer_path(root, session_id), None)
-        .map_err(|_| {
-            BrainError::Integrity("learned_controller_current_pointer_missing_or_invalid".into())
-        })?;
-    let pointer: LearnedControllerPointer = serde_json::from_slice(&fs::read(path)?)?;
+    let pointer_raw = read_existing_private_file_bounded(
+        root,
+        &controller_pointer_path(root, session_id),
+        MAX_CONTROLLER_AUTHORITY_JSON_BYTES,
+    )
+    .map_err(|_| {
+        BrainError::Integrity("learned_controller_current_pointer_missing_or_invalid".into())
+    })?;
+    let pointer: LearnedControllerPointer = serde_json::from_slice(&pointer_raw)?;
     if pointer.schema != "cerebro.tidex.learned_controller_pointer/v1"
         || pointer.session_id.as_str() != session_id
     {
@@ -1257,61 +1230,61 @@ fn train_persisted_runtime_learned_controller_under_root(
 ) -> BrainResult<LoadedLearnedControllerReceipt> {
     validate_persisted_controller_policy(policy)?;
     validate_controller_state_topology(root, binding.session_id.as_str())?;
-    // Authenticate the caller-provided immutable data set before creating a
-    // lock or any controller-state directory.
-    let _ = confined_existing_file(root, dataset_path, Some(binding.dataset_sha256.as_str()))?;
-    let _lock = acquire_controller_lock(root, binding.session_id.as_str())?;
-    let (bank, adaptive, finalization) = validate_controller_binding_under_root(root, binding)?;
-    let field_ids = canonical_field_ids(&bank.fields)?;
-    let source_path =
-        confined_existing_file(root, dataset_path, Some(binding.dataset_sha256.as_str()))?;
-    let raw = fs::read(&source_path)?;
-    let source_reference = EvidenceReference {
-        path: source_path,
-        sha256: binding.dataset_sha256.as_digest().clone(),
-    };
-    let (_, examples) = validate_training_dataset_under_root(
-        root,
-        &source_reference,
-        binding,
-        &field_ids,
-        &adaptive,
-        &finalization,
-    )?;
-    let dataset = persist_controller_dataset(root, &binding.dataset_sha256, &raw)?;
-    let runtime = train_runtime_learned_controller(
-        &bank.fields,
-        &examples,
-        policy.ridge,
-        policy.ood_margin_fraction,
-    )?;
-    validate_controller_quality(&runtime, policy, &field_ids)?;
-    let pointer = controller_pointer_path(root, binding.session_id.as_str());
-    let previous = if private_regular_file_if_present(root, &pointer)?.is_some() {
-        Some(load_current_controller_receipt_under_root(
+    // Authenticate the caller-provided immutable data set before obtaining a
+    // lock, so a hostile evidence path cannot create controller state.
+    let source_reference = EvidenceReference::new(
+        dataset_path.to_path_buf(),
+        binding.dataset_sha256.as_digest().clone(),
+    );
+    let _ = source_reference.read_verified_bounded(root, MAX_CONTROLLER_AUTHORITY_JSON_BYTES)?;
+    with_controller_lock(root, binding.session_id.as_str(), || {
+        let (bank, adaptive, finalization) = validate_controller_binding_under_root(root, binding)?;
+        let field_ids = canonical_field_ids(&bank.fields)?;
+        let raw =
+            source_reference.read_verified_bounded(root, MAX_CONTROLLER_AUTHORITY_JSON_BYTES)?;
+        let (_, examples) = validate_training_dataset_under_root(
             root,
-            binding.session_id.as_str(),
-        )?)
-    } else {
-        None
-    };
-    let receipt = LearnedControllerReceipt {
-        schema: "cerebro.tidex.learned_controller_receipt/v1".into(),
-        event_kind: LearnedControllerEventKind::ControllerTrained,
-        generation: previous
-            .as_ref()
-            .map(|previous| previous.receipt.generation.saturating_add(1))
-            .unwrap_or(0),
-        prior_receipt_sha256: previous.map(|previous| previous.receipt_sha256),
-        binding: binding.clone(),
-        field_ids: field_ids.clone(),
-        field_fingerprint: field_fingerprint(&field_ids)?,
-        dataset,
-        policy: policy.clone(),
-        policy_digest: controller_policy_digest(policy)?,
-        runtime_controller: runtime,
-    };
-    persist_controller_receipt_under_root(root, receipt)
+            &source_reference,
+            binding,
+            &field_ids,
+            &adaptive,
+            &finalization,
+        )?;
+        let dataset = persist_controller_dataset(root, &binding.dataset_sha256, &raw)?;
+        let runtime = train_runtime_learned_controller(
+            &bank.fields,
+            &examples,
+            policy.ridge,
+            policy.ood_margin_fraction,
+        )?;
+        validate_controller_quality(&runtime, policy, &field_ids)?;
+        let pointer = controller_pointer_path(root, binding.session_id.as_str());
+        let previous = if private_regular_file_if_present(root, &pointer)?.is_some() {
+            Some(load_current_controller_receipt_under_root(
+                root,
+                binding.session_id.as_str(),
+            )?)
+        } else {
+            None
+        };
+        let receipt = LearnedControllerReceipt {
+            schema: "cerebro.tidex.learned_controller_receipt/v1".into(),
+            event_kind: LearnedControllerEventKind::ControllerTrained,
+            generation: previous
+                .as_ref()
+                .map(|previous| previous.receipt.generation.saturating_add(1))
+                .unwrap_or(0),
+            prior_receipt_sha256: previous.map(|previous| previous.receipt_sha256),
+            binding: binding.clone(),
+            field_ids: field_ids.clone(),
+            field_fingerprint: field_fingerprint(&field_ids)?,
+            dataset,
+            policy: policy.clone(),
+            policy_digest: controller_policy_digest(policy)?,
+            runtime_controller: runtime,
+        };
+        persist_controller_receipt_under_root(root, receipt)
+    })
 }
 
 /// Train the canonical runtime controller only from a hash-bound data set,
@@ -1800,7 +1773,7 @@ mod tests {
         fs::create_dir(root.join("state")).unwrap();
         symlink(&outside, root.join("state/learned_controllers")).unwrap();
 
-        assert!(acquire_controller_lock(&root, "session-symlink-controller").is_err());
+        assert!(with_controller_lock(&root, "session-symlink-controller", || Ok(())).is_err());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
 
         fs::remove_dir_all(&root).unwrap();

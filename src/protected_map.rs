@@ -8,7 +8,7 @@ use crate::linalg::{dot, norm, symmetric_eigen_jacobi, weighted_row_gram, Matrix
 use crate::validation::{choose_energy_rank, effective_rank_from_spectrum};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SensitivityEvidence {
@@ -61,17 +61,6 @@ pub struct ProtectedMapArtifactReport {
     pub causal_damage_supported_probes: usize,
     pub sensitivity_damage_correlation: Option<f64>,
     pub cortex: ProtectedCortexArtifact,
-}
-
-fn confined_artifact_path(root: &Path, reference: &F64ArtifactRef) -> BrainResult<PathBuf> {
-    let canonical_root = root.canonicalize()?;
-    let canonical = Path::new(&reference.path).canonicalize()?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(BrainError::Integrity(
-            "protected_map_artifact_outside_root".into(),
-        ));
-    }
-    Ok(canonical)
 }
 
 pub fn persist_protected_map(
@@ -153,7 +142,6 @@ pub fn load_protected_cortex(
             "protected_map_artifact_contract".into(),
         ));
     }
-    let _ = confined_artifact_path(root, &report.cortex.parameter_importance)?;
     let parameter_importance = read_f64_artifact(root, &report.cortex.parameter_importance)?;
     if parameter_importance.len() != report.parameter_dimension
         || parameter_importance
@@ -169,7 +157,6 @@ pub fn load_protected_cortex(
     let mut directions = Vec::with_capacity(report.cortex.directions.len());
     let mut probe_ids = BTreeSet::new();
     for stored in &report.cortex.directions {
-        let _ = confined_artifact_path(root, &stored.direction)?;
         let direction = read_f64_artifact(root, &stored.direction)?;
         if !probe_ids.insert(stored.probe_id.as_str())
             || direction.len() != report.parameter_dimension

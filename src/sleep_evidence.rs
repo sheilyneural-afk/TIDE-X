@@ -1,13 +1,15 @@
 use crate::artifact::{read_dvec_f32, DeltaArtifactRef};
-use crate::authority::existing_regular_file_under_root;
+use crate::authority::{
+    existing_regular_file_under_root, read_existing_private_file_bounded, PrivateFileReference,
+};
 use crate::causal_credit::{
     certified_causal_priority_weights, estimate_causal_credit, CausalCreditReport,
     CounterfactualEvaluation,
 };
 use crate::contracts::{DeltaObservation, SkillField};
 use crate::digest::{
-    sha256_file, AnalysisVersionDigest, CausalCreditDigest, ConfigDigest, CorpusDigest,
-    ProtectedMapDigest, ReportDigest, Sha256Digest, SourceTreeDigest,
+    AnalysisVersionDigest, CausalCreditDigest, ConfigDigest, CorpusDigest, ProtectedMapDigest,
+    ReportDigest, Sha256Digest, SourceTreeDigest,
 };
 use crate::error::{BrainError, BrainResult};
 use crate::identity::SkillId;
@@ -24,6 +26,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const NONINFERIORITY_95_Z: f64 = 1.959_963_984_540_054;
+const MAX_SLEEP_EVIDENCE_JSON_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -277,7 +280,18 @@ fn confined_path(root: &Path, raw: impl AsRef<Path>) -> BrainResult<PathBuf> {
 
 fn verify_file(root: &Path, path: &str, expected_sha: &impl AsRef<str>) -> BrainResult<bool> {
     let path = confined_path(root, path)?;
-    Ok(sha256_file(&path)?.as_str() == expected_sha.as_ref())
+    let expected = Sha256Digest::parse(expected_sha.as_ref())?;
+    match PrivateFileReference::new(path, expected)
+        .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)
+    {
+        Ok(_) => Ok(true),
+        Err(BrainError::Integrity(message))
+            if message == "private_file_reference_digest_mismatch" =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn valid_sha256(value: &impl AsRef<str>) -> bool {
@@ -390,8 +404,12 @@ fn checked_replay_identity(
         ));
     }
 
-    let trust_path = confined_path(root, &bundle.interaction.source_path)?;
-    let trust: TrustRegionArtifactIdentity = serde_json::from_slice(&fs::read(trust_path)?)?;
+    let trust_raw = PrivateFileReference::new(
+        PathBuf::from(&bundle.interaction.source_path),
+        bundle.interaction.source_sha256.clone(),
+    )
+    .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+    let trust: TrustRegionArtifactIdentity = serde_json::from_slice(&trust_raw)?;
     if trust.schema != "cerebro.tidex.trust_region_benchmark/v3"
         || trust.report_sha256.as_str() != expected.report_sha256.as_str()
         || trust.protected_map_sha256 != bundle.protection.protected_map_sha256
@@ -575,11 +593,18 @@ fn recompute_functional_replay(
             "functional_replay_source_digest_mismatch".into(),
         ));
     }
-    let baseline_path = confined_path(root, &bundle.replay.baseline_source_path)?;
-    let candidate_path = confined_path(root, &bundle.replay.candidate_source_path)?;
-    let baseline: CounterfactualReplayArtifact = serde_json::from_slice(&fs::read(baseline_path)?)?;
-    let candidate: TrustRegionFunctionalReplayArtifact =
-        serde_json::from_slice(&fs::read(candidate_path)?)?;
+    let baseline_raw = PrivateFileReference::new(
+        PathBuf::from(&bundle.replay.baseline_source_path),
+        bundle.replay.baseline_source_sha256.clone(),
+    )
+    .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+    let candidate_raw = PrivateFileReference::new(
+        PathBuf::from(&bundle.replay.candidate_source_path),
+        bundle.replay.candidate_source_sha256.clone(),
+    )
+    .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+    let baseline: CounterfactualReplayArtifact = serde_json::from_slice(&baseline_raw)?;
+    let candidate: TrustRegionFunctionalReplayArtifact = serde_json::from_slice(&candidate_raw)?;
     checked_replay_identity(root, bundle, expected, expected_ids, &baseline, &candidate)?;
 
     let baseline_rows = baseline_full_coalition_rows(&baseline, expected_ids)?;
@@ -699,9 +724,11 @@ struct ProtectionSourcePayload {
 fn load_sensitivity_evidence(
     root: &Path,
     source_path: &str,
+    source_sha256: &Sha256Digest,
 ) -> BrainResult<Vec<SensitivityEvidence>> {
-    let source = confined_path(root, source_path)?;
-    let payload: ProtectionSourcePayload = serde_json::from_slice(&fs::read(source)?)?;
+    let source_raw = PrivateFileReference::new(PathBuf::from(source_path), source_sha256.clone())
+        .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+    let payload: ProtectionSourcePayload = serde_json::from_slice(&source_raw)?;
     if payload.schema != "cerebro.tidex.protected_sensitivity_evidence/v1"
         || payload.task_labels_used
         || payload.evidence.len() < 2
@@ -738,8 +765,12 @@ fn load_sensitivity_evidence(
         .collect()
 }
 
-fn verify_protection_artifacts(root: &Path, source_path: &str) -> BrainResult<bool> {
-    Ok(load_sensitivity_evidence(root, source_path).is_ok())
+fn verify_protection_artifacts(
+    root: &Path,
+    source_path: &str,
+    source_sha256: &Sha256Digest,
+) -> BrainResult<bool> {
+    Ok(load_sensitivity_evidence(root, source_path, source_sha256).is_ok())
 }
 
 fn verify_causal_credit_artifacts(
@@ -769,8 +800,12 @@ fn verify_causal_credit_artifacts(
     {
         return Ok(false);
     }
-    let replay_path = confined_path(root, &summary.replay_source_path)?;
-    let replay: serde_json::Value = serde_json::from_slice(&fs::read(replay_path)?)?;
+    let replay_raw = PrivateFileReference::new(
+        PathBuf::from(&summary.replay_source_path),
+        summary.replay_source_sha256.clone(),
+    )
+    .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+    let replay: serde_json::Value = serde_json::from_slice(&replay_raw)?;
     if replay.get("schema").and_then(serde_json::Value::as_str)
         != Some("cerebro.tidex.counterfactual_replay/v3")
         || replay
@@ -833,8 +868,12 @@ fn verify_causal_credit_artifacts(
         serde_json::from_value(serde_json::Value::Array(evaluations_value.clone()))?;
     let recomputed_credit = estimate_causal_credit(&evaluations)?;
 
-    let credit_path = confined_path(root, &summary.credit_source_path)?;
-    let wrapper: serde_json::Value = serde_json::from_slice(&fs::read(credit_path)?)?;
+    let credit_raw = PrivateFileReference::new(
+        PathBuf::from(&summary.credit_source_path),
+        summary.credit_source_sha256.as_digest().clone(),
+    )
+    .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+    let wrapper: serde_json::Value = serde_json::from_slice(&credit_raw)?;
     if wrapper.get("schema").and_then(serde_json::Value::as_str)
         != Some("cerebro.tidex.causal_credit_benchmark/v3")
         || wrapper
@@ -1052,8 +1091,12 @@ fn verified_causal_credit_with_weights(
     if !verify_causal_credit_artifacts(root, summary, expected_ids, expected_report_sha256)? {
         return Ok(None);
     }
-    let credit_path = confined_path(root, &summary.credit_source_path)?;
-    let wrapper: serde_json::Value = serde_json::from_slice(&fs::read(credit_path)?)?;
+    let credit_raw = PrivateFileReference::new(
+        PathBuf::from(&summary.credit_source_path),
+        summary.credit_source_sha256.as_digest().clone(),
+    )
+    .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+    let wrapper: serde_json::Value = serde_json::from_slice(&credit_raw)?;
     let report: CausalCreditReport = serde_json::from_value(
         wrapper
             .get("causal_credit")
@@ -1167,7 +1210,11 @@ pub fn verify_sleep_evidence(
         &bundle.protection.source_path,
         &bundle.protection.source_sha256,
     )?;
-    let protection_artifacts = verify_protection_artifacts(root, &bundle.protection.source_path)?;
+    let protection_artifacts = verify_protection_artifacts(
+        root,
+        &bundle.protection.source_path,
+        &bundle.protection.source_sha256,
+    )?;
     let protected_map_file = verify_file(
         root,
         &bundle.protection.protected_map_path,
@@ -1176,8 +1223,12 @@ pub fn verify_sleep_evidence(
     let mut protected_map_verified = false;
     let mut verified_cortex = None;
     if protected_map_file {
-        let map_path = confined_path(root, &bundle.protection.protected_map_path)?;
-        let wrapper: serde_json::Value = serde_json::from_slice(&fs::read(&map_path)?)?;
+        let map_raw = PrivateFileReference::new(
+            PathBuf::from(&bundle.protection.protected_map_path),
+            bundle.protection.protected_map_sha256.as_digest().clone(),
+        )
+        .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+        let wrapper: serde_json::Value = serde_json::from_slice(&map_raw)?;
         if wrapper.get("schema").and_then(serde_json::Value::as_str)
             == Some("cerebro.tidex.protected_map_benchmark/v2")
             && wrapper
@@ -1188,7 +1239,11 @@ pub fn verify_sleep_evidence(
             if let Some(map_value) = wrapper.get("map") {
                 let map: ProtectedMapArtifactReport = serde_json::from_value(map_value.clone())?;
                 let cortex = load_protected_cortex(root, &map)?;
-                let sensitivity = load_sensitivity_evidence(root, &bundle.protection.source_path)?;
+                let sensitivity = load_sensitivity_evidence(
+                    root,
+                    &bundle.protection.source_path,
+                    &bundle.protection.source_sha256,
+                )?;
                 let recomputed = build_protected_cortex_map(
                     &sensitivity,
                     map.retained_sensitivity_energy,
@@ -1283,8 +1338,12 @@ pub fn verify_sleep_evidence(
     )?;
     let mut interaction_artifact_verified = false;
     if interaction_file && bundle.interaction.field_ids == expected_ids && causal_credit.is_some() {
-        let interaction_path = confined_path(root, &bundle.interaction.source_path)?;
-        let payload: serde_json::Value = serde_json::from_slice(&fs::read(&interaction_path)?)?;
+        let interaction_raw = PrivateFileReference::new(
+            PathBuf::from(&bundle.interaction.source_path),
+            bundle.interaction.source_sha256.clone(),
+        )
+        .read_verified_bounded(root, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+        let payload: serde_json::Value = serde_json::from_slice(&interaction_raw)?;
         if payload.get("schema").and_then(serde_json::Value::as_str)
             == Some("cerebro.tidex.trust_region_benchmark/v3")
             && payload
@@ -1557,8 +1616,8 @@ pub fn load_sleep_evidence(root: &Path) -> BrainResult<SleepEvidenceBundle> {
         }
         Err(error) => return Err(error.into()),
     }
-    let path = confined_path(root, &path)?;
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    let raw = read_existing_private_file_bounded(root, &path, MAX_SLEEP_EVIDENCE_JSON_BYTES)?;
+    Ok(serde_json::from_slice(&raw)?)
 }
 
 #[cfg(test)]
@@ -1659,7 +1718,10 @@ mod tests {
             ]
         });
         fs::write(&source, serde_json::to_vec(&payload).unwrap()).unwrap();
-        assert!(load_sensitivity_evidence(&root, source.to_str().unwrap()).is_err());
+        let source_sha256 = crate::artifact::sha256_file(&source).unwrap();
+        assert!(
+            load_sensitivity_evidence(&root, source.to_str().unwrap(), &source_sha256).is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

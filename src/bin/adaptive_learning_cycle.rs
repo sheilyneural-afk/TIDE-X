@@ -1,4 +1,4 @@
-use cerebro_tidex::authority::existing_regular_file_under_root;
+use cerebro_tidex::authority::read_existing_private_file_bounded;
 use cerebro_tidex::contracts::BrainConfig;
 use cerebro_tidex::engine::{BrainEngine, ControllerInvocation, RecordedControllerExecution};
 use cerebro_tidex::learned_controller::{
@@ -14,23 +14,26 @@ use cerebro_tidex::security::configured_private_root;
 use serde_json::json;
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
-fn read_confined_invocation(
-    root: &Path,
-    raw_path: &str,
-) -> Result<(PathBuf, Vec<u8>), Box<dyn Error>> {
-    // Reuse the authority-wide resolver: it rejects a symlink in *any*
-    // intermediate component, not merely a symlink at the invocation leaf.
-    let path = existing_regular_file_under_root(root, Path::new(raw_path))?;
-    Ok((path.clone(), fs::read(path)?))
+const MAX_CLI_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_confined_invocation(root: &Path, raw_path: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    Ok(read_existing_private_file_bounded(
+        root,
+        Path::new(raw_path),
+        MAX_CLI_JSON_BYTES,
+    )?)
 }
 
 fn controller_compose(
     invocation_path: &str,
 ) -> Result<RecordedControllerExecution, Box<dyn Error>> {
     let root = configured_private_root()?;
-    let (_, invocation_raw) = read_confined_invocation(&root, invocation_path)?;
+    let invocation_raw = read_confined_invocation(&root, invocation_path)?;
     let invocation: ControllerInvocation = serde_json::from_slice(&invocation_raw)?;
     let engine = BrainEngine::open(&root, BrainConfig::default())?;
     Ok(engine.compose_current_learned_controller_and_record(&invocation)?)
@@ -85,7 +88,14 @@ fn print_controller_execution(
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Box<dyn std::error::Error>> {
-    Ok(serde_json::from_slice(&fs::read(Path::new(path))?)?)
+    let file = fs::File::open(Path::new(path))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CLI_JSON_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len())? > MAX_CLI_JSON_BYTES {
+        return Err("adaptive_learning_cli_input_too_large".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {

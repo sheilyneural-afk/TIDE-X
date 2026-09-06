@@ -6,10 +6,10 @@
 //! A later authoritative engine operation must explicitly consume those output
 //! records before they can influence a skill bank.
 
-use crate::artifact::{read_f64_artifact, sha256_file, ArtifactWriteAuthority, F64ArtifactRef};
+use crate::artifact::{read_f64_artifact, ArtifactWriteAuthority, F64ArtifactRef};
 use crate::authority::{
-    ensure_private_parent, existing_regular_file_under_root, root_relative_path,
-    write_or_verify_immutable,
+    ensure_private_parent, existing_regular_file_under_root, read_existing_private_file_bounded,
+    root_relative_path, write_or_verify_immutable, PrivateFileReference,
 };
 use crate::contracts::DeltaObservation;
 use crate::digest::{
@@ -23,6 +23,7 @@ use crate::security::verify_private_root;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,7 @@ const INSTALLED_OBSERVATIONS_RELATIVE: &str =
 const RECEIPTS_RELATIVE: &str = "state/representation_evidence/receipts/by-request-sha";
 const PROTOCOLS_RELATIVE: &str = "state/representation_protocols/by-sha";
 const LEDGER_KIND: &str = "representation_evidence_recorded";
+const MAX_REPRESENTATION_AUTHORITY_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Engine-compatible description of a sealed generic probe protocol.
 ///
@@ -365,19 +367,24 @@ fn verify_existing_receipt(
             root,
             Path::new(&installed.destination_observation_path),
         )?;
-        let existing = existing_regular_file_under_root(root, &destination)?;
-        if sha256_file(&existing)? != *installed.destination_observation_sha256.as_digest() {
-            return integrity("representation_evidence_receipt_destination_mismatch");
-        }
+        PrivateFileReference::new(
+            destination,
+            installed.destination_observation_sha256.as_digest().clone(),
+        )
+        .read_verified_bounded(root, MAX_REPRESENTATION_AUTHORITY_JSON_BYTES)
+        .map_err(|_| {
+            BrainError::Integrity("representation_evidence_receipt_destination_mismatch".into())
+        })?;
         verify_reference_under_root(root, &installed.representation_artifact)?;
     }
     let protocol_path = root
         .join(PROTOCOLS_RELATIVE)
         .join(format!("{protocol_sha256}.json"));
-    let protocol = existing_regular_file_under_root(root, &protocol_path)?;
-    if sha256_file(&protocol)? != *protocol_sha256.as_digest() {
-        return integrity("representation_evidence_receipt_protocol_mismatch");
-    }
+    PrivateFileReference::new(protocol_path, protocol_sha256.as_digest().clone())
+        .read_verified_bounded(root, MAX_REPRESENTATION_AUTHORITY_JSON_BYTES)
+        .map_err(|_| {
+            BrainError::Integrity("representation_evidence_receipt_protocol_mismatch".into())
+        })?;
     let event = ledger::find_v2_event_by_payload_string(
         root,
         LEDGER_KIND,
@@ -398,8 +405,11 @@ fn record_from_payload_path_at_root(
     root: &Path,
     source_payload_path: &Path,
 ) -> BrainResult<RepresentationEvidenceReceipt> {
-    let payload_path = existing_regular_file_under_root(root, source_payload_path)?;
-    let payload_bytes = fs::read(&payload_path)?;
+    let payload_bytes = read_existing_private_file_bounded(
+        root,
+        source_payload_path,
+        MAX_REPRESENTATION_AUTHORITY_JSON_BYTES,
+    )?;
     let request_sha256 = RepresentationRequestDigest::from(sha256_bytes(&payload_bytes));
     let request: RepresentationEvidenceInstallRequest = serde_json::from_slice(&payload_bytes)?;
     let shifts = validate_request_contract(&request)?;
@@ -409,9 +419,12 @@ fn record_from_payload_path_at_root(
 
     let receipt_path = receipt_path(root, &request_sha256);
     if receipt_path.exists() {
-        let receipt_file = existing_regular_file_under_root(root, &receipt_path)?;
-        let receipt: RepresentationEvidenceReceipt =
-            serde_json::from_slice(&fs::read(receipt_file)?)?;
+        let receipt_raw = read_existing_private_file_bounded(
+            root,
+            &receipt_path,
+            MAX_REPRESENTATION_AUTHORITY_JSON_BYTES,
+        )?;
+        let receipt: RepresentationEvidenceReceipt = serde_json::from_slice(&receipt_raw)?;
         verify_existing_receipt(
             root,
             &receipt,
@@ -430,13 +443,18 @@ fn record_from_payload_path_at_root(
 
     let mut installed = Vec::with_capacity(request.installations.len());
     for target in &request.installations {
-        let source_path =
-            existing_regular_file_under_root(root, Path::new(&target.source_observation_path))?;
-        let source_sha256 = sha256_file(&source_path)?;
-        if source_sha256 != *target.source_observation_sha256.as_digest() {
-            return integrity("representation_evidence_source_observation_digest_mismatch");
-        }
-        let before: DeltaObservation = serde_json::from_slice(&fs::read(&source_path)?)?;
+        let source_reference = PrivateFileReference::new(
+            PathBuf::from(&target.source_observation_path),
+            target.source_observation_sha256.as_digest().clone(),
+        );
+        let source_raw = source_reference
+            .read_verified_bounded(root, MAX_REPRESENTATION_AUTHORITY_JSON_BYTES)
+            .map_err(|_| {
+                BrainError::Integrity(
+                    "representation_evidence_source_observation_digest_mismatch".into(),
+                )
+            })?;
+        let before: DeltaObservation = serde_json::from_slice(&source_raw)?;
         if before.observation_id != target.observation_id {
             return integrity("representation_evidence_source_observation_id_mismatch");
         }
@@ -531,9 +549,13 @@ fn load_verified_representation_evidence_receipt_at_root(
     root: &Path,
     raw_receipt_path: &Path,
 ) -> BrainResult<RepresentationEvidenceReceipt> {
-    let loaded_receipt_path = existing_regular_file_under_root(root, raw_receipt_path)?;
-    let receipt: RepresentationEvidenceReceipt =
-        serde_json::from_slice(&fs::read(&loaded_receipt_path)?)?;
+    let receipt_raw = read_existing_private_file_bounded(
+        root,
+        raw_receipt_path,
+        MAX_REPRESENTATION_AUTHORITY_JSON_BYTES,
+    )?;
+    let loaded_receipt_path = raw_receipt_path.to_path_buf();
+    let receipt: RepresentationEvidenceReceipt = serde_json::from_slice(&receipt_raw)?;
     if receipt.schema != REPRESENTATION_EVIDENCE_RECEIPT_SCHEMA
         || receipt.source_tree_digest.as_str() != env!("TIDEX_SOURCE_TREE_DIGEST")
         || receipt.observation_count == 0
@@ -547,11 +569,17 @@ fn load_verified_representation_evidence_receipt_at_root(
     let protocol_path = root
         .join(PROTOCOLS_RELATIVE)
         .join(format!("{}.json", receipt.representation_protocol_sha256));
-    let protocol_path = existing_regular_file_under_root(root, &protocol_path)?;
-    if sha256_file(&protocol_path)? != *receipt.representation_protocol_sha256.as_digest() {
-        return integrity("representation_evidence_finalization_protocol_digest_mismatch");
-    }
-    let protocol: SealedRepresentationProtocol = serde_json::from_slice(&fs::read(protocol_path)?)?;
+    let protocol_raw = PrivateFileReference::new(
+        protocol_path,
+        receipt.representation_protocol_sha256.as_digest().clone(),
+    )
+    .read_verified_bounded(root, MAX_REPRESENTATION_AUTHORITY_JSON_BYTES)
+    .map_err(|_| {
+        BrainError::Integrity(
+            "representation_evidence_finalization_protocol_digest_mismatch".into(),
+        )
+    })?;
+    let protocol: SealedRepresentationProtocol = serde_json::from_slice(&protocol_raw)?;
     validate_sealed_representation_protocol(&protocol)?;
     if protocol.source_representation_sha256 != receipt.source_representation_sha256
         || sha256_bytes(&protocol_bytes(&protocol)?)
@@ -576,23 +604,36 @@ fn load_verified_representation_evidence_receipt_at_root(
         }
         previous_id = Some(installation.observation_id.clone());
 
-        let source_path = existing_regular_file_under_root(
-            root,
-            Path::new(&installation.source_observation_path),
-        )?;
+        let source_reference = PrivateFileReference::new(
+            PathBuf::from(&installation.source_observation_path),
+            installation.source_observation_sha256.as_digest().clone(),
+        );
+        let source_raw = source_reference
+            .read_verified_bounded(root, MAX_REPRESENTATION_AUTHORITY_JSON_BYTES)
+            .map_err(|_| {
+                BrainError::Integrity(
+                    "representation_evidence_finalization_observation_digest_mismatch".into(),
+                )
+            })?;
         let destination_path = installed_destination_under_root(
             root,
             Path::new(&installation.destination_observation_path),
         )?;
-        let destination_path = existing_regular_file_under_root(root, &destination_path)?;
-        if sha256_file(&source_path)? != *installation.source_observation_sha256.as_digest()
-            || sha256_file(&destination_path)?
-                != *installation.destination_observation_sha256.as_digest()
-        {
-            return integrity("representation_evidence_finalization_observation_digest_mismatch");
-        }
-        let source: DeltaObservation = serde_json::from_slice(&fs::read(source_path)?)?;
-        let destination: DeltaObservation = serde_json::from_slice(&fs::read(destination_path)?)?;
+        let destination_raw = PrivateFileReference::new(
+            destination_path,
+            installation
+                .destination_observation_sha256
+                .as_digest()
+                .clone(),
+        )
+        .read_verified_bounded(root, MAX_REPRESENTATION_AUTHORITY_JSON_BYTES)
+        .map_err(|_| {
+            BrainError::Integrity(
+                "representation_evidence_finalization_observation_digest_mismatch".into(),
+            )
+        })?;
+        let source: DeltaObservation = serde_json::from_slice(&source_raw)?;
+        let destination: DeltaObservation = serde_json::from_slice(&destination_raw)?;
         if source.observation_id != installation.observation_id
             || destination.observation_id != installation.observation_id
             || destination.representation_artifact.as_ref()

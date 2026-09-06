@@ -24,6 +24,7 @@ trap 'exit 143' TERM
 
 export CARGO_TARGET_DIR="$GATE0_TARGET"
 export CARGO_NET_OFFLINE=true
+umask 022
 cd "$GATE0_ROOT" || exit 1
 
 pass() {

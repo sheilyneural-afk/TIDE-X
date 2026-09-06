@@ -251,6 +251,7 @@ impl CertificationStatus {
 pub(super) struct RuntimeIntegrityHealth {
     pub(super) schema: String,
     pub(super) canonical_runtime_config: bool,
+    pub(super) canonical_head_verified: bool,
     pub(super) corpus_transition_clear: bool,
     pub(super) ledger_verified: bool,
     pub(super) bank_verified: bool,

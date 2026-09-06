@@ -233,16 +233,16 @@ impl PrimitiveSet {
             profile_id: PrimitiveProfileId::parse("tidex.core.v1")?,
             primitives: contracts
                 .into_iter()
-                .map(
-                    |(id, input_types, output_type, shape_rule)| PrimitiveContract {
-                        primitive_id: PrimitiveId::parse(id).expect("static primitive id"),
+                .map(|(id, input_types, output_type, shape_rule)| {
+                    Ok(PrimitiveContract {
+                        primitive_id: PrimitiveId::parse(id)?,
                         input_types,
                         output_type,
                         shape_rule,
                         effects: pure.clone(),
-                    },
-                )
-                .collect(),
+                    })
+                })
+                .collect::<BrainResult<Vec<_>>>()?,
             sha256: Sha256Digest::zero(),
         };
         primitive_set.sha256 = primitive_set.calculate_digest()?;

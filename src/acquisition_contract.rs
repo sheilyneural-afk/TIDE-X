@@ -95,10 +95,12 @@ mod path_wire {
     }
 
     pub(super) fn encode(path: &Path) -> EncodedPath {
-        let mut unix_bytes_hex = String::with_capacity(path.as_os_str().as_bytes().len() * 2);
-        for byte in path.as_os_str().as_bytes() {
-            use std::fmt::Write as _;
-            write!(&mut unix_bytes_hex, "{byte:02x}").expect("writing to String cannot fail");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let raw = path.as_os_str().as_bytes();
+        let mut unix_bytes_hex = String::with_capacity(raw.len() * 2);
+        for byte in raw {
+            unix_bytes_hex.push(char::from(HEX[(byte >> 4) as usize]));
+            unix_bytes_hex.push(char::from(HEX[(byte & 0x0f) as usize]));
         }
         EncodedPath { unix_bytes_hex }
     }

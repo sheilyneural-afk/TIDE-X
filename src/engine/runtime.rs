@@ -64,6 +64,13 @@ impl BrainEngine {
         if !canonical_runtime_config {
             integrity_reasons.push("noncanonical_runtime_config_forbidden".into());
         }
+        let canonical_head_verified = match self.verify_current_canonical_engine_head() {
+            Ok(_) => true,
+            Err(error) => {
+                integrity_reasons.push(format!("canonical_head_invalid:{error}"));
+                false
+            }
+        };
         let corpus_transition_clear = match self.require_no_incomplete_corpus_transition() {
             Ok(()) => true,
             Err(error) => {
@@ -150,25 +157,27 @@ impl BrainEngine {
 
         let sleep_path = self.root.join("state/sleep_state.json");
         let state = match fs::symlink_metadata(&sleep_path) {
-            Ok(_) => match existing_regular_file_under_root(&self.root, &sleep_path) {
-                Ok(verified_path) => {
-                    match serde_json::from_slice::<Value>(&fs::read(&verified_path)?) {
-                        Ok(value)
-                            if value.get("schema").and_then(Value::as_str)
-                                == Some("cerebro.tidex.sleep_state/v5") =>
-                        {
-                            Some(value)
-                        }
-                        Ok(_) => {
-                            integrity_reasons.push("sleep_state_schema_invalid".into());
-                            None
-                        }
-                        Err(error) => {
-                            integrity_reasons.push(format!("sleep_state_parse_failed:{error}"));
-                            None
-                        }
+            Ok(_) => match read_existing_private_file_bounded(
+                &self.root,
+                &sleep_path,
+                MAX_ENGINE_JSON_BYTES,
+            ) {
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(value)
+                        if value.get("schema").and_then(Value::as_str)
+                            == Some("cerebro.tidex.sleep_state/v5") =>
+                    {
+                        Some(value)
                     }
-                }
+                    Ok(_) => {
+                        integrity_reasons.push("sleep_state_schema_invalid".into());
+                        None
+                    }
+                    Err(error) => {
+                        integrity_reasons.push(format!("sleep_state_parse_failed:{error}"));
+                        None
+                    }
+                },
                 Err(error) => {
                     integrity_reasons.push(format!("sleep_state_path_invalid:{error}"));
                     None
@@ -226,20 +235,25 @@ impl BrainEngine {
                 }
             };
             if receipt_present {
-                match existing_regular_file_under_root(&self.root, &receipt_path)
-                    .and_then(|path| Ok(serde_json::from_slice::<SleepReceipt>(&fs::read(path)?)?))
-                {
+                match read_private_json::<SleepReceipt>(
+                    &self.root,
+                    &receipt_path,
+                    MAX_ENGINE_JSON_BYTES,
+                ) {
                     Ok(receipt) => {
-                        match existing_regular_file_under_root(&self.root, &sleep_path).and_then(
-                            |verified_state| {
-                                verify_sleep_receipt_ledger_binding(
-                                    &self.root,
-                                    &receipt,
-                                    state,
-                                    &file_sha256(&verified_state)?,
-                                )
-                            },
-                        ) {
+                        match read_existing_private_file_bounded(
+                            &self.root,
+                            &sleep_path,
+                            MAX_ENGINE_JSON_BYTES,
+                        )
+                        .and_then(|current_state_bytes| {
+                            verify_sleep_receipt_ledger_binding(
+                                &self.root,
+                                &receipt,
+                                state,
+                                &sha256_bytes(&current_state_bytes),
+                            )
+                        }) {
                             Ok(()) => receipt_verified = true,
                             Err(error) => {
                                 integrity_reasons
@@ -310,9 +324,14 @@ impl BrainEngine {
                         }
 
                         if historical_artifacts_verified {
-                            let report_history =
-                                existing_regular_file_under_root(&self.root, &report_history)?;
-                            match serde_json::from_slice::<Value>(&fs::read(&report_history)?) {
+                            let report_reference = PrivateFileReference::new(
+                                report_history,
+                                receipt.report_sha256.as_digest().clone(),
+                            );
+                            match report_reference
+                                .read_verified_bounded(&self.root, MAX_ENGINE_JSON_BYTES)
+                                .and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?))
+                            {
                                 Ok(report) => {
                                     let report_source = report
                                         .get("source_tree_digest")
@@ -395,6 +414,7 @@ impl BrainEngine {
         }
 
         let integrity_healthy = canonical_runtime_config
+            && canonical_head_verified
             && corpus_transition_clear
             && ledger_verified
             && bank_verified
@@ -408,6 +428,9 @@ impl BrainEngine {
         let mut execution_blockers = Vec::<String>::new();
         if !canonical_runtime_config {
             execution_blockers.push("noncanonical_runtime_config_forbidden".into());
+        }
+        if !canonical_head_verified {
+            execution_blockers.push("canonical_head_invalid".into());
         }
         if !corpus_transition_clear {
             execution_blockers.push("corpus_transition_incomplete".into());
@@ -434,8 +457,9 @@ impl BrainEngine {
         }
         let execution_authorized = execution_blockers.is_empty();
         Ok(RuntimeIntegrityHealth {
-            schema: "cerebro.tidex.runtime_integrity_health/v1".into(),
+            schema: "cerebro.tidex.runtime_integrity_health/v2".into(),
             canonical_runtime_config,
+            canonical_head_verified,
             corpus_transition_clear,
             ledger_verified,
             bank_verified,
@@ -471,27 +495,19 @@ impl BrainEngine {
         Ok(())
     }
 
-    pub(super) fn canonical_evidence_path(
+    pub(super) fn canonical_evidence_bytes(
         &self,
         raw: &str,
         expected_sha256: &str,
-    ) -> BrainResult<PathBuf> {
-        if expected_sha256.len() != 64
-            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(BrainError::Invalid(
-                "runtime_evidence_digest_invalid".into(),
-            ));
-        }
-        let path = PathBuf::from(raw);
-        let path = existing_regular_file_under_root(&self.root, &path)
-            .map_err(|_| BrainError::Integrity("runtime_evidence_path_invalid".into()))?;
-        if file_sha256(&path)? != expected_sha256 {
-            return Err(BrainError::Integrity(
-                "runtime_evidence_identity_mismatch".into(),
-            ));
-        }
-        Ok(path)
+    ) -> BrainResult<Vec<u8>> {
+        let expected = Sha256Digest::parse(expected_sha256)
+            .map_err(|_| BrainError::Invalid("runtime_evidence_digest_invalid".into()))?;
+        PrivateFileReference::new(PathBuf::from(raw), expected)
+            .read_verified_bounded(&self.root, MAX_ENGINE_JSON_BYTES)
+            .map_err(|error| match error {
+                BrainError::Invalid(_) => error,
+                _ => BrainError::Integrity(format!("runtime_evidence_invalid:{error}")),
+            })
     }
 
     pub(super) fn load_verified_runtime_evidence(
@@ -539,12 +555,11 @@ impl BrainEngine {
             ));
         }
 
-        let protected_path = self.canonical_evidence_path(
+        let protected_bytes = self.canonical_evidence_bytes(
             &bundle.protection.protected_map_path,
             &bundle.protection.protected_map_sha256,
         )?;
-        let protected_wrapper: serde_json::Value =
-            serde_json::from_slice(&fs::read(protected_path)?)?;
+        let protected_wrapper: serde_json::Value = serde_json::from_slice(&protected_bytes)?;
         if protected_wrapper
             .get("schema")
             .and_then(serde_json::Value::as_str)
@@ -566,12 +581,11 @@ impl BrainEngine {
         )?;
         let protected = load_protected_cortex(&self.root, &protected_map)?;
 
-        let interaction_path = self.canonical_evidence_path(
+        let interaction_bytes = self.canonical_evidence_bytes(
             &bundle.interaction.source_path,
             &bundle.interaction.source_sha256,
         )?;
-        let interaction_payload: serde_json::Value =
-            serde_json::from_slice(&fs::read(interaction_path)?)?;
+        let interaction_payload: serde_json::Value = serde_json::from_slice(&interaction_bytes)?;
         if interaction_payload
             .get("schema")
             .and_then(serde_json::Value::as_str)
@@ -682,11 +696,11 @@ impl BrainEngine {
             ));
         }
 
-        let causal_path = self.canonical_evidence_path(
+        let causal_bytes = self.canonical_evidence_bytes(
             &bundle.causal_credit.credit_source_path,
             &bundle.causal_credit.credit_source_sha256,
         )?;
-        let causal_wrapper: serde_json::Value = serde_json::from_slice(&fs::read(causal_path)?)?;
+        let causal_wrapper: serde_json::Value = serde_json::from_slice(&causal_bytes)?;
         if causal_wrapper
             .get("schema")
             .and_then(serde_json::Value::as_str)
@@ -918,17 +932,25 @@ impl BrainEngine {
                 "governed_composition_activation_contract_invalid".into(),
             ));
         }
-        let bank_path = self.bank_path();
-        let bank_path = existing_regular_file_under_root(&self.root, &bank_path).map_err(|_| {
-            BrainError::Integrity("governed_composition_active_bank_missing".into())
-        })?;
-        let active_bank_sha256 =
-            SkillBankDigest::from(Sha256Digest::parse(file_sha256(&bank_path)?)?);
-        let sleep_path = existing_regular_file_under_root(
+        let bank_bytes =
+            read_existing_private_file_bounded(&self.root, &self.bank_path(), MAX_SKILL_BANK_BYTES)
+                .map_err(|_| {
+                    BrainError::Integrity("governed_composition_active_bank_missing".into())
+                })?;
+        let current_bank: SkillBank = serde_json::from_slice(&bank_bytes)?;
+        Self::validate_skill_bank_semantics(&current_bank)?;
+        if current_bank != bank {
+            return Err(BrainError::Integrity(
+                "governed_composition_active_bank_changed_during_composition".into(),
+            ));
+        }
+        let active_bank_sha256 = SkillBankDigest::from(Sha256Digest::digest_bytes(&bank_bytes));
+        let sleep_bytes = read_existing_private_file_bounded(
             &self.root,
             &self.root.join("state/sleep_state.json"),
+            MAX_ENGINE_JSON_BYTES,
         )?;
-        let sleep_state: serde_json::Value = serde_json::from_slice(&fs::read(sleep_path)?)?;
+        let sleep_state: serde_json::Value = serde_json::from_slice(&sleep_bytes)?;
         let report_sha256 = ReportDigest::from(Sha256Digest::parse(
             sleep_state
                 .get("report_sha256")
@@ -1028,9 +1050,12 @@ impl BrainEngine {
         ensure_private_directory(&self.root, &by_operation)?;
         let pointer_path = by_operation.join(format!("{operation_key}.json"));
         if fs::symlink_metadata(&pointer_path).is_ok() {
-            let pointer_path = existing_regular_file_under_root(&self.root, &pointer_path)?;
-            let pointer: GovernedCompositionPointer =
-                serde_json::from_slice(&fs::read(&pointer_path)?)?;
+            let pointer_bytes = read_existing_private_file_bounded(
+                &self.root,
+                &pointer_path,
+                MAX_ENGINE_JSON_BYTES,
+            )?;
+            let pointer: GovernedCompositionPointer = serde_json::from_slice(&pointer_bytes)?;
             if pointer.schema != "cerebro.tidex.governed_composition_pointer/v2"
                 || pointer.operation_key != operation_key
                 || !valid_digest(&pointer.receipt_sha256)
@@ -1190,8 +1215,12 @@ impl BrainEngine {
         let pointer_bytes = serialize_pretty_line(&pointer)?;
         match fs::symlink_metadata(&pointer_path) {
             Ok(_) => {
-                let pointer_path = existing_regular_file_under_root(&self.root, &pointer_path)?;
-                if fs::read(&pointer_path)? != pointer_bytes {
+                if read_existing_private_file_bounded(
+                    &self.root,
+                    &pointer_path,
+                    MAX_ENGINE_JSON_BYTES,
+                )? != pointer_bytes
+                {
                     return Err(BrainError::Integrity(
                         "governed_composition_pointer_artifact_collision".into(),
                     ));

@@ -405,7 +405,7 @@ impl KnowledgePredicate {
                 Self::ExactBytesDigestEquals { expected, .. },
                 ObservedValue::ExactBytesDigest(actual),
             ) => actual == expected,
-            _ => unreachable!("value type checked above"),
+            _ => return PredicateEvaluation::TypeMismatch,
         };
         if matches {
             PredicateEvaluation::Matches
@@ -5169,8 +5169,11 @@ fn reduce_hypothesis_assessment(
                 PredicateEvaluation::Contradicts => {
                     refuting.insert(receipt.clone());
                 }
-                PredicateEvaluation::Missing => unreachable!("handled above"),
-                PredicateEvaluation::TypeMismatch => unreachable!("handled above"),
+                PredicateEvaluation::Missing | PredicateEvaluation::TypeMismatch => {
+                    return Err(integrity(
+                        "hypothesis_prediction_observation_missing_or_type_mismatch",
+                    ));
+                }
             }
             HypothesisAssessment::Conflicted {
                 supporting,
@@ -5178,7 +5181,9 @@ fn reduce_hypothesis_assessment(
             }
         }
         (_, PredicateEvaluation::Missing | PredicateEvaluation::TypeMismatch) => {
-            unreachable!("handled above")
+            return Err(integrity(
+                "hypothesis_prediction_observation_missing_or_type_mismatch",
+            ));
         }
     };
     Ok(result)

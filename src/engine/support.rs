@@ -21,21 +21,14 @@ pub(super) fn read_private_json<T: DeserializeOwned>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-pub(super) fn file_sha256(path: &Path) -> BrainResult<String> {
-    crate::artifact::sha256_file(path).map(Into::into)
-}
-
 /// Boolean health predicate for a content-addressed private artifact. Any
 /// path, symlink, read, or digest failure is deliberately an unhealthy value.
 pub(super) fn private_file_digest_matches(root: &Path, path: &Path, expected_sha256: &str) -> bool {
-    existing_regular_file_under_root(root, path)
-        .and_then(|verified| {
-            if file_sha256(&verified)? == expected_sha256 {
-                Ok(())
-            } else {
-                Err(BrainError::Integrity("private_file_digest_mismatch".into()))
-            }
-        })
+    let Ok(expected) = Sha256Digest::parse(expected_sha256) else {
+        return false;
+    };
+    PrivateFileReference::new(path.to_path_buf(), expected)
+        .read_verified_bounded(root, MAX_ENGINE_JSON_BYTES)
         .is_ok()
 }
 
@@ -190,8 +183,11 @@ pub(super) fn persist_controller_execution(
     let receipt_path = controller_execution_receipt_path(root, &receipt_sha256);
     match fs::symlink_metadata(&receipt_path) {
         Ok(_) => {
-            let path = existing_regular_file_under_root(root, &receipt_path)?;
-            let bytes = fs::read(path)?;
+            let bytes = PrivateFileReference::new(
+                receipt_path.clone(),
+                Sha256Digest::parse(&receipt_sha256)?,
+            )
+            .read_verified_bounded(root, MAX_ENGINE_JSON_BYTES)?;
             if sha256_bytes(&bytes) != receipt_sha256 {
                 return Err(BrainError::Integrity(
                     "controller_execution_receipt_artifact_invalid".into(),
@@ -283,11 +279,10 @@ pub(super) fn verify_controller_execution_receipt(
             "controller_execution_receipt_contract_invalid".into(),
         ));
     }
-    let receipt_path = existing_regular_file_under_root(
-        root,
-        &controller_execution_receipt_path(root, &recorded.receipt_sha256),
-    )?;
-    let receipt_bytes = fs::read(&receipt_path)?;
+    let receipt_path = controller_execution_receipt_path(root, &recorded.receipt_sha256);
+    let receipt_bytes =
+        PrivateFileReference::new(receipt_path, Sha256Digest::parse(&recorded.receipt_sha256)?)
+            .read_verified_bounded(root, MAX_ENGINE_JSON_BYTES)?;
     if sha256_bytes(&receipt_bytes) != recorded.receipt_sha256
         || serde_json::from_slice::<ControllerExecutionReceipt>(&receipt_bytes)? != recorded.receipt
     {
@@ -778,15 +773,15 @@ pub(super) fn archive_private_state_file(
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
-    let source = existing_regular_file_under_root(root, source)?;
+    let source_bytes = read_existing_private_file_bounded(root, source, MAX_SKILL_BANK_BYTES)?;
     ensure_private_parent(root, archive)?;
-    let digest = crate::artifact::sha256_file(&source)?;
+    let digest = Sha256Digest::digest_bytes(&source_bytes);
     if expected_sha256.is_some_and(|expected| digest != *expected) {
         return Err(BrainError::Integrity(format!(
             "learning_corpus_transition_prior_state_file_changed:{label}"
         )));
     }
-    move_private_file_transactional(root, &source, archive, &digest)?;
+    move_private_file_transactional(root, source, archive, &digest)?;
     archived.insert(label.to_string(), digest);
     Ok(())
 }
@@ -809,8 +804,7 @@ pub(super) fn load_observations_from_private_directory(
     }
     let directory = existing_directory_under_root(root, directory)?;
     let mut paths = Vec::new();
-    for entry in fs::read_dir(&directory)? {
-        let path = entry?.path();
+    for path in list_existing_private_directory(root, &directory)? {
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             return Err(BrainError::Integrity(
                 "persisted_observations_entry_invalid".into(),
@@ -980,12 +974,14 @@ pub(super) fn verify_learning_finalization_archive(
         .map(String::as_str)
         .chain(["observations", "transition_intent"])
         .collect::<BTreeSet<_>>();
-    for entry in fs::read_dir(&archive_dir)? {
-        let entry = entry?;
-        let name = entry.file_name().into_string().map_err(|_| {
-            BrainError::Integrity("learning_finalization_archive_name_invalid".into())
-        })?;
-        if !allowed_entries.contains(name.as_str()) {
+    for path in list_existing_private_directory(root, &archive_dir)? {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                BrainError::Integrity("learning_finalization_archive_name_invalid".into())
+            })?;
+        if !allowed_entries.contains(name) {
             return Err(BrainError::Integrity(
                 "learning_finalization_archive_unexpected_entry".into(),
             ));
@@ -995,7 +991,7 @@ pub(super) fn verify_learning_finalization_archive(
     let mut manifest = None;
     for (label, digest) in &receipt.archived_artifact_sha256 {
         let bytes = PrivateFileReference::new(archive_dir.join(label), digest.clone())
-            .read_verified(root)?;
+            .read_verified_bounded(root, MAX_ENGINE_JSON_BYTES)?;
         if label == "observations_manifest.json" {
             manifest = Some(serde_json::from_slice::<Vec<DeltaObservation>>(&bytes)?);
         }
@@ -1057,19 +1053,21 @@ pub(super) fn verify_learning_finalization_transition_intent(
     archive_dir: &Path,
 ) -> BrainResult<()> {
     let intent_dir = existing_directory_under_root(root, intent_dir)?;
-    let mut entries = fs::read_dir(&intent_dir)?;
-    let entry = entries.next().transpose()?.ok_or_else(|| {
-        BrainError::Integrity("learning_finalization_transition_intent_missing".into())
-    })?;
-    if entries.next().transpose()?.is_some()
-        || entry.file_name().as_encoded_bytes() != b"intent.json"
+    let entries = list_existing_private_directory(root, &intent_dir)?;
+    if entries.is_empty() {
+        return Err(BrainError::Integrity(
+            "learning_finalization_transition_intent_missing".into(),
+        ));
+    }
+    if entries.len() != 1
+        || entries[0].file_name().and_then(|value| value.to_str()) != Some("intent.json")
     {
         return Err(BrainError::Integrity(
             "learning_finalization_transition_intent_directory_invalid".into(),
         ));
     }
-    let intent_path = existing_regular_file_under_root(root, &entry.path())?;
-    let intent: LearningCorpusTransitionIntent = serde_json::from_slice(&fs::read(intent_path)?)?;
+    let intent: LearningCorpusTransitionIntent =
+        read_private_json(root, &entries[0], MAX_ENGINE_JSON_BYTES)?;
     if intent != expected_learning_finalization_transition_intent(receipt, archive_dir) {
         return Err(BrainError::Integrity(
             "learning_finalization_archive_intent_binding_invalid".into(),
@@ -1091,17 +1089,19 @@ pub(super) fn close_verified_learning_finalization_inflight(
     }
     let inflight_root = existing_directory_under_root(root, &inflight_root)?;
     let mut matching_inflight = None;
-    for entry in fs::read_dir(&inflight_root)? {
-        let entry = entry?;
-        let name = entry.file_name().into_string().map_err(|_| {
-            BrainError::Integrity("learning_finalization_inflight_name_invalid".into())
-        })?;
+    for path in list_existing_private_directory(root, &inflight_root)? {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                BrainError::Integrity("learning_finalization_inflight_name_invalid".into())
+            })?;
         if name != receipt.operation_key.as_str() {
             return Err(BrainError::Integrity(
                 "learning_finalization_unrelated_inflight_transition".into(),
             ));
         }
-        if matching_inflight.replace(entry.path()).is_some() {
+        if matching_inflight.replace(path).is_some() {
             return Err(BrainError::Integrity(
                 "learning_finalization_inflight_transition_ambiguous".into(),
             ));
@@ -1218,7 +1218,7 @@ pub fn load_verified_governed_composition_receipt(
     }
     let receipt_reference =
         PrivateFileReference::new(expected_receipt_path, Sha256Digest::parse(receipt_sha256)?);
-    let (_canonical, receipt_bytes) = receipt_reference.read_verified_with_path(&root)?;
+    let receipt_bytes = receipt_reference.read_verified_bounded(&root, MAX_ENGINE_JSON_BYTES)?;
     let receipt_value: Value = serde_json::from_slice(&receipt_bytes)?;
     match receipt_value.get("schema").and_then(Value::as_str) {
         Some("cerebro.tidex.governed_composition_receipt/v2") => {}
@@ -1359,13 +1359,14 @@ pub fn load_verified_governed_composition_receipt(
         ));
     }
     let bank_path = root.join("state/skill_bank.json");
-    let bank_path = existing_regular_file_under_root(&root, &bank_path)?;
-    if file_sha256(&bank_path)? != receipt.active_bank_sha256 {
-        return Err(BrainError::Integrity(
-            "governed_composition_receipt_active_bank_invalid".into(),
-        ));
-    }
-    let bank: SkillBank = serde_json::from_slice(&fs::read(&bank_path)?)?;
+    let bank_bytes =
+        PrivateFileReference::new(bank_path, receipt.active_bank_sha256.as_digest().clone())
+            .read_verified_bounded(&root, MAX_SKILL_BANK_BYTES)
+            .map_err(|_| {
+                BrainError::Integrity("governed_composition_receipt_active_bank_invalid".into())
+            })?;
+    let bank: SkillBank = serde_json::from_slice(&bank_bytes)?;
+    BrainEngine::validate_skill_bank_semantics(&bank)?;
     if bank
         .fields
         .iter()
@@ -1377,8 +1378,12 @@ pub fn load_verified_governed_composition_receipt(
             "governed_composition_receipt_field_identity_invalid".into(),
         ));
     }
-    let sleep_path = existing_regular_file_under_root(&root, &root.join("state/sleep_state.json"))?;
-    let sleep_state: serde_json::Value = serde_json::from_slice(&fs::read(sleep_path)?)?;
+    let sleep_bytes = read_existing_private_file_bounded(
+        &root,
+        &root.join("state/sleep_state.json"),
+        MAX_ENGINE_JSON_BYTES,
+    )?;
+    let sleep_state: serde_json::Value = serde_json::from_slice(&sleep_bytes)?;
     if sleep_state
         .get("certification_status")
         .and_then(serde_json::Value::as_str)
@@ -1491,10 +1496,10 @@ pub(super) fn load_verified_learning_finalization_receipt_under_root(
     reference: &PrivateFileReference,
     permitted_inflight_operation: Option<&Sha256Digest>,
 ) -> BrainResult<LearningFinalizationReceipt> {
-    let (canonical, receipt_bytes) = reference.read_verified_with_path(root)?;
+    let receipt_bytes = reference.read_verified_bounded(root, MAX_ENGINE_JSON_BYTES)?;
     let receipt: LearningFinalizationReceipt = serde_json::from_slice(&receipt_bytes)?;
     let expected = learning_finalization_receipt_path(root, &receipt.operation_key);
-    if canonical != expected
+    if reference.path != expected
         || receipt.schema != "cerebro.tidex.learning_finalization_receipt/v1"
         || receipt.representation_observation_bindings.is_empty()
     {
@@ -1604,8 +1609,9 @@ pub(super) fn load_verified_learning_finalization_receipt_under_root(
         .join("state/reports")
         .join(format!("{}.json", receipt.report_sha256));
     let report_reference = PrivateFileReference::new(report_path, receipt.report_sha256.clone());
-    let report: ReconstructionReport =
-        serde_json::from_slice(&report_reference.read_verified(root)?)?;
+    let report: ReconstructionReport = serde_json::from_slice(
+        &report_reference.read_verified_bounded(root, MAX_ENGINE_JSON_BYTES)?,
+    )?;
     if report.observation_set_digest != receipt.new_corpus_digest || !report.promotion.allowed {
         return Err(BrainError::Integrity(
             "learning_finalization_receipt_report_corpus_invalid".into(),
@@ -1639,7 +1645,9 @@ pub(super) fn load_verified_learning_finalization_receipt_under_root(
         .join(format!("{}.json", receipt.commit_operation_key));
     let commit_reference =
         PrivateFileReference::new(commit_path, receipt.commit_receipt_sha256.clone());
-    let commit: CommitReceipt = serde_json::from_slice(&commit_reference.read_verified(root)?)?;
+    let commit: CommitReceipt = serde_json::from_slice(
+        &commit_reference.read_verified_bounded(root, MAX_ENGINE_JSON_BYTES)?,
+    )?;
     verify_learning_finalization_commit_binding(
         root,
         &receipt,

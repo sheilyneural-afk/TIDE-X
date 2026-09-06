@@ -35,10 +35,11 @@ pub(super) use crate::artifact::{
 };
 pub(super) use crate::authority::{
     ensure_private_directory, ensure_private_parent, existing_directory_under_root,
-    existing_regular_file_under_root, inspect_private_directory,
+    existing_regular_file_under_root, inspect_private_directory, list_existing_private_directory,
     move_private_directory_transactional, move_private_file_transactional,
-    read_untrusted_private_file_bounded, replace_private_file_atomic, root_relative_path,
-    with_private_authority_lock, write_or_verify_immutable, PrivateFileReference,
+    read_existing_private_file_bounded, read_untrusted_private_file_bounded,
+    replace_private_file_atomic, root_relative_path, with_private_authority_lock,
+    write_or_verify_immutable, PrivateFileReference,
 };
 pub(super) use crate::block_tomography::{
     reconstruct_structured_geometry, ParameterBlockLayout, ParameterLayoutAuthority,
@@ -449,7 +450,7 @@ mod tests {
         assert_eq!(live.len(), 2);
         assert!(!root
             .join("state/observation_staging")
-            .join(&digest_json(&digests).unwrap())
+            .join(digest_json(&digests).unwrap())
             .exists());
         let _ = fs::remove_dir_all(&root);
     }
@@ -540,6 +541,69 @@ mod tests {
         assert!(status.get("private_root").is_none());
         assert_eq!(status["revision"], 0);
         assert_eq!(status["skill_generation"], 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonical_head_rejects_live_pointer_drift_after_publication() {
+        let root = isolated_engine_root("head-live-drift");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut field = sample_field("skill-alpha");
+        field.support = 1;
+        field.evidence_support_digests = vec![ObservationRecordDigest::from(
+            Sha256Digest::digest_bytes(b"obs-head"),
+        )];
+        let mut bank = SkillBank {
+            generation: 1,
+            fields: vec![field],
+        };
+        fs::write(
+            state_dir.join("skill_bank.json"),
+            serialize_pretty_line(&bank).unwrap(),
+        )
+        .unwrap();
+        let engine = BrainEngine {
+            root: root.clone(),
+            config: BrainConfig::default(),
+        };
+        engine
+            .advance_canonical_engine_head(HeadIncomplete::Clear, None, None)
+            .unwrap();
+        engine.verify_current_canonical_engine_head().unwrap();
+
+        bank.generation = 2;
+        fs::write(
+            state_dir.join("skill_bank.json"),
+            serialize_pretty_line(&bank).unwrap(),
+        )
+        .unwrap();
+        let err = engine.verify_current_canonical_engine_head().unwrap_err();
+        assert!(
+            matches!(err, BrainError::Integrity(message) if message.contains("live_authority_mismatch"))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonical_head_rejects_tampered_parent_history() {
+        let root = isolated_engine_root("head-history-tamper");
+        let engine = BrainEngine {
+            root: root.clone(),
+            config: BrainConfig::default(),
+        };
+        let first = engine
+            .advance_canonical_engine_head(HeadIncomplete::Clear, None, None)
+            .unwrap();
+        engine
+            .advance_canonical_engine_head(HeadIncomplete::Clear, None, None)
+            .unwrap();
+        fs::write(
+            engine.canonical_engine_head_history_path(&first.manifest_digest),
+            b"{}\n",
+        )
+        .unwrap();
+        assert!(engine.verify_current_canonical_engine_head().is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

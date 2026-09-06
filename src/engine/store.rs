@@ -5,6 +5,142 @@ impl BrainEngine {
         self.root.join("state/canonical_engine_head.json")
     }
 
+    pub(super) fn canonical_engine_head_history_path(
+        &self,
+        digest: &CanonicalEngineHeadDigest,
+    ) -> PathBuf {
+        self.root
+            .join("state/canonical_engine_heads/by-sha")
+            .join(format!("{}.json", digest.as_str()))
+    }
+
+    pub(super) fn persist_canonical_engine_head_history(
+        &self,
+        head: &CanonicalEngineHead,
+    ) -> BrainResult<()> {
+        head.authenticate()?;
+        let bytes = serialize_pretty_line(head)?;
+        let path = self.canonical_engine_head_history_path(&head.manifest_digest);
+        write_new_private(&self.root, &path, &bytes)?;
+        let persisted: CanonicalEngineHead =
+            read_private_json(&self.root, &path, CANONICAL_ENGINE_HEAD_MAX_BYTES)?;
+        persisted.authenticate()?;
+        if persisted != *head {
+            return Err(BrainError::Integrity(
+                "canonical_engine_head_history_content_mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_current_canonical_engine_head(&self) -> BrainResult<CanonicalEngineHead> {
+        let head = self
+            .load_canonical_head_if_present()?
+            .ok_or_else(|| BrainError::Integrity("canonical_engine_head_missing".into()))?;
+
+        let historical: CanonicalEngineHead = read_private_json(
+            &self.root,
+            &self.canonical_engine_head_history_path(&head.manifest_digest),
+            CANONICAL_ENGINE_HEAD_MAX_BYTES,
+        )?;
+        historical.authenticate()?;
+        if historical != head {
+            return Err(BrainError::Integrity(
+                "canonical_engine_head_history_current_mismatch".into(),
+            ));
+        }
+        if let Some(parent_digest) = &head.parent_digest {
+            let parent: CanonicalEngineHead = read_private_json(
+                &self.root,
+                &self.canonical_engine_head_history_path(parent_digest),
+                CANONICAL_ENGINE_HEAD_MAX_BYTES,
+            )?;
+            parent.authenticate()?;
+            if &parent.manifest_digest != parent_digest
+                || Some(parent.revision) != head.parent_revision
+                || parent.revision.checked_add(1) != Some(head.revision)
+            {
+                return Err(BrainError::Integrity(
+                    "canonical_engine_head_parent_history_mismatch".into(),
+                ));
+            }
+        }
+
+        let observations = self.load_persisted_observations()?;
+        let (corpus_digest, observation_count) = if observations.is_empty() {
+            (None, 0)
+        } else {
+            (
+                Some(observation_set_digest(&observations)?),
+                observations.len(),
+            )
+        };
+        let active_bank_sha256 = self
+            .optional_pointer_digest(&self.bank_path())?
+            .map(SkillBankDigest::from);
+        let memory_sha256 = self
+            .optional_pointer_digest(&self.root.join("state/memory/current.json"))?
+            .map(MemoryDigest::from);
+        let sleep_state_sha256 =
+            self.optional_pointer_digest(&self.root.join("state/sleep_state.json"))?;
+        let evidence_bundle_sha256 = self
+            .optional_pointer_digest(&self.root.join("state/sleep_evidence/current.json"))?
+            .map(EvidenceBundleDigest::from);
+        let incomplete_transition = self.incomplete_transition_operation_key()?;
+
+        if head.corpus_digest != corpus_digest
+            || head.observation_count != observation_count
+            || head.active_bank_sha256 != active_bank_sha256
+            || head.memory_sha256 != memory_sha256
+            || head.sleep_state_sha256 != sleep_state_sha256
+            || head.evidence_bundle_sha256 != evidence_bundle_sha256
+            || head.incomplete_transition != incomplete_transition
+        {
+            return Err(BrainError::Integrity(
+                "canonical_engine_head_live_authority_mismatch".into(),
+            ));
+        }
+
+        let sleep_path = self.root.join("state/sleep_state.json");
+        match read_untrusted_private_file_bounded(&self.root, &sleep_path, MAX_ENGINE_JSON_BYTES) {
+            Ok(bytes) => {
+                let state: Value = serde_json::from_slice(&bytes)?;
+                if state.get("schema").and_then(Value::as_str)
+                    != Some("cerebro.tidex.sleep_state/v5")
+                {
+                    return Err(BrainError::Integrity(
+                        "canonical_engine_head_sleep_state_schema_invalid".into(),
+                    ));
+                }
+                let certification_status = state
+                    .get("certification_status")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let report_sha256 = state
+                    .get("report_sha256")
+                    .and_then(Value::as_str)
+                    .map(|value| Sha256Digest::parse(value).map(ReportDigest::from))
+                    .transpose()?;
+                if head.certification_status != certification_status
+                    || head.reconstruction_report_sha256 != report_sha256
+                {
+                    return Err(BrainError::Integrity(
+                        "canonical_engine_head_sleep_authority_mismatch".into(),
+                    ));
+                }
+            }
+            Err(BrainError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                if head.certification_status.is_some() {
+                    return Err(BrainError::Integrity(
+                        "canonical_engine_head_certification_without_sleep_state".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(head)
+    }
+
     pub(super) fn transition_journal_path(&self, operation_key: &Sha256Digest) -> PathBuf {
         self.root
             .join("state/corpus_transitions/journals")
@@ -66,6 +202,10 @@ impl BrainEngine {
             }
             _ => {}
         }
+        if let Some(current) = current.as_ref() {
+            self.persist_canonical_engine_head_history(current)?;
+        }
+        self.persist_canonical_engine_head_history(next)?;
         let bytes = serialize_pretty_line(next)?;
         let digest = Sha256Digest::digest_bytes(&bytes);
         replace_private_file_atomic(
@@ -74,6 +214,7 @@ impl BrainEngine {
             &bytes,
             Some(&digest),
         )?;
+        self.verify_current_canonical_engine_head()?;
         Ok(())
     }
 
@@ -94,6 +235,38 @@ impl BrainEngine {
                 observations.len(),
             )
         };
+        let sleep_path = self.root.join("state/sleep_state.json");
+        let (live_certification_status, live_report_sha256) =
+            match read_untrusted_private_file_bounded(
+                &self.root,
+                &sleep_path,
+                MAX_ENGINE_JSON_BYTES,
+            ) {
+                Ok(bytes) => {
+                    let state: Value = serde_json::from_slice(&bytes)?;
+                    if state.get("schema").and_then(Value::as_str)
+                        != Some("cerebro.tidex.sleep_state/v5")
+                    {
+                        return Err(BrainError::Integrity(
+                            "canonical_engine_head_sleep_state_schema_invalid".into(),
+                        ));
+                    }
+                    let certification = state
+                        .get("certification_status")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let report = state
+                        .get("report_sha256")
+                        .and_then(Value::as_str)
+                        .map(|value| Sha256Digest::parse(value).map(ReportDigest::from))
+                        .transpose()?;
+                    (certification, report)
+                }
+                Err(BrainError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (None, None)
+                }
+                Err(error) => return Err(error),
+            };
         CanonicalEngineHead {
             schema: CANONICAL_ENGINE_HEAD_SCHEMA.into(),
             revision,
@@ -112,8 +285,9 @@ impl BrainEngine {
             evidence_bundle_sha256: self
                 .optional_pointer_digest(&self.root.join("state/sleep_evidence/current.json"))?
                 .map(EvidenceBundleDigest::from),
-            reconstruction_report_sha256,
-            certification_status: certification_status.map(str::to_string),
+            reconstruction_report_sha256: live_report_sha256.or(reconstruction_report_sha256),
+            certification_status: live_certification_status
+                .or_else(|| certification_status.map(str::to_string)),
             incomplete_transition,
             manifest_digest: CanonicalEngineHeadDigest::from(Sha256Digest::zero()),
         }
@@ -540,10 +714,14 @@ impl BrainEngine {
             write_new_private(&self.root, &staging.join(name), bytes)?;
         }
         let mut staged_names = BTreeSet::new();
-        for entry in fs::read_dir(&staging)? {
-            let name = entry?.file_name().into_string().map_err(|_| {
-                BrainError::Integrity("observation_staging_filename_invalid".into())
-            })?;
+        for path in list_existing_private_directory(&self.root, &staging)? {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| {
+                    BrainError::Integrity("observation_staging_filename_invalid".into())
+                })?
+                .to_string();
             staged_names.insert(name);
         }
         let expected_names = prepared
