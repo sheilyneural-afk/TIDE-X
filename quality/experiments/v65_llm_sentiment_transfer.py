@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""V65: real language-capability transfer between pretrained causal LMs.
+"""V65: bounded cross-model functional distillation through CapabilityIR.
 
-Donor A learns SST-2 sentiment from original labels.  A is then reduced to a
-portable language CapabilityIR made only of canonical text anchors and donor
-output probabilities.  The donor is unloaded before Receiver B is compiled.
-The receiver compiler never receives SST-2 labels.  B-direct is trained from
-labels only as an evaluation oracle; a swapped-operator IR is the wrong-skill
-control.
+Donor A learns SST-2 sentiment from original labels. A is then reduced to a
+sealed language CapabilityIR containing canonical text anchors and donor output
+probabilities. The donor is unloaded before Receiver B is optimized from that
+artifact. The receiver compilation route never receives SST-2 labels. B-direct
+is trained from labels only as an evaluation oracle; a swapped-output IR is the
+negative control.
 
-Scope: LoRA capability adapters on two different pretrained causal-LM
-architectures.  This is functional distillation through a sealed IR, not a
-claim of zero-optimization weight translation or universal LLM portability.
+Scope: one sentiment capability, one donor/receiver pair and one seed using
+receiver-native LoRA optimization. This experiment measures functional recovery
+through a sealed IR; it does not establish zero-optimization weight translation,
+universal LLM portability, or superiority over direct fine-tuning.
 """
 
 from __future__ import annotations
@@ -409,12 +410,13 @@ def run(receipt_path: Path, ir_path: Path) -> dict[str, Any]:
         "schema": RECEIPT_SCHEMA,
         "version": "V65",
         "pass": passed,
-        "scope": "real pretrained causal-LM LoRA capability transfer on held-out SST-2 evaluation",
-        "method": "donor labeled fine-tune -> sealed text/probability CapabilityIR -> receiver-native LoRA compilation",
+        "scope": "single-seed held-out functional distillation across one pretrained causal-LM donor/receiver pair on SST-2",
+        "method": "donor labeled fine-tune -> sealed text/probability CapabilityIR -> receiver-native LoRA optimization -> held-out evaluation",
         "limits": [
-            "functional distillation uses receiver-side optimization",
-            "one language capability and one donor/receiver pair",
-            "LoRA adapter transfer, not full-checkpoint weight translation",
+            "receiver-side optimization is required",
+            "one seed, one language capability, and one donor/receiver pair",
+            "LoRA materialization on the receiver, not direct donor-weight or full-checkpoint translation",
+            "result measures bounded functional recovery and does not establish universal portability or superiority over direct fine-tuning",
         ],
         "git_commit": commit,
         "git_tree": tree,

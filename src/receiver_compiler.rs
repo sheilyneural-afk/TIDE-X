@@ -5,6 +5,11 @@
 //! receiver-native solutions, predicts a new receiver delta for a held-out
 //! capability, applies protection/trust-region constraints, and then verifies
 //! the resulting behavior back in canonical functional space.
+//!
+//! "Compilation" is the mechanism implemented here. "Portability" is only an
+//! empirical property measured by held-out benchmarks over an explicitly
+//! declared calibration domain; nothing in this module by itself establishes
+//! universal cross-model or cross-capability portability.
 
 use crate::capability_ir::{
     CapabilityIr, OperationalCapabilityContract, OperationalInterfaceVerification,
@@ -122,9 +127,11 @@ fn validate_rows(
 /// Compile one held-out operational capability into receiver-native parameters.
 ///
 /// `calibration` must contain matched capabilities *other than the queried
-/// capability* when this function is used to claim portability. This function
-/// cannot infer experimental data leakage, so the benchmark/front-end is
-/// responsible for enforcing that split.
+/// capability* when this function is used inside a portability experiment. This
+/// function implements receiver-native compilation; any portability claim must
+/// come from a separate held-out evaluation with an explicit scope. The
+/// function cannot infer experimental data leakage, so the benchmark/front-end
+/// is responsible for enforcing that split.
 pub fn compile_receiver_capability(
     ir: &CapabilityIr,
     operational: &OperationalCapabilityContract,
@@ -264,9 +271,11 @@ pub fn compile_receiver_capability(
     })
 }
 
-/// Compare a transferred receiver against an untouched receiver, a direct
-/// receiver oracle, and a wrong-skill receiver using one common functional
-/// score. This metric is intentionally independent of parameter distance.
+/// Compare one receiver-native compiled result against an untouched receiver,
+/// a direct receiver oracle, and an explicit wrong-skill control using one
+/// common functional score. This metric is intentionally independent of
+/// parameter distance. A positive score supports functional recovery only in
+/// the declared evaluation domain; it is not, by itself, a universal portability claim.
 pub fn evaluate_portability(
     expected_functional_signature: &[f64],
     virgin_functional_signature: &[f64],
@@ -372,9 +381,13 @@ pub struct ReceiverPortabilityBenchmarkReport {
     pub cases: Vec<ReceiverPortabilityCaseReport>,
 }
 
-/// Leave-one-skill-out portability benchmark. The direct receiver solution of
-/// the held-out skill is never passed to either learned map; it is opened only
-/// after compilation as an oracle for `RecoveredGain`.
+/// Leave-one-skill-out functional compilation benchmark. The direct receiver
+/// solution of the held-out skill is never passed to either learned map; it is
+/// opened only after compilation as an oracle for `RecoveredGain`.
+///
+/// The retained `portability` schema/API name is historical compatibility. The
+/// benchmark measures held-out recovery inside its supplied calibration set; it
+/// does not establish portability across arbitrary model architectures.
 pub fn benchmark_receiver_portability_leave_one_out(
     input: &ReceiverPortabilityBenchmarkInput,
 ) -> BrainResult<ReceiverPortabilityBenchmarkReport> {
