@@ -181,6 +181,14 @@ quality/gate4-release-readiness.sh
 
 `QUALITY_P4_RECEIPT_PATH` permite seleccionar un receipt externo. Gate4 rechaza cualquier destino dentro del checkout.
 
+## Evidencia experimental V64: ReceiverCompiler sobre Transformers
+
+`quality/experiments/v64_transformer_portability.py` ejecuta un benchmark determinista con dos `torch.nn.TransformerEncoder` de arquitecturas e inicializaciones diferentes. No descarga modelos y no constituye una afirmación de portabilidad LLM-scale. Su propósito es comprobar una propiedad más estrecha: una firma funcional de una skill del donante puede compilarse en coordenadas nativas del receptor sin suministrar a TIDE-X los parámetros del donante ni la solución directa del receptor para la skill held-out.
+
+La evidencia canónica en `quality/evidence/v64/receipt.json` liga la ejecución al commit `e96f3aef94f63014a9ceec54176dc5194eeedb39`. Dos ejecuciones completas sobre ese snapshot produjeron bytes idénticos, SHA-256 `8845c7f80ce470d7d7186c6ed5582c7f9af88e364ef90592d877cbe8df0e94be`. El resultado observado fue `pass=true`, `mean_recovered_gain=0.9999307459756482`, `minimum_recovered_gain=0.9995205672621005`; también pasaron el control de fuga del oracle held-out y la comprobación SHA-256 de que los backbones congelados no cambiaron durante el entrenamiento de las skills.
+
+El benchmark sigue siendo un micro-benchmark: A tiene 5.858 parámetros y B 18.402, y las realizaciones de skill viven en una base receptora de cuatro coordenadas sobre backbones congelados. Por tanto V64 demuestra una compilación cross-architecture en ese régimen, no migración de un fine-tune completo ni portabilidad universal entre LLMs.
+
 ## Límite de la evidencia
 
 Las campañas acotadas prueban ausencia de fallos únicamente sobre las entradas

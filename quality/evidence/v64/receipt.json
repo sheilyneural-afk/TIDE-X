@@ -1,0 +1,163 @@
+{
+  "criteria": {
+    "donor_pretrain_mse_max": 0.0005,
+    "mean_correct_wrong_advantage_min": 0.05,
+    "mean_recovered_gain_min": 0.95,
+    "minimum_recovered_gain_min": 0.9,
+    "receiver_direct_mse_max": 0.0005,
+    "receiver_pretrain_mse_max": 0.0005
+  },
+  "deterministic_algorithms": true,
+  "donor_parameter_vectors_supplied_to_tidex": false,
+  "experiment_script_sha256": "384c92312c792063ea8deac979a00a5d9e91b3cf4572a45644ab0ee9ddff5dcd",
+  "frozen_backbone_digest_check_passed": true,
+  "git_commit": "e96f3aef94f63014a9ceec54176dc5194eeedb39",
+  "git_tree": "705472f0bf825af3016ea7aa2b18982f2f522b14",
+  "heldout_oracle_leak_check_passed": true,
+  "heldout_receiver_direct_solution_used_for_compilation": false,
+  "means": {
+    "correct_wrong_advantage": 1.5801432098396009,
+    "maximum_direct_mse": 8.771647844696417e-05,
+    "minimum_recovered_gain": 0.9995205672621005,
+    "recovered_gain": 0.9999307459756482,
+    "rust_mean_recovered_gain": 1.0063142164672267,
+    "rust_minimum_recovered_gain": 1.0014394147808916
+  },
+  "method": "held-out donor functional signature -> TIDE-X ReceiverCompiler -> receiver-native operator coordinates",
+  "models": {
+    "A": {
+      "d_model": 24,
+      "frozen_digest_sha256": "26ecd1b7156a34ac20e1db51858402c191ef9da32ced090f83d971d34fca20e6",
+      "layers": 1,
+      "nhead": 4,
+      "parameter_count": 5858,
+      "pretrain_mse": 3.216205004719086e-05,
+      "receiver_coordinate_dimension": 4,
+      "seed": 111
+    },
+    "B": {
+      "d_model": 32,
+      "frozen_digest_sha256": "0a30cea222cb986aa19418da1cb8739375543886507004c430a455149111b817",
+      "layers": 2,
+      "nhead": 4,
+      "parameter_count": 18402,
+      "pretrain_mse": 1.630233418836724e-05,
+      "receiver_coordinate_dimension": 4,
+      "seed": 222
+    }
+  },
+  "pass": true,
+  "rows": [
+    {
+      "correct_wrong_advantage": 1.9988457240251591,
+      "donor_mse": 7.650584302609786e-05,
+      "receiver_direct_mse": 8.392553718294948e-05,
+      "receiver_tidex_mse": 8.486322622047737e-05,
+      "receiver_virgin_mse": 0.5,
+      "receiver_wrong_skill_mse": 0.9995077252388,
+      "recovered_gain": 0.9999981243070879,
+      "rust_decoder_loo_r2": 0.9949318589048828,
+      "rust_encoder_loo_r2": 0.993619049594619,
+      "rust_resolved": true,
+      "skill": "identity"
+    },
+    {
+      "correct_wrong_advantage": 1.9988015048438683,
+      "donor_mse": 7.794945850037038e-05,
+      "receiver_direct_mse": 8.771647844696417e-05,
+      "receiver_tidex_mse": 0.00032739079324528575,
+      "receiver_virgin_mse": 0.5,
+      "receiver_wrong_skill_mse": 0.9997281432151794,
+      "recovered_gain": 0.9995205672621005,
+      "rust_decoder_loo_r2": 0.9999559641710074,
+      "rust_encoder_loo_r2": 0.9999508012782693,
+      "rust_resolved": true,
+      "skill": "swap"
+    },
+    {
+      "correct_wrong_advantage": 1.9979784159222618,
+      "donor_mse": 7.636343798367307e-05,
+      "receiver_direct_mse": 8.290400728583336e-05,
+      "receiver_tidex_mse": 0.00010098674101755023,
+      "receiver_virgin_mse": 0.5,
+      "receiver_wrong_skill_mse": 0.9990901947021484,
+      "recovered_gain": 0.9999638285350178,
+      "rust_decoder_loo_r2": 0.9997733765376479,
+      "rust_encoder_loo_r2": 0.9997752710152163,
+      "rust_resolved": true,
+      "skill": "sign_x"
+    },
+    {
+      "correct_wrong_advantage": 2.0037441798194777,
+      "donor_mse": 7.625386933796108e-05,
+      "receiver_direct_mse": 8.585579053033143e-05,
+      "receiver_tidex_mse": 8.961815910879523e-05,
+      "receiver_virgin_mse": 0.5,
+      "receiver_wrong_skill_mse": 1.0019617080688477,
+      "recovered_gain": 0.9999924739705367,
+      "rust_decoder_loo_r2": 0.9997532201267327,
+      "rust_encoder_loo_r2": 0.999756525506649,
+      "rust_resolved": true,
+      "skill": "sign_y"
+    },
+    {
+      "correct_wrong_advantage": 2.001986938485061,
+      "donor_mse": 7.868146349210292e-05,
+      "receiver_direct_mse": 8.301204798044637e-05,
+      "receiver_tidex_mse": 9.181212953990325e-05,
+      "receiver_virgin_mse": 0.5,
+      "receiver_wrong_skill_mse": 1.0010852813720703,
+      "recovered_gain": 0.9999823969143447,
+      "rust_decoder_loo_r2": 0.999812913748017,
+      "rust_encoder_loo_r2": 0.9998062638487425,
+      "rust_resolved": true,
+      "skill": "rot90"
+    },
+    {
+      "correct_wrong_advantage": 2.0006958445883356,
+      "donor_mse": 7.556527270935476e-05,
+      "receiver_direct_mse": 8.490083564538509e-05,
+      "receiver_tidex_mse": 8.957579848356545e-05,
+      "receiver_virgin_mse": 0.5,
+      "receiver_wrong_skill_mse": 1.0004374980926514,
+      "recovered_gain": 0.999990648486421,
+      "rust_decoder_loo_r2": 0.9998543915287851,
+      "rust_encoder_loo_r2": 0.9998540712794651,
+      "rust_resolved": true,
+      "skill": "rotm90"
+    },
+    {
+      "correct_wrong_advantage": 0.11398208165488956,
+      "donor_mse": 6.245560507522896e-05,
+      "receiver_direct_mse": 6.517679139506072e-05,
+      "receiver_tidex_mse": 6.568401295226067e-05,
+      "receiver_virgin_mse": 0.39499998092651367,
+      "receiver_wrong_skill_mse": 0.04508860409259796,
+      "recovered_gain": 0.9999987156828117,
+      "rust_decoder_loo_r2": 0.9997169929146809,
+      "rust_encoder_loo_r2": 0.9996978253859345,
+      "rust_resolved": true,
+      "skill": "contract_mix"
+    },
+    {
+      "correct_wrong_advantage": 0.5251109893777537,
+      "donor_mse": 4.725665712612681e-05,
+      "receiver_direct_mse": 5.1674571295734495e-05,
+      "receiver_tidex_mse": 5.192254684516229e-05,
+      "receiver_virgin_mse": 0.3149999976158142,
+      "receiver_wrong_skill_mse": 0.16546188294887543,
+      "recovered_gain": 0.9999992126468653,
+      "rust_decoder_loo_r2": 0.9998863689328038,
+      "rust_encoder_loo_r2": 0.9998850608023976,
+      "rust_resolved": true,
+      "skill": "mix"
+    }
+  ],
+  "schema": "cerebro.tidex.v64_transformer_portability/v1",
+  "scope": "micro-transformer cross-architecture portability; not an LLM-scale claim",
+  "shared_backbone_mutated_during_skill_compilation": false,
+  "skills": 8,
+  "tidex_binary_sha256": "9ea1a17b4dd43b03219df789fa9387eea53cc4f03aa8092b0bdc9c84c7cb1e66",
+  "torch_version": "2.5.1+cpu",
+  "version": "V64"
+}
