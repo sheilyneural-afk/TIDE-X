@@ -70,6 +70,10 @@ path = "src/bin/record_representation_evidence.rs"
 name = "tidex-finalize"
 path = "src/bin/tidex_finalize.rs"
 
+[[bin]]
+name = "tidex"
+path = "src/bin/tidex.rs"
+
 [[test]]
 name = "brain"
 path = "tests/brain.rs"

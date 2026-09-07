@@ -38,6 +38,7 @@ pub mod security;
 pub mod tomography;
 pub mod transport;
 pub mod validation;
+pub mod workspace;
 
 pub use authority::PrivateFileReference;
 pub use contracts::*;

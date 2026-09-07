@@ -652,6 +652,118 @@ impl CapabilityIr {
     }
 }
 
+/// V63 operational semantics bound to one already-authenticated structural IR.
+///
+/// The structural [`CapabilityIr`] remains the closed executable vocabulary.
+/// This contract adds receiver-independent state anchors and operator
+/// transitions that define what the capability does. Keeping the binding
+/// explicit prevents a structural graph from becoming semantic evidence by
+/// assertion alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationalCapabilityContract {
+    pub schema: String,
+    pub capability_id: CapabilityId,
+    pub capability_ir_sha256: CapabilityIrDigest,
+    pub state_dimension: u64,
+    pub anchors: Vec<StateIrAnchor>,
+    pub transitions: Vec<OperatorIrTransition>,
+    pub maximum_closure_error: f64,
+    pub maximum_contraction_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StateIrAnchor {
+    pub anchor_id: String,
+    pub state: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorIrTransition {
+    pub operator_id: String,
+    pub source_anchor_id: String,
+    pub target_anchor_id: String,
+    pub observed_next_state: Vec<f64>,
+    pub pre_target_error: f64,
+    pub post_target_error: f64,
+}
+
+impl OperationalCapabilityContract {
+    pub fn validate_against(&self, ir: &CapabilityIr) -> BrainResult<()> {
+        if self.schema != "cerebro.tidex.operational_capability/v1"
+            || self.capability_id != *ir.capability_id()
+            || self.capability_ir_sha256 != *ir.manifest_digest()
+            || self.state_dimension == 0
+            || self.anchors.is_empty()
+            || self.transitions.is_empty()
+            || !self.maximum_closure_error.is_finite()
+            || self.maximum_closure_error < 0.0
+            || !self.maximum_contraction_ratio.is_finite()
+            || !(0.0..=1.0).contains(&self.maximum_contraction_ratio)
+        {
+            return Err(BrainError::Invalid("operational_capability_contract_invalid".into()));
+        }
+        let dimension = usize::try_from(self.state_dimension)
+            .map_err(|_| BrainError::Invalid("operational_state_dimension_overflow".into()))?;
+        let mut anchors = std::collections::BTreeMap::new();
+        for anchor in &self.anchors {
+            if anchor.anchor_id.is_empty()
+                || anchor.anchor_id.len() > 256
+                || anchor.state.len() != dimension
+                || anchor.state.iter().any(|value| !value.is_finite())
+                || anchors.insert(anchor.anchor_id.as_str(), anchor.state.as_slice()).is_some()
+            {
+                return Err(BrainError::Invalid("state_ir_anchor_invalid".into()));
+            }
+        }
+        let mut operator_ids = BTreeSet::new();
+        for transition in &self.transitions {
+            if transition.operator_id.is_empty()
+                || transition.operator_id.len() > 256
+                || !operator_ids.insert(transition.operator_id.as_str())
+                || transition.observed_next_state.len() != dimension
+                || transition.observed_next_state.iter().any(|value| !value.is_finite())
+                || !transition.pre_target_error.is_finite()
+                || !transition.post_target_error.is_finite()
+                || transition.pre_target_error < 0.0
+                || transition.post_target_error < 0.0
+            {
+                return Err(BrainError::Invalid("operator_ir_transition_invalid".into()));
+            }
+            let source = anchors.get(transition.source_anchor_id.as_str()).ok_or_else(|| {
+                BrainError::Integrity("operator_ir_source_anchor_unknown".into())
+            })?;
+            let target = anchors.get(transition.target_anchor_id.as_str()).ok_or_else(|| {
+                BrainError::Integrity("operator_ir_target_anchor_unknown".into())
+            })?;
+            if source.len() != dimension {
+                return Err(BrainError::Integrity("operator_ir_source_anchor_invalid".into()));
+            }
+            let closure = transition
+                .observed_next_state
+                .iter()
+                .zip(*target)
+                .map(|(left, right)| (left - right).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if !closure.is_finite() || closure > self.maximum_closure_error {
+                return Err(BrainError::Integrity("operator_ir_closure_contract_failed".into()));
+            }
+            let ratio = if transition.pre_target_error <= 1e-15 {
+                if transition.post_target_error <= 1e-15 { 0.0 } else { f64::INFINITY }
+            } else {
+                transition.post_target_error / transition.pre_target_error
+            };
+            if !ratio.is_finite() || ratio > self.maximum_contraction_ratio {
+                return Err(BrainError::Integrity("operator_ir_contraction_contract_failed".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Authenticate the unique canonical persisted form of an IR against the
 /// exact retained system envelope it claims to represent.
 pub fn authenticate_capability_ir(
@@ -1269,5 +1381,48 @@ mod tests {
         fs::remove_dir_all(donor).unwrap();
         fs::remove_dir_all(private).unwrap();
         fs::remove_dir_all(noncanonical_private).unwrap();
+    }
+
+    #[test]
+    fn operational_contract_enforces_v63_closure_and_contraction() {
+        let (root, envelope) = envelope();
+        let ir = CapabilityIr::new(
+            CapabilityId::parse("memory.select:v1").unwrap(),
+            &envelope,
+            PrimitiveSet::tidex_core_v1().unwrap(),
+            vec![TypedPort::tensor_f64(PortId::parse("scores").unwrap(), vec![4]).unwrap()],
+            vec![node(vec![ValueReference::Input { name: PortId::parse("scores").unwrap() }])],
+            vec![output("node.select")],
+        ).unwrap();
+        let contract = OperationalCapabilityContract {
+            schema: "cerebro.tidex.operational_capability/v1".into(),
+            capability_id: ir.capability_id().clone(),
+            capability_ir_sha256: ir.manifest_digest().clone(),
+            state_dimension: 2,
+            anchors: vec![
+                StateIrAnchor { anchor_id: "s0".into(), state: vec![1.0, 0.0] },
+                StateIrAnchor { anchor_id: "s1".into(), state: vec![0.0, 1.0] },
+            ],
+            transitions: vec![OperatorIrTransition {
+                operator_id: "toggle".into(),
+                source_anchor_id: "s0".into(),
+                target_anchor_id: "s1".into(),
+                observed_next_state: vec![0.0, 1.0],
+                pre_target_error: 1.0,
+                post_target_error: 0.0001,
+            }],
+            maximum_closure_error: 0.001,
+            maximum_contraction_ratio: 0.001,
+        };
+        contract.validate_against(&ir).unwrap();
+
+        let mut bad_closure = contract.clone();
+        bad_closure.transitions[0].observed_next_state = vec![0.1, 0.9];
+        assert!(bad_closure.validate_against(&ir).is_err());
+
+        let mut bad_contraction = contract;
+        bad_contraction.transitions[0].post_target_error = 0.1;
+        assert!(bad_contraction.validate_against(&ir).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

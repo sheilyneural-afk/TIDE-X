@@ -12,6 +12,7 @@ EXPECTED_BINARIES=(
     pure-linear-runner
     record-representation-evidence
     tidex-finalize
+    tidex
 )
 
 fail() {
