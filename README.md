@@ -84,7 +84,7 @@ cargo build --release --bins --offline --locked
 
 El perfil release usa `lto = "thin"`, `codegen-units = 1`, `panic = "abort"` y `strip = "symbols"`.
 
-`Cargo.toml` declara ocho binarios:
+`Cargo.toml` declara nueve binarios:
 
 1. `cerebro-tidex`
 2. `acquire-system`
@@ -94,8 +94,39 @@ El perfil release usa `lto = "thin"`, `codegen-units = 1`, `panic = "abort"` y `
 6. `pure-linear-runner`
 7. `record-representation-evidence`
 8. `tidex-finalize`
+9. `tidex`
 
 ## Interfaces reales de los binarios
+
+### `tidex`
+
+`tidex` es la capa de operador. `TIDEX_HOME` mantiene workspaces y perfiles de modelo separados del proyecto objetivo; cada workspace posee su propia raíz privada de estado. El modelo configurado es asistencia no autoritativa y no puede crear evidencia ni promover una capability.
+
+Superficie implementada actualmente:
+
+```bash
+export TIDEX_HOME=/var/lib/tidex
+tidex workspace create proyecto --target /ruta/al/proyecto
+tidex workspace use proyecto
+tidex workspace show
+
+tidex model add qwen --provider openai-compatible --url http://127.0.0.1:8080/v1 --model Qwen
+tidex model use qwen
+
+tidex acquire
+tidex acquire --path src/modulo
+tidex capabilities
+```
+
+La adquisición reutiliza `content_vault::capture_to_vault`; no existe un capturador paralelo. El estado se escribe bajo `TIDEX_HOME/workspaces/<workspace>/state`, nunca dentro del target externo.
+
+El benchmark leave-one-skill-out del `ReceiverCompiler` es independiente de workspaces:
+
+```bash
+tidex benchmark portability receiver-benchmark.json
+```
+
+La solución directa del receptor para la skill evaluada se excluye del ajuste de los mapas forward/reverse y sólo se abre después como oracle de `RecoveredGain`. El benchmark V64 reproducible con dos Transformers pequeños y arquitecturas distintas está en `quality/experiments/v64_transformer_portability.py`; es evidencia micro-transformer y no una afirmación de portabilidad LLM-scale.
 
 ### `cerebro-tidex`
 
@@ -195,8 +226,8 @@ P3 es acumulativa sobre P2 y añade model checking determinista acotado, pruebas
 
 P4 añade una capa de distribución técnica sobre P3. Las fronteras son:
 
-- `quality/build-release-bundle.sh`: exige Git limpio, hace dos builds independientes de los ocho binarios con `--release --bins --offline --locked`, exige igualdad bit a bit, genera `release-manifest.json`, `SHA256SUMS`, SBOM SPDX 2.3 y un `.tar.zst` determinista fuera del checkout.
-- `quality/verify-release.sh`: valida identidad, conjunto exacto de ocho binarios, hashes/tamaños, permisos, SBOM, miembros del archive y, cuando se solicita, las firmas OpenPGP del fingerprint autorizado.
+- `quality/build-release-bundle.sh`: exige Git limpio, hace dos builds independientes de los nueve binarios con `--release --bins --offline --locked`, exige igualdad bit a bit, genera `release-manifest.json`, `SHA256SUMS`, SBOM SPDX 2.3 y un `.tar.zst` determinista fuera del checkout.
+- `quality/verify-release.sh`: valida identidad, conjunto exacto de nueve binarios, hashes/tamaños, permisos, SBOM, miembros del archive y, cuando se solicita, las firmas OpenPGP del fingerprint autorizado.
 - `quality/sign-release.sh`: firma manifest/checksums y opcionalmente archive/checksum externo sin generar ni elegir una clave implícita.
 - `quality/manage-release-installation.sh`: mantiene releases versionadas, `activation.json` como autoridad, `current` como puntero derivado, upgrade, rollback y uninstall de releases inactivas sin borrar `TIDEX_PRIVATE_ROOT`.
 - `quality/gate4-release-readiness.sh`: consume P3 mediante evidencia reutilizable sólo cuando `quality/verify-p3-reuse.sh` demuestra que los 101 inputs cerrados P0–P3 y ambos toolchains siguen byte-idénticos al snapshot P3; si hay drift, falla y exige rerun de P3. Después exige reproducibilidad del bundle completo, firma real con una identidad efímera de prueba, instalación firmada, upgrade, recuperación del puntero derivado, rollback, roll-forward, uninstall y preservación del estado privado.

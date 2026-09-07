@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
@@ -29,6 +30,144 @@ fn primary_cli_rejects_unguarded_mutation_commands_before_opening_state() {
             "command={command}"
         );
     }
+}
+
+#[test]
+fn tidex_operator_acquires_the_selected_external_workspace_target() {
+    let executable = env!("CARGO_BIN_EXE_tidex");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("test-tidex-operator-{unique}"));
+    let home = base.join("home");
+    let target = base.join("external-project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(target.join("src")).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        target.join("src/lib.rs"),
+        b"pub fn external_capability() {}\n",
+    )
+    .unwrap();
+
+    let create = Command::new(executable)
+        .args(["workspace", "create", "external", "--target"])
+        .arg(&target)
+        .env("TIDEX_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        create.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let selected = Command::new(executable)
+        .args(["workspace", "use", "external"])
+        .env("TIDEX_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(selected.status.code(), Some(0));
+
+    let acquired = Command::new(executable)
+        .arg("acquire")
+        .env("TIDEX_HOME", &home)
+        .env_remove("TIDEX_PRIVATE_ROOT")
+        .output()
+        .unwrap();
+    assert_eq!(
+        acquired.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&acquired.stdout).unwrap();
+    assert_eq!(value["schema"], "cerebro.tidex.workspace_acquisition/v1");
+    assert_eq!(value["workspace"], "external");
+    assert!(value["entries"].as_u64().unwrap() >= 2);
+    assert!(home
+        .join("workspaces/external/state/state/acquisitions/capture-receipts/by-sha")
+        .is_dir());
+    assert!(!target.join("state").exists());
+
+    let scoped = Command::new(executable)
+        .args(["acquire", "--path", "src"])
+        .env("TIDEX_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        scoped.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&scoped.stderr)
+    );
+    let scoped_value: serde_json::Value = serde_json::from_slice(&scoped.stdout).unwrap();
+    assert_eq!(scoped_value["completeness"], "declared_scope_only");
+
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn tidex_portability_benchmark_is_workspace_independent_and_leave_one_out() {
+    let executable = env!("CARGO_BIN_EXE_tidex");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let input = std::env::temp_dir().join(format!("tidex-portability-{unique}.json"));
+    let functional = [
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [2.0, -1.0],
+        [-1.0, 2.0],
+        [0.5, 2.0],
+    ];
+    let cases = functional
+        .iter()
+        .enumerate()
+        .map(|(index, values)| {
+            serde_json::json!({
+                "skill_id":format!("skill-{index}"),
+                "functional_signature":values,
+                "direct_receiver_solution":[
+                    2.0 * values[0] + values[1] + 0.1,
+                    -values[0] + 3.0 * values[1] - 0.2
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"cerebro.tidex.receiver_portability_benchmark_input/v1",
+            "ridge":1e-9,
+            "cases":cases
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(executable)
+        .args(["benchmark", "portability"])
+        .arg(&input)
+        .env_remove("TIDEX_HOME")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&input);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["schema"],
+        "cerebro.tidex.receiver_portability_benchmark/v1"
+    );
+    assert_eq!(report["case_count"], 6);
+    assert_eq!(report["all_resolved"], true);
 }
 
 #[test]

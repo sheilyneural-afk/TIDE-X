@@ -31,6 +31,7 @@ pub mod persistent;
 pub mod portfolio_governance;
 pub mod protected;
 pub mod pure_capability_e2e;
+pub mod receiver_compiler;
 pub mod representation_evidence;
 pub mod residency_decision;
 pub mod sbas;

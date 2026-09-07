@@ -690,6 +690,18 @@ pub struct OperatorIrTransition {
     pub post_target_error: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationalInterfaceVerification {
+    pub schema: String,
+    pub transition_count: usize,
+    pub maximum_observed_closure_error: f64,
+    pub maximum_observed_contraction_ratio: f64,
+    pub closure_satisfied: bool,
+    pub contraction_satisfied: bool,
+    pub allowed: bool,
+}
+
 impl OperationalCapabilityContract {
     pub fn validate_against(&self, ir: &CapabilityIr) -> BrainResult<()> {
         if self.schema != "cerebro.tidex.operational_capability/v1"
@@ -703,28 +715,47 @@ impl OperationalCapabilityContract {
             || !self.maximum_contraction_ratio.is_finite()
             || !(0.0..=1.0).contains(&self.maximum_contraction_ratio)
         {
-            return Err(BrainError::Invalid("operational_capability_contract_invalid".into()));
+            return Err(BrainError::Invalid(
+                "operational_capability_contract_invalid".into(),
+            ));
         }
         let dimension = usize::try_from(self.state_dimension)
             .map_err(|_| BrainError::Invalid("operational_state_dimension_overflow".into()))?;
         let mut anchors = std::collections::BTreeMap::new();
+        let mut previous_anchor = None::<&str>;
         for anchor in &self.anchors {
             if anchor.anchor_id.is_empty()
                 || anchor.anchor_id.len() > 256
                 || anchor.state.len() != dimension
                 || anchor.state.iter().any(|value| !value.is_finite())
-                || anchors.insert(anchor.anchor_id.as_str(), anchor.state.as_slice()).is_some()
+                || previous_anchor.is_some_and(|previous| previous >= anchor.anchor_id.as_str())
+                || anchors
+                    .insert(anchor.anchor_id.as_str(), anchor.state.as_slice())
+                    .is_some()
             {
                 return Err(BrainError::Invalid("state_ir_anchor_invalid".into()));
             }
+            previous_anchor = Some(anchor.anchor_id.as_str());
         }
-        let mut operator_ids = BTreeSet::new();
+        let mut transition_ids = BTreeSet::new();
+        let mut previous_transition = None::<(&str, &str, &str)>;
         for transition in &self.transitions {
+            let transition_identity = (
+                transition.operator_id.as_str(),
+                transition.source_anchor_id.as_str(),
+                transition.target_anchor_id.as_str(),
+            );
             if transition.operator_id.is_empty()
                 || transition.operator_id.len() > 256
-                || !operator_ids.insert(transition.operator_id.as_str())
+                || transition.source_anchor_id.is_empty()
+                || transition.target_anchor_id.is_empty()
+                || previous_transition.is_some_and(|previous| previous >= transition_identity)
+                || !transition_ids.insert(transition_identity)
                 || transition.observed_next_state.len() != dimension
-                || transition.observed_next_state.iter().any(|value| !value.is_finite())
+                || transition
+                    .observed_next_state
+                    .iter()
+                    .any(|value| !value.is_finite())
                 || !transition.pre_target_error.is_finite()
                 || !transition.post_target_error.is_finite()
                 || transition.pre_target_error < 0.0
@@ -732,14 +763,16 @@ impl OperationalCapabilityContract {
             {
                 return Err(BrainError::Invalid("operator_ir_transition_invalid".into()));
             }
-            let source = anchors.get(transition.source_anchor_id.as_str()).ok_or_else(|| {
-                BrainError::Integrity("operator_ir_source_anchor_unknown".into())
-            })?;
-            let target = anchors.get(transition.target_anchor_id.as_str()).ok_or_else(|| {
-                BrainError::Integrity("operator_ir_target_anchor_unknown".into())
-            })?;
+            let source = anchors
+                .get(transition.source_anchor_id.as_str())
+                .ok_or_else(|| BrainError::Integrity("operator_ir_source_anchor_unknown".into()))?;
+            let target = anchors
+                .get(transition.target_anchor_id.as_str())
+                .ok_or_else(|| BrainError::Integrity("operator_ir_target_anchor_unknown".into()))?;
             if source.len() != dimension {
-                return Err(BrainError::Integrity("operator_ir_source_anchor_invalid".into()));
+                return Err(BrainError::Integrity(
+                    "operator_ir_source_anchor_invalid".into(),
+                ));
             }
             let closure = transition
                 .observed_next_state
@@ -749,18 +782,132 @@ impl OperationalCapabilityContract {
                 .sum::<f64>()
                 .sqrt();
             if !closure.is_finite() || closure > self.maximum_closure_error {
-                return Err(BrainError::Integrity("operator_ir_closure_contract_failed".into()));
+                return Err(BrainError::Integrity(
+                    "operator_ir_closure_contract_failed".into(),
+                ));
             }
             let ratio = if transition.pre_target_error <= 1e-15 {
-                if transition.post_target_error <= 1e-15 { 0.0 } else { f64::INFINITY }
+                if transition.post_target_error <= 1e-15 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
             } else {
                 transition.post_target_error / transition.pre_target_error
             };
             if !ratio.is_finite() || ratio > self.maximum_contraction_ratio {
-                return Err(BrainError::Integrity("operator_ir_contraction_contract_failed".into()));
+                return Err(BrainError::Integrity(
+                    "operator_ir_contraction_contract_failed".into(),
+                ));
             }
+            previous_transition = Some(transition_identity);
         }
         Ok(())
+    }
+
+    /// Receiver-independent signature used by a receiver compiler. It is the
+    /// concatenation of the exact target `StateIR` anchors for each canonical
+    /// transition. Donor parameter coordinates never participate in this
+    /// representation.
+    pub fn canonical_transition_signature(&self, ir: &CapabilityIr) -> BrainResult<Vec<f64>> {
+        self.validate_against(ir)?;
+        let anchors = self
+            .anchors
+            .iter()
+            .map(|anchor| (anchor.anchor_id.as_str(), anchor.state.as_slice()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let dimension = usize::try_from(self.state_dimension)
+            .map_err(|_| BrainError::Invalid("operational_state_dimension_overflow".into()))?;
+        let mut signature = Vec::with_capacity(self.transitions.len().saturating_mul(dimension));
+        for transition in &self.transitions {
+            let target = anchors
+                .get(transition.target_anchor_id.as_str())
+                .ok_or_else(|| BrainError::Integrity("operator_ir_target_anchor_unknown".into()))?;
+            signature.extend_from_slice(target);
+        }
+        Ok(signature)
+    }
+
+    /// Verify a receiver-produced functional signature against the same
+    /// closure and contraction semantics used to seal V63 evidence.
+    pub fn verify_receiver_signature(
+        &self,
+        ir: &CapabilityIr,
+        receiver_signature: &[f64],
+    ) -> BrainResult<OperationalInterfaceVerification> {
+        self.validate_against(ir)?;
+        let dimension = usize::try_from(self.state_dimension)
+            .map_err(|_| BrainError::Invalid("operational_state_dimension_overflow".into()))?;
+        let expected = self
+            .transitions
+            .len()
+            .checked_mul(dimension)
+            .ok_or_else(|| BrainError::Invalid("operational_signature_size_overflow".into()))?;
+        if receiver_signature.len() != expected
+            || receiver_signature.iter().any(|value| !value.is_finite())
+        {
+            return Err(BrainError::Invalid(
+                "receiver_operational_signature_invalid".into(),
+            ));
+        }
+        let anchors = self
+            .anchors
+            .iter()
+            .map(|anchor| (anchor.anchor_id.as_str(), anchor.state.as_slice()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut max_closure = 0.0_f64;
+        let mut max_contraction = 0.0_f64;
+        for (transition, observed) in self
+            .transitions
+            .iter()
+            .zip(receiver_signature.chunks_exact(dimension))
+        {
+            let source = anchors
+                .get(transition.source_anchor_id.as_str())
+                .ok_or_else(|| BrainError::Integrity("operator_ir_source_anchor_unknown".into()))?;
+            let target = anchors
+                .get(transition.target_anchor_id.as_str())
+                .ok_or_else(|| BrainError::Integrity("operator_ir_target_anchor_unknown".into()))?;
+            let closure = observed
+                .iter()
+                .zip(*target)
+                .map(|(left, right)| (left - right).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let pre = source
+                .iter()
+                .zip(*target)
+                .map(|(left, right)| (left - right).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let ratio = if pre <= 1e-15 {
+                if closure <= 1e-15 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
+            } else {
+                closure / pre
+            };
+            if !closure.is_finite() || !ratio.is_finite() {
+                return Err(BrainError::Numerical(
+                    "receiver_operational_metric_non_finite".into(),
+                ));
+            }
+            max_closure = max_closure.max(closure);
+            max_contraction = max_contraction.max(ratio);
+        }
+        let closure_satisfied = max_closure <= self.maximum_closure_error;
+        let contraction_satisfied = max_contraction <= self.maximum_contraction_ratio;
+        Ok(OperationalInterfaceVerification {
+            schema: "cerebro.tidex.operational_interface_verification/v1".into(),
+            transition_count: self.transitions.len(),
+            maximum_observed_closure_error: max_closure,
+            maximum_observed_contraction_ratio: max_contraction,
+            closure_satisfied,
+            contraction_satisfied,
+            allowed: closure_satisfied && contraction_satisfied,
+        })
     }
 }
 
@@ -1391,26 +1538,45 @@ mod tests {
             &envelope,
             PrimitiveSet::tidex_core_v1().unwrap(),
             vec![TypedPort::tensor_f64(PortId::parse("scores").unwrap(), vec![4]).unwrap()],
-            vec![node(vec![ValueReference::Input { name: PortId::parse("scores").unwrap() }])],
+            vec![node(vec![ValueReference::Input {
+                name: PortId::parse("scores").unwrap(),
+            }])],
             vec![output("node.select")],
-        ).unwrap();
+        )
+        .unwrap();
         let contract = OperationalCapabilityContract {
             schema: "cerebro.tidex.operational_capability/v1".into(),
             capability_id: ir.capability_id().clone(),
             capability_ir_sha256: ir.manifest_digest().clone(),
             state_dimension: 2,
             anchors: vec![
-                StateIrAnchor { anchor_id: "s0".into(), state: vec![1.0, 0.0] },
-                StateIrAnchor { anchor_id: "s1".into(), state: vec![0.0, 1.0] },
+                StateIrAnchor {
+                    anchor_id: "s0".into(),
+                    state: vec![1.0, 0.0],
+                },
+                StateIrAnchor {
+                    anchor_id: "s1".into(),
+                    state: vec![0.0, 1.0],
+                },
             ],
-            transitions: vec![OperatorIrTransition {
-                operator_id: "toggle".into(),
-                source_anchor_id: "s0".into(),
-                target_anchor_id: "s1".into(),
-                observed_next_state: vec![0.0, 1.0],
-                pre_target_error: 1.0,
-                post_target_error: 0.0001,
-            }],
+            transitions: vec![
+                OperatorIrTransition {
+                    operator_id: "toggle".into(),
+                    source_anchor_id: "s0".into(),
+                    target_anchor_id: "s1".into(),
+                    observed_next_state: vec![0.0, 1.0],
+                    pre_target_error: 1.0,
+                    post_target_error: 0.0001,
+                },
+                OperatorIrTransition {
+                    operator_id: "toggle".into(),
+                    source_anchor_id: "s1".into(),
+                    target_anchor_id: "s0".into(),
+                    observed_next_state: vec![1.0, 0.0],
+                    pre_target_error: 1.0,
+                    post_target_error: 0.0001,
+                },
+            ],
             maximum_closure_error: 0.001,
             maximum_contraction_ratio: 0.001,
         };
