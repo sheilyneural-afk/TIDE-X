@@ -2,6 +2,14 @@
 
 CEREBRO TIDE-X es un motor Rust para adquisición de evidencia, reconstrucción de subespacios de habilidad, consolidación de memoria, aprendizaje adaptativo y ejecución gobernada. Su diseño prioriza autoridad explícita, persistencia direccionada por contenido, idempotencia en rutas críticas, recuperación fail-closed y evidencia de calidad vinculada por hashes.
 
+## Estado actual del HEAD
+
+El HEAD actual incluye el banco modular de adaptadores y la ruta de adaptación de receptor: perfiles autenticados, importación PEFT LoRA en la superficie admitida, manifiestos CAS inmutables, composición determinista, índice capability/modelo, materialización de candidato, activación, revocación, rollback hacia delante y CLI `tidex receiver profile` / `tidex adapter-bank ...`.
+
+Esto es evidencia de control-plane e integridad de software. No demuestra mejora de inferencia, calidad de tarea, seguridad, latencia, rendimiento de serving, compatibilidad universal ni promoción de producción. El perfilador rechaza checkpoints sharded; el compositor admite layouts idénticos y su contrato es `ordered_f32_axes_mul_f64_accumulate_f64_round_f32/v1`, no aritmética independiente del orden ni fusión factor-native sin pérdida.
+
+La última ejecución local posterior a esta integración superó formato, Clippy con `-D warnings` y 504 pruebas de todos los targets al excluir `sleep_cycle_promotes_after_verified_evidence_and_certifies_runtime`, que el canal de ejecución no deja terminar y devolver resultado. No se marca esa prueba como aprobada. Tampoco había checkpoint `.safetensors` ni `adapter_config.json` real disponible para una evaluación E2E de modelo + LoRA; por ello no se hace ninguna afirmación de mejora de modelo.
+
 Este repositorio no declara por sí solo conformidad DO-178C, ISO 26262, ASIL D ni otra certificación normativa externa. Las puertas `P0` a `P3` son controles internos automatizados del proyecto y fijan toolchains, dependencias y snapshots para hacer sus ejecuciones repetibles bajo un entorno compatible. `P3` añade aseguramiento acotado de concurrencia y recuperación, pero tampoco constituye una prueba universal del kernel, filesystem, hardware o entorno de despliegue.
 
 ## Estado de calidad
@@ -84,7 +92,7 @@ cargo build --release --bins --offline --locked
 
 El perfil release usa `lto = "thin"`, `codegen-units = 1`, `panic = "abort"` y `strip = "symbols"`.
 
-`Cargo.toml` declara nueve binarios:
+`Cargo.toml` declara diez binarios:
 
 1. `cerebro-tidex`
 2. `acquire-system`
@@ -95,6 +103,7 @@ El perfil release usa `lto = "thin"`, `codegen-units = 1`, `panic = "abort"` y `
 7. `record-representation-evidence`
 8. `tidex-finalize`
 9. `tidex`
+10. `v67-weight-actuator-smoke` (smoke experimental; no es interfaz de operador).
 
 ## Interfaces reales de los binarios
 

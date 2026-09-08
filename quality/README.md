@@ -1,5 +1,13 @@
 # Puerta 0: aptitud de una entrega
 
+## Estado de evidencia frente al HEAD actual
+
+Los receipts P2/P3/P4 descritos en este documento son históricos y están ligados a snapshots congelados. El verificador ejecutable `quality/verify-p3-reuse.sh` rechaza el HEAD actual con `reusable_input_path_set_changed`; por tanto no se puede reutilizar esa evidencia para certificar el código actual.
+
+Para el HEAD actual se verificaron formato, Clippy con `-D warnings` y 504 pruebas de todos los targets al excluir `sleep_cycle_promotes_after_verified_evidence_and_certifies_runtime`, cuyo resultado no pudo recuperarse porque el canal de ejecución agota el tiempo antes de devolverlo. Esta evidencia no sustituye P0-P4, fuzzing, Miri, sanitizadores ni una evaluación E2E de modelo real.
+
+El banco de adaptadores y el perfilador se consideran control-plane: no acreditan mejora de inferencia, serving, seguridad de modelo ni compatibilidad universal sin una campaña reproducible de checkpoint, LoRA y evaluación held-out.
+
 `quality/gate0-release.sh` es la puerta local de entrega. Usa el toolchain
 estable fijado por `rust-toolchain.toml`, resuelve los dos grafos con sus
 `Cargo.lock` y sin red, y construye en un directorio temporal fuera del
