@@ -145,21 +145,26 @@ Estas rutas de `tidex` usan la autoridad de instalación indicada por `TIDEX_PRI
 export TIDEX_PRIVATE_ROOT=/var/lib/tidex-brain
 
 tidex receiver profile receiver-profile-input.json
+tidex receiver verify-profile receiver-profile-reference.json
+tidex receiver verify-live-profile receiver-profile-reference.json
 
 tidex adapter-bank import adapter-import.json
 tidex adapter-bank compose adapter-composition.json
+tidex adapter-bank materialize candidate-materialization.json
+tidex adapter-bank verify-materialization materialization-reference.json
 tidex adapter-bank query adapter-query.json
 tidex adapter-bank show adapter-lookup.json
 tidex adapter-bank resolve adapter-resolution.json
+tidex adapter-bank verify-resolution execution-resolution.json
 tidex adapter-bank activate adapter-activation.json
 tidex adapter-bank revoke adapter-revocation.json
 tidex adapter-bank rollback adapter-rollback.json
 tidex adapter-bank status
 ```
 
-`receiver profile` liga la identidad declarada del modelo a los hashes exactos de un checkpoint SafeTensors de un solo fichero, su `config.json`, su tokenizer y su layout físico. La superficie desconocida o no soportada falla cerrada; el perfil no constituye por sí mismo autorización de promoción.
+`receiver profile` liga la identidad declarada del modelo a los hashes exactos de un checkpoint SafeTensors de un solo fichero, su `config.json`, su tokenizer y su layout físico. `verify-profile` autentica el perfil histórico sellado en CAS; `verify-live-profile` vuelve a medir los artefactos físicos y falla si alguno ha cambiado. La superficie desconocida o no soportada falla cerrada; el perfil no constituye por sí mismo autorización de promoción.
 
-`adapter-bank import` conserva la procedencia PEFT LoRA y crea un manifiesto candidato inmutable. `compose` combina deltas compatibles con suma ordenada determinista f64→f32, sin SVD, poda ni truncamiento de rango. `query` y `show` consultan las proyecciones autenticadas por capability/modelo; `resolve` devuelve el binding activo para ejecución; `status` verifica el historial publicado. Las mutaciones llevan una expectativa de revisión para control de concurrencia. `activate` exige autorización de promoción independiente, `revoke` es persistente y transitivo sobre derivados, y `rollback` publica una nueva revisión hacia delante: no reescribe el pasado.
+`adapter-bank import` conserva la procedencia PEFT LoRA y crea un manifiesto candidato inmutable. `compose` combina deltas compatibles con suma ordenada determinista f64→f32, sin SVD, poda ni truncamiento de rango. `materialize` aplica el candidato al checkpoint autenticado; `verify-materialization` revalida su recibo sellado. `query` y `show` consultan las proyecciones autenticadas por capability/modelo; `resolve` devuelve el binding activo para ejecución y `verify-resolution` comprueba su revisión, época de fencing, autorización y materialización vigentes. `status` verifica el historial publicado. Las mutaciones llevan una expectativa de revisión para control de concurrencia. `activate` exige autorización de promoción independiente, `revoke` es persistente y transitivo sobre derivados, y `rollback` publica una nueva revisión hacia delante: no reescribe el pasado.
 
 Los ficheros JSON de entrada siguen los contratos versionados y estrictos expuestos por `model_adaptation` y `adapter_bank`; campos desconocidos se rechazan. `TIDEX_HOME` continúa siendo la autoridad de selección de workspace/modelo para `workspace`, `model`, `acquire` y `capabilities`, y no selecciona implícitamente otro banco.
 

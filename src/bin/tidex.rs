@@ -4,13 +4,17 @@ use cerebro_tidex::acquisition_contract::{
 };
 use cerebro_tidex::adapter_bank::{
     AdapterActivationRequest, AdapterBank, AdapterBankLookup, AdapterBankQuery,
-    AdapterCompositionRequest, AdapterImportRequest, AdapterResolutionRequest,
-    AdapterRevocationRequest, AdapterRollbackRequest,
+    AdapterCandidateMaterializationRequest, AdapterCompositionRequest, AdapterExecutionResolution,
+    AdapterImportRequest, AdapterResolutionRequest, AdapterRevocationRequest,
+    AdapterRollbackRequest,
 };
 use cerebro_tidex::authority::PrivateFileReference;
 use cerebro_tidex::content_vault::capture_to_vault;
 use cerebro_tidex::identity::AcquisitionId;
-use cerebro_tidex::model_adaptation::{profile_receiver_model, ReceiverModelProfileInput};
+use cerebro_tidex::model_adaptation::{
+    authenticate_live_receiver_model_profile, authenticate_receiver_model_profile,
+    profile_receiver_model, ReceiverModelProfileInput,
+};
 use cerebro_tidex::receiver_compiler::{
     benchmark_receiver_portability_leave_one_out, ReceiverPortabilityBenchmarkInput,
 };
@@ -194,6 +198,26 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let receipt = profile_receiver_model(&root, &input)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
+        [area, command, reference] if area == "receiver" && command == "verify-profile" => {
+            let root = configured_private_root()?;
+            let input: PrivateFileReference = read_json_bounded(Path::new(reference))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &authenticate_receiver_model_profile(&root, &input,)?
+                )?
+            );
+        }
+        [area, command, reference] if area == "receiver" && command == "verify-live-profile" => {
+            let root = configured_private_root()?;
+            let input: PrivateFileReference = read_json_bounded(Path::new(reference))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&authenticate_live_receiver_model_profile(
+                    &root, &input,
+                )?)?
+            );
+        }
         [area, command, path] if area == "adapter-bank" && command == "import" => {
             let root = configured_private_root()?;
             let bank = AdapterBank::open(&root)?;
@@ -210,6 +234,26 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&bank.compose_exact(&input)?)?
+            );
+        }
+        [area, command, path] if area == "adapter-bank" && command == "materialize" => {
+            let root = configured_private_root()?;
+            let bank = AdapterBank::open(&root)?;
+            let input: AdapterCandidateMaterializationRequest = read_json_bounded(Path::new(path))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&bank.materialize_candidate(&input)?)?
+            );
+        }
+        [area, command, path] if area == "adapter-bank" && command == "verify-materialization" => {
+            let root = configured_private_root()?;
+            let bank = AdapterBank::open(&root)?;
+            let input: PrivateFileReference = read_json_bounded(Path::new(path))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &bank.authenticate_candidate_materialization(&input)?,
+                )?
             );
         }
         [area, command, path] if area == "adapter-bank" && command == "query" => {
@@ -236,6 +280,14 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::to_string_pretty(&bank.resolve_active(&input)?)?
             );
         }
+        [area, command, path] if area == "adapter-bank" && command == "verify-resolution" => {
+            let root = configured_private_root()?;
+            let bank = AdapterBank::open(&root)?;
+            let input: AdapterExecutionResolution = read_json_bounded(Path::new(path))?;
+            bank.authenticate_execution_resolution(&input)?;
+            println!("{}", serde_json::to_string_pretty(&input)?);
+        }
+
         [area, command, path] if area == "adapter-bank" && command == "activate" => {
             let root = configured_private_root()?;
             let bank = AdapterBank::open(&root)?;
@@ -369,5 +421,40 @@ fn acquire_workspace(
 }
 
 fn usage() -> &'static str {
-    "usage:\n  tidex workspace create <name> --target <absolute-path>\n  tidex workspace use <name>\n  tidex workspace show\n  tidex model add <name> --provider openai-compatible --url <endpoint> --model <model>\n  tidex model use <name>\n  tidex acquire [--path <relative-project-path>]\n  tidex benchmark portability <input.json>\n  tidex benchmark response <input.json>\n  tidex benchmark receiver-basis <input.json>\n  tidex receiver describe-readout <input.json>\n  tidex receiver acquire-readout <input.json>\n  tidex receiver import-axis <values-reference.json>\n  tidex receiver import-lora-axis <input.json>\n  tidex receiver profile <input.json>\n  tidex receiver assemble-lora-basis <input.json>\n  tidex receiver compile <request-reference.json>\n  tidex receiver inspect <candidate-reference.json>\n  tidex receiver materialize <candidate-reference.json> --base-model <model.safetensors> --output <private-root/model.safetensors>\n  tidex adapter-bank import <input.json>\n  tidex adapter-bank compose <input.json>\n  tidex adapter-bank query <query.json>\n  tidex adapter-bank show <lookup.json>\n  tidex adapter-bank resolve <input.json>\n  tidex adapter-bank activate <input.json>\n  tidex adapter-bank revoke <input.json>\n  tidex adapter-bank rollback <input.json>\n  tidex adapter-bank status\n  tidex capabilities"
+    concat!(
+        "usage:\n",
+        "  tidex workspace create <name> --target <absolute-path>\n",
+        "  tidex workspace use <name>\n",
+        "  tidex workspace show\n",
+        "  tidex model add <name> --provider openai-compatible --url <endpoint> --model <model>\n",
+        "  tidex model use <name>\n",
+        "  tidex acquire [--path <relative-project-path>]\n",
+        "  tidex benchmark portability <input.json>\n",
+        "  tidex benchmark response <input.json>\n",
+        "  tidex benchmark receiver-basis <input.json>\n",
+        "  tidex receiver describe-readout <input.json>\n",
+        "  tidex receiver acquire-readout <input.json>\n",
+        "  tidex receiver import-axis <values-reference.json>\n",
+        "  tidex receiver import-lora-axis <input.json>\n",
+        "  tidex receiver profile <input.json>\n",
+        "  tidex receiver verify-profile <reference.json>\n",
+        "  tidex receiver verify-live-profile <reference.json>\n",
+        "  tidex receiver assemble-lora-basis <input.json>\n",
+        "  tidex receiver compile <request-reference.json>\n",
+        "  tidex receiver inspect <candidate-reference.json>\n",
+        "  tidex receiver materialize <candidate-reference.json> --base-model <model.safetensors> --output <private-root/model.safetensors>\n",
+        "  tidex adapter-bank import <input.json>\n",
+        "  tidex adapter-bank compose <input.json>\n",
+        "  tidex adapter-bank materialize <input.json>\n",
+        "  tidex adapter-bank verify-materialization <reference.json>\n",
+        "  tidex adapter-bank query <query.json>\n",
+        "  tidex adapter-bank show <lookup.json>\n",
+        "  tidex adapter-bank resolve <input.json>\n",
+        "  tidex adapter-bank verify-resolution <resolution.json>\n",
+        "  tidex adapter-bank activate <input.json>\n",
+        "  tidex adapter-bank revoke <input.json>\n",
+        "  tidex adapter-bank rollback <input.json>\n",
+        "  tidex adapter-bank status\n",
+        "  tidex capabilities"
+    )
 }

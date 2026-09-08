@@ -1,5 +1,50 @@
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
+
+fn write_minimal_receiver_checkpoint(path: &Path) {
+    let tensors = [
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            [1.0_f32, 2.0, 3.0, 4.0],
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            [-1.0_f32, -2.0, -3.0, -4.0],
+        ),
+    ];
+    let mut data = Vec::new();
+    let mut header = serde_json::Map::new();
+    header.insert(
+        "__metadata__".to_string(),
+        serde_json::json!({"format":"pt"}),
+    );
+    for (name, values) in tensors {
+        let start = data.len();
+        for value in values {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        header.insert(
+            name.to_string(),
+            serde_json::json!({
+                "dtype":"F32",
+                "shape":[2,2],
+                "data_offsets":[start,data.len()]
+            }),
+        );
+    }
+    let mut header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+    let padding = (8 - header.len() % 8) % 8;
+    header.extend(std::iter::repeat_n(b' ', padding));
+    let mut output = std::fs::File::create(path).unwrap();
+    output
+        .write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    output.write_all(&header).unwrap();
+    output.write_all(&data).unwrap();
+    output.sync_all().unwrap();
+}
 
 #[test]
 fn primary_cli_rejects_unguarded_mutation_commands_before_opening_state() {
@@ -33,14 +78,19 @@ fn primary_cli_rejects_unguarded_mutation_commands_before_opening_state() {
 }
 
 #[test]
-fn tidex_adapter_bank_invalid_routes_fail_before_opening_private_state() {
+fn tidex_invalid_guarded_routes_fail_before_opening_private_state() {
     let executable = env!("CARGO_BIN_EXE_tidex");
     let routes: &[&[&str]] = &[
         &["adapter-bank"],
         &["adapter-bank", "import"],
         &["adapter-bank", "unknown", "/tmp/input.json"],
         &["adapter-bank", "status", "extra"],
+        &["adapter-bank", "materialize"],
+        &["adapter-bank", "verify-materialization"],
+        &["adapter-bank", "verify-resolution"],
         &["receiver", "profile"],
+        &["receiver", "verify-profile"],
+        &["receiver", "verify-live-profile"],
     ];
     for route in routes {
         let output = Command::new(executable)
@@ -55,6 +105,18 @@ fn tidex_adapter_bank_invalid_routes_fail_before_opening_private_state() {
             stderr.contains("usage:"),
             "route={route:?}, stderr={stderr}"
         );
+        for command in [
+            "receiver verify-profile",
+            "receiver verify-live-profile",
+            "adapter-bank materialize",
+            "adapter-bank verify-materialization",
+            "adapter-bank verify-resolution",
+        ] {
+            assert!(
+                stderr.contains(command),
+                "command={command}, stderr={stderr}"
+            );
+        }
         assert!(!stderr.contains("private_root"), "route={route:?}");
     }
 }
@@ -88,6 +150,120 @@ fn tidex_adapter_bank_status_is_valid_on_an_empty_private_authority() {
     assert_eq!(status["registered_adapter_count"], 0);
     assert_eq!(status["active_adapter_count"], 0);
     assert_eq!(status["revoked_adapter_count"], 0);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tidex_profiles_and_reauthenticates_a_physical_receiver_through_the_cli() {
+    let executable = env!("CARGO_BIN_EXE_tidex");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("test-tidex-profile-cli-{unique}"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let checkpoint = root.join("model.safetensors");
+    let config = root.join("config.json");
+    let tokenizer = root.join("tokenizer.json");
+    let request = root.join("profile-request.json");
+    let reference = root.join("profile-reference.json");
+    write_minimal_receiver_checkpoint(&checkpoint);
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "model_type":"tidex-test",
+            "architectures":["TidexForCausalLM"],
+            "num_hidden_layers":1,
+            "hidden_size":2,
+            "vocab_size":8,
+            "max_position_embeddings":128,
+            "tie_word_embeddings":false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &tokenizer,
+        serde_json::to_vec(&serde_json::json!({
+            "version":"1.0",
+            "model":{"type":"test"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &request,
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"cerebro.tidex.receiver_model_profile_input/v1",
+            "model_id":"receiver.cli-test",
+            "architecture_id":"tidex.cli-test",
+            "checkpoint_path":checkpoint,
+            "config_path":config,
+            "tokenizer_path":tokenizer
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let profiled = Command::new(executable)
+        .args(["receiver", "profile"])
+        .arg(&request)
+        .env("TIDEX_PRIVATE_ROOT", &root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        profiled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&profiled.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&profiled.stdout).unwrap();
+    assert_eq!(
+        receipt["schema"],
+        "cerebro.tidex.receiver_model_profile_receipt/v1"
+    );
+    std::fs::write(
+        &reference,
+        serde_json::to_vec(&receipt["profile_reference"]).unwrap(),
+    )
+    .unwrap();
+
+    for command in ["verify-profile", "verify-live-profile"] {
+        let verified = Command::new(executable)
+            .args(["receiver", command])
+            .arg(&reference)
+            .env("TIDEX_PRIVATE_ROOT", &root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            verified.status.code(),
+            Some(0),
+            "command={command}, stderr={}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        let profile: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+        assert_eq!(profile["model_id"], "receiver.cli-test");
+    }
+
+    std::fs::write(&config, b"{}").unwrap();
+    let static_check = Command::new(executable)
+        .args(["receiver", "verify-profile"])
+        .arg(&reference)
+        .env("TIDEX_PRIVATE_ROOT", &root)
+        .output()
+        .unwrap();
+    assert_eq!(static_check.status.code(), Some(0));
+    let live_check = Command::new(executable)
+        .args(["receiver", "verify-live-profile"])
+        .arg(&reference)
+        .env("TIDEX_PRIVATE_ROOT", &root)
+        .output()
+        .unwrap();
+    assert_eq!(live_check.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&live_check.stderr)
+        .contains("receiver_model_profile_source_changed"));
 
     std::fs::remove_dir_all(root).unwrap();
 }
