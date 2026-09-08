@@ -517,6 +517,8 @@ pub struct AdapterExecutionResolution {
     pub manifest: PrivateFileReference,
     pub authorization: PrivateFileReference,
     pub execution_binding: AdapterExecutionBinding,
+    #[serde(default)]
+    pub materialized_candidate: Option<AdapterCandidateMaterialization>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2872,7 +2874,14 @@ impl AdapterBank {
             .ok_or_else(|| invalid("adapter_resolution_not_active"))?;
         let manifest = self.authenticate_manifest(&selection.manifest)?;
         authenticate_live_receiver_model_profile(&self.root, &manifest.receiver_profile)?;
-        self.authenticate_promotion_authorization(&selection.authorization)?;
+        let authorization = self.authenticate_promotion_authorization(&selection.authorization)?;
+        let materialized_candidate = if authorization.governed {
+            Some(self.authenticate_candidate_materialization(
+                &authorization.evidence.materialization_receipt,
+            )?)
+        } else {
+            None
+        };
         Ok(AdapterExecutionResolution {
             schema: ADAPTER_EXECUTION_RESOLUTION_SCHEMA.to_string(),
             bank_revision: snapshot.revision,
@@ -2882,6 +2891,7 @@ impl AdapterBank {
             manifest: selection.manifest.clone(),
             authorization: selection.authorization.clone(),
             execution_binding: selection.execution_binding.clone(),
+            materialized_candidate,
         })
     }
 
@@ -3563,6 +3573,7 @@ mod tests {
         assert_eq!(resolution.adapter.adapter_id.as_str(), "adapter-a");
         assert_eq!(resolution.bank_revision, 5);
         assert_eq!(resolution.execution_binding.activation_epoch, 5);
+        assert!(resolution.materialized_candidate.is_none());
         bank.authenticate_execution_resolution(&resolution).unwrap();
 
         let revoked = bank
