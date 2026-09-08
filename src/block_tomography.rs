@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::security::verify_private_root;
+use crate::security::{verify_internal_private_root, verify_private_root};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -213,6 +213,12 @@ impl ParameterLayoutAuthority {
     pub fn open(root: impl AsRef<Path>) -> BrainResult<Self> {
         Ok(Self {
             root: verify_private_root(root.as_ref())?,
+        })
+    }
+
+    pub(crate) fn for_internal_root(root: &Path) -> BrainResult<Self> {
+        Ok(Self {
+            root: verify_internal_private_root(root)?,
         })
     }
 

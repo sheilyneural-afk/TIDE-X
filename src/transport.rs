@@ -1,7 +1,58 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::error::{BrainError, BrainResult};
-use crate::linalg::{cosine, dot, norm, normalize, solve, weighted_normal_solve, Matrix};
+use crate::linalg::{
+    compensated_sum, cosine, dot, norm, normalize, solve, stable_rms, weighted_normal_solve, Matrix,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AffineTransportPolicy {
+    /// Original affine solve, including its penalized intercept.
+    FixedRidge { ridge: f64 },
+    /// Center within each training partition and regularize with
+    /// lambda = relative_ridge * trace(X_centered^T X_centered) / input_dimension.
+    /// The fitted intercept is not penalized.
+    CenteredTraceRidge { relative_ridge: f64 },
+}
+
+impl AffineTransportPolicy {
+    pub fn validate(&self) -> BrainResult<()> {
+        let strength = match self {
+            Self::FixedRidge { ridge } => *ridge,
+            Self::CenteredTraceRidge { relative_ridge } => *relative_ridge,
+        };
+        if !strength.is_finite() || strength <= 0.0 {
+            return Err(BrainError::Invalid(
+                "transport_regularization_policy_invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AffineFitDiagnostics {
+    pub training_count: usize,
+    pub input_dimension: usize,
+    pub centered: bool,
+    pub centered_design_trace: Option<f64>,
+    pub regularization_scale: f64,
+    pub effective_ridge: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AffineTransportDiagnostics {
+    pub schema: String,
+    pub policy: AffineTransportPolicy,
+    pub full_fit: AffineFitDiagnostics,
+    /// Entry i was fitted without source[i] or target[i]. Its means, design
+    /// scale and effective ridge are derived anew from that training partition.
+    pub leave_one_out: Vec<AffineFitDiagnostics>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransportMap {
@@ -110,6 +161,130 @@ fn fit_affine(source: &[Vec<f64>], target: &[Vec<f64>], ridge: f64) -> BrainResu
     })
 }
 
+fn fit_affine_with_policy(
+    source: &[Vec<f64>],
+    target: &[Vec<f64>],
+    policy: &AffineTransportPolicy,
+) -> BrainResult<(TransportMap, AffineFitDiagnostics)> {
+    policy.validate()?;
+    let relative_ridge = match policy {
+        AffineTransportPolicy::FixedRidge { ridge } => {
+            let map = fit_affine(source, target, *ridge)?;
+            let diagnostics = AffineFitDiagnostics {
+                training_count: source.len(),
+                input_dimension: map.source_dim,
+                centered: false,
+                centered_design_trace: None,
+                regularization_scale: 1.0,
+                effective_ridge: *ridge,
+            };
+            return Ok((map, diagnostics));
+        }
+        AffineTransportPolicy::CenteredTraceRidge { relative_ridge } => *relative_ridge,
+    };
+    if source.len() != target.len() {
+        return Err(BrainError::Invalid("transport_anchor_count".into()));
+    }
+    let source_dim = validate_rows(source, 3, "transport_source")?;
+    let target_dim = validate_rows(target, 3, "transport_target")?;
+    let count = source.len() as f64;
+    let means = |rows: &[Vec<f64>], dimension: usize| -> BrainResult<Vec<f64>> {
+        (0..dimension)
+            .map(|column| compensated_sum(rows.iter().map(|row| row[column] / count)))
+            .collect()
+    };
+    let source_mean = means(source, source_dim)?;
+    let target_mean = means(target, target_dim)?;
+    let centered = source
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(&source_mean)
+                .map(|(x, mean)| x - mean)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // Solve in global unit coordinates to avoid the absolute pivot floor of
+    // the existing solver when the same data is expressed in very small units.
+    // This is algebraically the declared trace-scaled ridge, not a new solver.
+    let unit_scale = stable_rms(centered.iter().flatten().copied())? * count.sqrt();
+    let regularization_scale = unit_scale * unit_scale;
+    let centered_design_trace = regularization_scale * source_dim as f64;
+    let effective_ridge = relative_ridge * regularization_scale;
+    if !unit_scale.is_finite()
+        || unit_scale <= 0.0
+        || !regularization_scale.is_finite()
+        || regularization_scale <= 0.0
+        || !centered_design_trace.is_finite()
+        || !effective_ridge.is_finite()
+        || effective_ridge <= 0.0
+    {
+        return Err(BrainError::Numerical(
+            "transport_centered_design_degenerate".into(),
+        ));
+    }
+    let normalized_rows = centered
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| value / unit_scale)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let design = Matrix::from_rows(&normalized_rows)?;
+    let row_weights = vec![1.0; source.len()];
+    let mut weights = Matrix::zeros(target_dim, source_dim);
+    let mut bias = vec![0.0; target_dim];
+    for output in 0..target_dim {
+        let centered_target = target
+            .iter()
+            .map(|row| row[output] - target_mean[output])
+            .collect::<Vec<_>>();
+        let beta = weighted_normal_solve(&design, &centered_target, &row_weights, relative_ridge)?;
+        for input in 0..source_dim {
+            weights.set(output, input, beta[input] / unit_scale);
+        }
+        bias[output] = target_mean[output] - dot(weights.row(output), &source_mean)?;
+    }
+    weights.validate("transport_centered_weights")?;
+    if bias.iter().any(|value| !value.is_finite()) {
+        return Err(BrainError::Numerical(
+            "transport_centered_bias_nonfinite".into(),
+        ));
+    }
+    let mut map = TransportMap {
+        source_dim,
+        target_dim,
+        weights,
+        bias,
+        training_rms: 0.0,
+    };
+    let residuals = source
+        .iter()
+        .zip(target)
+        .map(|(input, actual)| {
+            let predicted = map.apply(input)?;
+            Ok(predicted
+                .iter()
+                .zip(actual)
+                .map(|(prediction, value)| prediction - value)
+                .collect::<Vec<_>>())
+        })
+        .collect::<BrainResult<Vec<_>>>()?;
+    map.training_rms = stable_rms(residuals.iter().flatten().copied())?;
+    Ok((
+        map,
+        AffineFitDiagnostics {
+            training_count: source.len(),
+            input_dimension: source_dim,
+            centered: true,
+            centered_design_trace: Some(centered_design_trace),
+            regularization_scale,
+            effective_ridge,
+        },
+    ))
+}
+
 /// Backwards-compatible generation transport, now affine rather than forced
 /// through the origin. Use `learn_transport_validated` before promotion.
 pub fn learn_transport(
@@ -198,10 +373,18 @@ pub fn learn_transport_validated(
     }
     let map = fit_affine(source, target, ridge)?;
     let predicted = leave_one_out_predictions(source, target, ridge)?;
-    let loo_cv_r2 = global_r2(target, &predicted)?;
+    validated_from_predictions(map, target, &predicted)
+}
+
+fn validated_from_predictions(
+    map: TransportMap,
+    target: &[Vec<f64>],
+    predicted: &[Vec<f64>],
+) -> BrainResult<ValidatedTransportMap> {
+    let loo_cv_r2 = global_r2(target, predicted)?;
     let squared_error = target
         .iter()
-        .zip(&predicted)
+        .zip(predicted)
         .flat_map(|(actual, prediction)| {
             actual
                 .iter()
@@ -212,7 +395,7 @@ pub fn learn_transport_validated(
     let loo_cv_rms = (squared_error / (target.len() * target[0].len()) as f64).sqrt();
     let cosines = target
         .iter()
-        .zip(&predicted)
+        .zip(predicted)
         .map(|(actual, prediction)| cosine(actual, prediction))
         .collect::<BrainResult<Vec<_>>>()?;
     let mean_loo_cosine = cosines.iter().sum::<f64>() / cosines.len() as f64;
@@ -221,13 +404,102 @@ pub fn learn_transport_validated(
     Ok(ValidatedTransportMap {
         schema: "cerebro.tidex.validated_transport/v1".into(),
         map,
-        anchor_count: source.len(),
+        anchor_count: target.len(),
         loo_cv_r2,
         loo_cv_rms,
         mean_loo_cosine,
         min_loo_cosine,
         resolved,
     })
+}
+
+fn leave_one_out_with_policy(
+    source: &[Vec<f64>],
+    target: &[Vec<f64>],
+    policy: &AffineTransportPolicy,
+) -> BrainResult<(Vec<Vec<f64>>, Vec<AffineFitDiagnostics>)> {
+    if source.len() != target.len() || source.len() < 4 {
+        return Err(BrainError::Invalid("transport_cv_anchor_count".into()));
+    }
+    let mut predictions = Vec::with_capacity(source.len());
+    let mut diagnostics = Vec::with_capacity(source.len());
+    for holdout in 0..source.len() {
+        let train_source = source
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != holdout)
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
+        let train_target = target
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != holdout)
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
+        let (map, fit) = fit_affine_with_policy(&train_source, &train_target, policy)?;
+        predictions.push(map.apply(&source[holdout])?);
+        diagnostics.push(fit);
+    }
+    Ok((predictions, diagnostics))
+}
+
+/// Explicit policy entry point. Existing callers of learn_transport_validated
+/// retain the original fixed-ridge implementation. Numerical stabilization is
+/// not evidence of semantic generalization: the same held-out gates still apply.
+pub fn learn_transport_validated_with_policy(
+    source: &[Vec<f64>],
+    target: &[Vec<f64>],
+    policy: &AffineTransportPolicy,
+) -> BrainResult<(ValidatedTransportMap, AffineTransportDiagnostics)> {
+    if source.len() != target.len() || source.len() < 4 {
+        return Err(BrainError::Invalid("transport_cv_anchor_count".into()));
+    }
+    let (map, full_fit) = fit_affine_with_policy(source, target, policy)?;
+    let (predictions, leave_one_out) = leave_one_out_with_policy(source, target, policy)?;
+    Ok((
+        validated_from_predictions(map, target, &predictions)?,
+        AffineTransportDiagnostics {
+            schema: "cerebro.tidex.affine_transport_diagnostics/v1".into(),
+            policy: policy.clone(),
+            full_fit,
+            leave_one_out,
+        },
+    ))
+}
+
+/// Functional-signature to receiver-coordinate compilation using an explicitly
+/// selected affine policy. No target update or target training data is accepted.
+pub fn learn_functional_transplant_with_policy(
+    functional_anchors: &[Vec<f64>],
+    target_capability_anchors: &[Vec<f64>],
+    policy: &AffineTransportPolicy,
+) -> BrainResult<(FunctionalTransplantMap, AffineTransportDiagnostics)> {
+    if functional_anchors.len() != target_capability_anchors.len() || functional_anchors.len() < 4 {
+        return Err(BrainError::Invalid(
+            "functional_transplant_anchor_count".into(),
+        ));
+    }
+    let functional_dim = validate_rows(functional_anchors, 4, "functional_transplant_function")?;
+    let target_dim = validate_rows(target_capability_anchors, 4, "functional_transplant_target")?;
+    let (validated, diagnostics) = learn_transport_validated_with_policy(
+        functional_anchors,
+        target_capability_anchors,
+        policy,
+    )?;
+    Ok((
+        FunctionalTransplantMap {
+            schema: "cerebro.tidex.functional_transplant/v1".into(),
+            functional_dim,
+            target_dim,
+            target_decoder: validated.map,
+            anchor_count: validated.anchor_count,
+            loo_cv_r2: validated.loo_cv_r2,
+            mean_loo_cosine: validated.mean_loo_cosine,
+            min_loo_cosine: validated.min_loo_cosine,
+            resolved: validated.resolved,
+        },
+        diagnostics,
+    ))
 }
 
 /// Functional transplantation does not require source and target parameter
@@ -518,6 +790,163 @@ impl RelationalTransportMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn centered_trace_ridge_preserves_source_units_and_affine_origins() {
+        let source = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+            vec![2.0, -1.0],
+            vec![-1.0, 2.0],
+            vec![0.5, 2.0],
+        ];
+        let target = source
+            .iter()
+            .map(|row| {
+                vec![
+                    10.0 + 2.0 * row[0] - row[1],
+                    6.0 + 0.5 * row[0] + 3.0 * row[1],
+                ]
+            })
+            .collect::<Vec<_>>();
+        let policy = AffineTransportPolicy::CenteredTraceRidge {
+            relative_ridge: 0.2,
+        };
+        let (reference, reference_diagnostics) =
+            learn_transport_validated_with_policy(&source, &target, &policy).unwrap();
+        let query = [0.25, 0.75];
+        let expected = reference.map.apply(&query).unwrap();
+        for scale in [1e-6, 1.0, 1e6] {
+            let source_offset = [3.0 * scale, -7.0 * scale];
+            let target_offset = [25.0, -12.0];
+            let changed_source = source
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(i, value)| scale * value + source_offset[i])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let changed_target = target
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(i, value)| value + target_offset[i])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let (changed, diagnostics) =
+                learn_transport_validated_with_policy(&changed_source, &changed_target, &policy)
+                    .unwrap();
+            let actual = changed
+                .map
+                .apply(&[
+                    scale * query[0] + source_offset[0],
+                    scale * query[1] + source_offset[1],
+                ])
+                .unwrap();
+            for output in 0..expected.len() {
+                assert!((actual[output] - target_offset[output] - expected[output]).abs() < 1e-9);
+            }
+            let expected_ridge = reference_diagnostics.full_fit.effective_ridge * scale * scale;
+            assert!((diagnostics.full_fit.effective_ridge / expected_ridge - 1.0).abs() < 1e-12);
+            assert!((changed.loo_cv_r2 - reference.loo_cv_r2).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn trace_ridge_loo_refits_mean_and_scale_without_holdout_values() {
+        let policy = AffineTransportPolicy::CenteredTraceRidge {
+            relative_ridge: 0.5,
+        };
+        let mut source = vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0], vec![1000.0]];
+        let mut target = vec![vec![3.0], vec![5.0], vec![7.0], vec![9.0], vec![-777.0]];
+        let (predicted, diagnostics) =
+            leave_one_out_with_policy(&source, &target, &policy).unwrap();
+        // Independent closed form from the four training rows:
+        // mean_x=1.5, mean_y=6, sum(x-mean_x)^2=5,
+        // slope=(2*5)/(5+0.5*5), bias=6-slope*1.5.
+        let slope = 10.0 / 7.5;
+        let expected = 6.0 + slope * (1000.0 - 1.5);
+        assert!((predicted[4][0] - expected).abs() < 1e-10);
+        assert_eq!(diagnostics[4].training_count, 4);
+        assert!((diagnostics[4].regularization_scale - 5.0).abs() < 1e-12);
+        assert!((diagnostics[4].effective_ridge - 2.5).abs() < 1e-12);
+        target[4][0] = 1e9;
+        let (changed, changed_diagnostics) =
+            leave_one_out_with_policy(&source, &target, &policy).unwrap();
+        assert_eq!(predicted[4], changed[4]);
+        assert_eq!(diagnostics[4], changed_diagnostics[4]);
+        source[4][0] = 1e6;
+        let (changed, changed_diagnostics) =
+            leave_one_out_with_policy(&source, &target, &policy).unwrap();
+        assert!((changed[4][0] - (6.0 + slope * (1e6 - 1.5))).abs() < 1e-8);
+        assert_eq!(diagnostics[4], changed_diagnostics[4]);
+    }
+
+    #[test]
+    fn explicit_fixed_policy_preserves_legacy_maps_and_diagnostics_are_honest() {
+        let source = vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0]];
+        let target = vec![vec![3.0], vec![5.0], vec![7.0], vec![9.0], vec![11.0]];
+        let policy = AffineTransportPolicy::FixedRidge { ridge: 0.75 };
+        let old = learn_transport_validated(&source, &target, 0.75).unwrap();
+        let (new, diagnostics) =
+            learn_transport_validated_with_policy(&source, &target, &policy).unwrap();
+        assert_eq!(old, new);
+        assert!(!diagnostics.full_fit.centered);
+        assert_eq!(diagnostics.full_fit.centered_design_trace, None);
+        assert!(diagnostics
+            .leave_one_out
+            .iter()
+            .all(|fit| fit.effective_ridge == 0.75));
+        let old = learn_functional_transplant(&source, &target, 0.75).unwrap();
+        let (new, _) = learn_functional_transplant_with_policy(&source, &target, &policy).unwrap();
+        assert_eq!(old, new);
+    }
+
+    #[test]
+    fn centered_trace_ridge_rejects_unidentified_design_in_full_fit_or_any_fold() {
+        let policy = AffineTransportPolicy::CenteredTraceRidge {
+            relative_ridge: 0.5,
+        };
+        let target = vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]];
+        let constant = vec![vec![2.0, -3.0]; 4];
+        let error = learn_transport_validated_with_policy(&constant, &target, &policy).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("transport_centered_design_degenerate"));
+        let single_excitation = vec![vec![0.0], vec![0.0], vec![0.0], vec![1.0]];
+        let error = learn_transport_validated_with_policy(&single_excitation, &target, &policy)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("transport_centered_design_degenerate"));
+        let source = vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0]];
+        for relative_ridge in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let invalid = AffineTransportPolicy::CenteredTraceRidge { relative_ridge };
+            assert!(learn_transport_validated_with_policy(&source, &target, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn centered_trace_ridge_does_not_penalize_the_intercept_or_claim_constant_targets_resolved() {
+        let source = vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0], vec![4.0]];
+        let target = vec![vec![7.0, -2.0]; source.len()];
+        let policy = AffineTransportPolicy::CenteredTraceRidge {
+            relative_ridge: 100.0,
+        };
+        let (fit, _) = learn_transport_validated_with_policy(&source, &target, &policy).unwrap();
+        assert_eq!(fit.map.apply(&[50.0]).unwrap(), vec![7.0, -2.0]);
+        assert_eq!(fit.map.training_rms, 0.0);
+        assert_eq!(fit.loo_cv_r2, 0.0);
+        assert!(!fit.resolved);
+        let policy_json =
+            r#"{"kind":"centered_trace_ridge","relative_ridge":1.0,"hidden_fallback":true}"#;
+        assert!(serde_json::from_str::<AffineTransportPolicy>(policy_json).is_err());
+    }
 
     #[test]
     fn relational_transport_validates_geometry_and_rejects_ood_query() {

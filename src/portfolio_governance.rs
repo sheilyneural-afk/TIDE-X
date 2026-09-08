@@ -3698,6 +3698,72 @@ struct CanaryStateDraft {
     last_observation_end_tick: Option<u64>,
 }
 
+/// Authenticates the complete governance chain required before an adapter can
+/// be considered for promotion. The caller still owns persistence,
+/// materialization, authorization and activation; this function only proves
+/// that the supplied sealed witnesses form one eligible, independent chain.
+pub(crate) fn authenticate_adapter_promotion_witnesses(
+    expected_candidate: &VariantId,
+    gate: &CandidateGateDecision,
+    petfc: &PetfcAssessment,
+    canary: &CanaryState,
+) -> BrainResult<()> {
+    gate.authenticate()?;
+    petfc.authenticate()?;
+    canary.authenticate()?;
+
+    if &gate.candidate_id != expected_candidate
+        || &petfc.candidate_id != expected_candidate
+        || &canary.candidate_id != expected_candidate
+        || gate.baseline_id != petfc.baseline_id
+        || gate.baseline_id != canary.baseline_id
+        || gate.metric_catalog_digest != petfc.metric_catalog_digest
+        || gate.evaluation_policy_digest != petfc.evaluation_policy_digest
+        || gate.evaluation_policy_digest != canary.evaluation_policy_digest
+        || gate.independence_design_digest != petfc.independence_design_digest
+        || gate.decision_digest != canary.gate_digest
+    {
+        return Err(integrity("adapter_promotion_governance_binding_mismatch"));
+    }
+
+    if gate.disposition != CandidateGateDisposition::AdvanceCandidate
+        || petfc.disposition != PetfcDisposition::CompatibleForNextGate
+        || canary.phase != CanaryPhase::CandidateValidated
+        || canary.last_disposition != Some(CanaryStageDisposition::CandidateValidated)
+        || !gate.reasons.is_empty()
+        || !petfc.reasons.is_empty()
+        || !canary.last_reasons.is_empty()
+    {
+        return Err(integrity("adapter_promotion_governance_not_approved"));
+    }
+
+    // Enforce a strict evidence chronology: PETFC trajectory, offline gate,
+    // then fresh canary stages. This prevents one observation from satisfying
+    // multiple authorities under different labels.
+    if gate.source_evidence_ids.is_empty()
+        || petfc.trajectory_evidence_ids.is_empty()
+        || canary.evaluated_reports.is_empty()
+        || !gate
+            .source_evidence_ids
+            .is_disjoint(&petfc.trajectory_evidence_ids)
+        || !petfc
+            .trajectory_evidence_ids
+            .is_disjoint(&canary.evaluated_evidence_ids)
+        || !canary
+            .evaluated_evidence_ids
+            .is_superset(&gate.source_evidence_ids)
+        || canary.evaluated_evidence_ids.len() <= gate.source_evidence_ids.len()
+        || petfc.trajectory_observation_window.end_tick >= gate.source_observation_window.start_tick
+        || canary
+            .last_observation_end_tick
+            .is_none_or(|end| end <= gate.source_observation_window.end_tick)
+    {
+        return Err(integrity("adapter_promotion_governance_evidence_invalid"));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4430,6 +4496,103 @@ mod tests {
             ]),
         )
         .unwrap()
+    }
+
+    fn validated_canary(specs: &[MetricSpec], gate: &CandidateGateDecision) -> CanaryState {
+        let policy = canary_policy(specs);
+        let first_tick = gate.source_observation_window.end_tick + 10;
+        let first = report_with_rows(
+            specs,
+            gate.baseline_id.as_str(),
+            gate.candidate_id.as_str(),
+            first_tick,
+            &constant_rows(3, 0.2, 0.7, 0.8, 0.3),
+            3,
+        );
+        let state = CanaryState::start(gate, &policy)
+            .unwrap()
+            .evaluate_stage(specs, &first, &policy)
+            .unwrap();
+        let second = report_with_rows(
+            specs,
+            gate.baseline_id.as_str(),
+            gate.candidate_id.as_str(),
+            first_tick + 10,
+            &constant_rows(4, 0.2, 0.7, 0.8, 0.3),
+            3,
+        );
+        state.evaluate_stage(specs, &second, &policy).unwrap()
+    }
+
+    #[test]
+    fn adapter_promotion_witnesses_accept_one_fully_bound_chain() {
+        let specs = default_specs();
+        let (gate, petfc) = eligible_candidate("candidate", 0.7, 0.3, 100);
+        let canary = validated_canary(&specs, &gate);
+
+        authenticate_adapter_promotion_witnesses(&variant("candidate"), &gate, &petfc, &canary)
+            .unwrap();
+    }
+
+    #[test]
+    fn adapter_promotion_witnesses_reject_wrong_candidate_or_pending_canary() {
+        let specs = default_specs();
+        let (gate, petfc) = eligible_candidate("candidate", 0.7, 0.3, 100);
+        let policy = canary_policy(&specs);
+        let pending = CanaryState::start(&gate, &policy).unwrap();
+
+        assert!(authenticate_adapter_promotion_witnesses(
+            &variant("different-candidate"),
+            &gate,
+            &petfc,
+            &pending,
+        )
+        .is_err());
+        assert!(authenticate_adapter_promotion_witnesses(
+            &variant("candidate"),
+            &gate,
+            &petfc,
+            &pending,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn adapter_promotion_witnesses_reject_incoherent_evaluation_design() {
+        let specs = default_specs();
+        let (gate, _) = eligible_candidate("candidate", 0.7, 0.3, 100);
+        let petfc_policy = petfc_policy(&specs);
+        let first = report_with_rows(
+            &specs,
+            "baseline",
+            "candidate-middle",
+            100,
+            &constant_rows(4, 0.2, 0.4, 0.8, 0.6),
+            4,
+        );
+        let second = report_with_rows(
+            &specs,
+            "baseline",
+            "candidate",
+            110,
+            &constant_rows(4, 0.2, 0.7, 0.8, 0.3),
+            4,
+        );
+        let trajectory = PetfcTrajectory::start(&first, &petfc_policy)
+            .unwrap()
+            .append_report(&second)
+            .unwrap();
+        let petfc = evaluate_petfc(&specs, &trajectory, &petfc_policy).unwrap();
+        let canary = validated_canary(&specs, &gate);
+
+        assert_eq!(petfc.disposition(), PetfcDisposition::CompatibleForNextGate);
+        assert!(authenticate_adapter_promotion_witnesses(
+            &variant("candidate"),
+            &gate,
+            &petfc,
+            &canary,
+        )
+        .is_err());
     }
 
     #[test]

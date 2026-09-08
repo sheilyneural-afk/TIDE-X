@@ -652,6 +652,141 @@ impl CapabilityIr {
     }
 }
 
+/// Execution result for the bounded scalar linear readout already represented
+/// by the pure-capability discovery profile. This proves the declared
+/// readout's arithmetic on supplied activations, not a model's general
+/// capability, an independently attested observation, or promotion.
+///
+/// The caller authenticates the parameter values and activation provenance.
+/// Structural IR intentionally contains parameter slots rather than weights.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LinearReadoutExecution {
+    pub schema: String,
+    pub capability_ir_sha256: CapabilityIrDigest,
+    pub operator_node_id: CapabilityNodeId,
+    pub parameter_port_id: PortId,
+    pub input_dimension: usize,
+    pub row_count: usize,
+    pub weights_sha256: Sha256Digest,
+    pub inputs_sha256: Sha256Digest,
+    pub raw_margins: Vec<f64>,
+    pub execution_arithmetic: String,
+    pub candidate_only: bool,
+}
+
+/// Execute the scalar-output specialization of the existing authenticated
+/// linear-map IR. There is exactly one runtime tensor [d, 1], one resident
+/// parameter tensor [1, d], one matmul(parameter, input), and its single [1, 1]
+/// public output. Names come from the actual graph; no new IR constructor or
+/// donor-supplied executable vocabulary is introduced.
+///
+/// Parameters must have been authenticated by the caller against the acquired
+/// descriptor/model. The returned value digests bind exactly what this call
+/// consumed, without implying that the structural IR itself contains weights.
+pub fn execute_linear_readout(
+    ir: &CapabilityIr,
+    envelope: &SystemEnvelope,
+    weights: &[f64],
+    inputs: &[Vec<f64>],
+) -> BrainResult<LinearReadoutExecution> {
+    const MAX_READOUT_DIMENSION: usize = 4_096;
+    const MAX_READOUT_ROWS: usize = 128;
+    const MAX_READOUT_WORK: usize = MAX_READOUT_DIMENSION * MAX_READOUT_ROWS;
+
+    ir.validate_against(envelope)?;
+    if ir.inputs.len() != 1
+        || ir.parameters.len() != 1
+        || ir.nodes.len() != 1
+        || ir.outputs.len() != 1
+    {
+        return Err(BrainError::Invalid(
+            "linear_readout_graph_profile_mismatch".into(),
+        ));
+    }
+    let input = &ir.inputs[0];
+    let parameter = ir.parameters[0].port();
+    let node = &ir.nodes[0];
+    let output = &ir.outputs[0];
+    if input.value_type != ValueType::TensorF64
+        || input.shape.len() != 2
+        || input.shape[1] != 1
+        || parameter.value_type != ValueType::TensorF64
+        || parameter.shape.as_slice() != [1, input.shape[0]]
+        || node.primitive_id.as_str() != "tensor.matmul"
+        || node.inputs.as_slice()
+            != [
+                ValueReference::Parameter {
+                    name: parameter.name.clone(),
+                },
+                ValueReference::Input {
+                    name: input.name.clone(),
+                },
+            ]
+        || node.output.value_type != ValueType::TensorF64
+        || node.output.shape.as_slice() != [1, 1]
+        || output.port.value_type != ValueType::TensorF64
+        || output.port.shape.as_slice() != [1, 1]
+        || output.source
+            != (ValueReference::NodeOutput {
+                node_id: node.node_id.clone(),
+            })
+    {
+        return Err(BrainError::Invalid(
+            "linear_readout_graph_profile_mismatch".into(),
+        ));
+    }
+
+    let dimension = usize::try_from(input.shape[0])
+        .map_err(|_| BrainError::Invalid("linear_readout_dimension_overflow".into()))?;
+    if dimension == 0
+        || dimension > MAX_READOUT_DIMENSION
+        || inputs.is_empty()
+        || inputs.len() > MAX_READOUT_ROWS
+        || inputs
+            .len()
+            .checked_mul(dimension)
+            .is_none_or(|work| work > MAX_READOUT_WORK)
+    {
+        return Err(BrainError::Invalid("linear_readout_budget_exceeded".into()));
+    }
+    if weights.len() != dimension
+        || weights.iter().any(|value| !value.is_finite())
+        || inputs
+            .iter()
+            .any(|row| row.len() != dimension || row.iter().any(|value| !value.is_finite()))
+    {
+        return Err(BrainError::Invalid(
+            "linear_readout_parameter_or_input_invalid".into(),
+        ));
+    }
+
+    // Reuse the existing scaled, compensated dot product through Matrix.
+    // Each row is one [d, 1] activation passed to the same [1, d] readout.
+    let raw_margins = crate::linalg::Matrix::from_rows(inputs)?.matvec(weights)?;
+    let weights_sha256 = domain_digest(
+        b"CEREBRO:TIDEX:LINEAR-READOUT-WEIGHTS-JSON:v1\0",
+        &serde_json::to_vec(weights)?,
+    );
+    let inputs_sha256 = domain_digest(
+        b"CEREBRO:TIDEX:LINEAR-READOUT-INPUTS-JSON:v1\0",
+        &serde_json::to_vec(inputs)?,
+    );
+    Ok(LinearReadoutExecution {
+        schema: "cerebro.tidex.linear_readout_execution/v1".into(),
+        capability_ir_sha256: ir.manifest_digest().clone(),
+        operator_node_id: node.node_id.clone(),
+        parameter_port_id: parameter.name.clone(),
+        input_dimension: dimension,
+        row_count: inputs.len(),
+        weights_sha256,
+        inputs_sha256,
+        raw_margins,
+        execution_arithmetic: "f64_scaled_neumaier_dot/v1".into(),
+        candidate_only: true,
+    })
+}
+
 /// V63 operational semantics bound to one already-authenticated structural IR.
 ///
 /// The structural [`CapabilityIr`] remains the closed executable vocabulary.
@@ -1528,6 +1663,191 @@ mod tests {
         fs::remove_dir_all(donor).unwrap();
         fs::remove_dir_all(private).unwrap();
         fs::remove_dir_all(noncanonical_private).unwrap();
+    }
+
+    fn linear_readout_fixture(envelope: &SystemEnvelope, dimension: u64) -> CapabilityIr {
+        CapabilityIr::new_with_parameters(
+            CapabilityId::parse("model.readout:v1").unwrap(),
+            envelope,
+            PrimitiveSet::tidex_core_v1().unwrap(),
+            vec![TypedPort::tensor_f64(
+                PortId::parse("runtime_input").unwrap(),
+                vec![dimension, 1],
+            )
+            .unwrap()],
+            vec![ParameterSlot::new(
+                TypedPort::tensor_f64(
+                    PortId::parse("resident_weights").unwrap(),
+                    vec![1, dimension],
+                )
+                .unwrap(),
+            )
+            .unwrap()],
+            vec![IrNode::new(
+                CapabilityNodeId::parse("node.linear_map").unwrap(),
+                PrimitiveId::parse("tensor.matmul").unwrap(),
+                vec![
+                    ValueReference::Parameter {
+                        name: PortId::parse("resident_weights").unwrap(),
+                    },
+                    ValueReference::Input {
+                        name: PortId::parse("runtime_input").unwrap(),
+                    },
+                ],
+                TypedPort::tensor_f64(PortId::parse("mapped").unwrap(), vec![1, 1]).unwrap(),
+                vec![PathBuf::from("src/memory.rs")],
+            )
+            .unwrap()],
+            vec![OutputBinding::new(
+                TypedPort::tensor_f64(PortId::parse("runtime_output").unwrap(), vec![1, 1])
+                    .unwrap(),
+                ValueReference::NodeOutput {
+                    node_id: CapabilityNodeId::parse("node.linear_map").unwrap(),
+                },
+            )
+            .unwrap()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn linear_readout_executes_existing_rectangular_ir_with_real_parameters() {
+        let (root, envelope) = envelope();
+        let ir = linear_readout_fixture(&envelope, 3);
+        let weights = vec![2.0, -3.0, 0.5];
+        let inputs = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 2.0, 4.0],
+        ];
+        let execution = execute_linear_readout(&ir, &envelope, &weights, &inputs).unwrap();
+        for (actual, expected) in execution.raw_margins.iter().zip([2.0, -3.0, 0.5, -2.0]) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        assert_eq!(execution.capability_ir_sha256, *ir.manifest_digest());
+        assert_eq!(execution.operator_node_id.as_str(), "node.linear_map");
+        assert_eq!(execution.parameter_port_id.as_str(), "resident_weights");
+        assert_eq!(execution.input_dimension, 3);
+        assert_eq!(execution.row_count, 4);
+        assert!(execution.candidate_only);
+        assert_eq!(
+            serde_json::from_slice::<LinearReadoutExecution>(
+                &serde_json::to_vec(&execution).unwrap()
+            )
+            .unwrap(),
+            execution
+        );
+
+        // A structural slot does not pretend to authenticate values. Different
+        // bound parameters produce different arithmetic and consumed-value IDs.
+        let changed = execute_linear_readout(&ir, &envelope, &[4.0, -3.0, 0.5], &inputs).unwrap();
+        assert_ne!(changed.weights_sha256, execution.weights_sha256);
+        assert_eq!(changed.inputs_sha256, execution.inputs_sha256);
+        assert_ne!(changed.raw_margins, execution.raw_margins);
+        let reordered = inputs.into_iter().rev().collect::<Vec<_>>();
+        let reordered = execute_linear_readout(&ir, &envelope, &weights, &reordered).unwrap();
+        assert_ne!(reordered.inputs_sha256, execution.inputs_sha256);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linear_readout_rejects_tampered_ir_parameter_binding_and_envelope() {
+        let (root, envelope) = envelope();
+        let ir = linear_readout_fixture(&envelope, 3);
+        let weights = [2.0, -3.0, 0.5];
+        let inputs = [vec![1.0, 2.0, 4.0]];
+
+        let mut tampered = ir.clone();
+        tampered.nodes[0].node_id = CapabilityNodeId::parse("node.changed").unwrap();
+        assert!(execute_linear_readout(&tampered, &envelope, &weights, &inputs).is_err());
+        let mut tampered = ir.clone();
+        tampered.parameters[0].port.name = PortId::parse("other_weights").unwrap();
+        tampered.manifest_sha256 = tampered.calculate_digest().unwrap();
+        assert!(execute_linear_readout(&tampered, &envelope, &weights, &inputs).is_err());
+
+        let mut envelope_json = serde_json::to_value(&envelope).unwrap();
+        let total = envelope_json["total_file_bytes"].as_u64().unwrap();
+        envelope_json["total_file_bytes"] = serde_json::json!(total + 1);
+        let invalid_envelope = serde_json::from_value(envelope_json).unwrap();
+        assert!(execute_linear_readout(&ir, &invalid_envelope, &weights, &inputs).is_err());
+        assert!(execute_linear_readout(&ir, &envelope, &[2.0, -3.0], &inputs).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linear_readout_rejects_authenticated_graphs_outside_scalar_matmul_profile() {
+        let (root, envelope) = envelope();
+        let mut transposed = linear_readout_fixture(&envelope, 3);
+        transposed.nodes[0].inputs.swap(0, 1);
+        transposed.nodes[0].output.shape = vec![3, 3];
+        transposed.outputs[0].port.shape = vec![3, 3];
+        transposed.manifest_sha256 = transposed.calculate_digest().unwrap();
+        transposed.validate_against(&envelope).unwrap();
+        assert!(execute_linear_readout(
+            &transposed,
+            &envelope,
+            &[1.0, 2.0, 3.0],
+            &[vec![4.0, 5.0, 6.0]]
+        )
+        .is_err());
+
+        let mut added = linear_readout_fixture(&envelope, 1);
+        added.nodes[0].primitive_id = PrimitiveId::parse("tensor.add").unwrap();
+        added.manifest_sha256 = added.calculate_digest().unwrap();
+        added.validate_against(&envelope).unwrap();
+        assert!(execute_linear_readout(&added, &envelope, &[2.0], &[vec![3.0]]).is_err());
+
+        let mut extra_output = linear_readout_fixture(&envelope, 1);
+        let mut output = extra_output.outputs[0].clone();
+        output.port.name = PortId::parse("another_output").unwrap();
+        extra_output.outputs.push(output);
+        extra_output.manifest_sha256 = extra_output.calculate_digest().unwrap();
+        extra_output.validate_against(&envelope).unwrap();
+        assert!(execute_linear_readout(&extra_output, &envelope, &[2.0], &[vec![3.0]]).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linear_readout_bounds_work_and_rejects_nonfinite_inputs_and_results() {
+        let (root, envelope) = envelope();
+        let ir = linear_readout_fixture(&envelope, 2);
+        assert!(execute_linear_readout(&ir, &envelope, &[1.0, 2.0], &[]).is_err());
+        assert!(
+            execute_linear_readout(&ir, &envelope, &[1.0, 2.0], &vec![vec![0.0; 2]; 129]).is_err()
+        );
+        assert!(execute_linear_readout(&ir, &envelope, &[1.0, 2.0], &[vec![1.0]]).is_err());
+        assert!(
+            execute_linear_readout(&ir, &envelope, &[1.0, f64::NAN], &[vec![1.0, 2.0]]).is_err()
+        );
+        assert!(
+            execute_linear_readout(&ir, &envelope, &[1.0, 2.0], &[vec![1.0, f64::INFINITY]])
+                .is_err()
+        );
+        assert!(
+            execute_linear_readout(&ir, &envelope, &[f64::MAX, f64::MAX], &[vec![2.0, 2.0]])
+                .is_err()
+        );
+        let oversized = linear_readout_fixture(&envelope, 4_097);
+        assert!(execute_linear_readout(
+            &oversized,
+            &envelope,
+            &vec![0.0; 4_097],
+            &[vec![0.0; 4_097]]
+        )
+        .is_err());
+
+        // The admitted upper boundary is executed, not merely shape-checked.
+        let boundary = linear_readout_fixture(&envelope, 4_096);
+        let boundary_execution = execute_linear_readout(
+            &boundary,
+            &envelope,
+            &vec![1.0; 4_096],
+            &vec![vec![1.0; 4_096]; 128],
+        )
+        .unwrap();
+        assert_eq!(boundary_execution.raw_margins, vec![4_096.0; 128]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

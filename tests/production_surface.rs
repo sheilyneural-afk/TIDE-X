@@ -33,6 +33,179 @@ fn primary_cli_rejects_unguarded_mutation_commands_before_opening_state() {
 }
 
 #[test]
+fn tidex_adapter_bank_invalid_routes_fail_before_opening_private_state() {
+    let executable = env!("CARGO_BIN_EXE_tidex");
+    let routes: &[&[&str]] = &[
+        &["adapter-bank"],
+        &["adapter-bank", "import"],
+        &["adapter-bank", "unknown", "/tmp/input.json"],
+        &["adapter-bank", "status", "extra"],
+        &["receiver", "profile"],
+    ];
+    for route in routes {
+        let output = Command::new(executable)
+            .args(*route)
+            .env_remove("TIDEX_PRIVATE_ROOT")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "route={route:?}");
+        assert!(output.stdout.is_empty(), "route={route:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("usage:"),
+            "route={route:?}, stderr={stderr}"
+        );
+        assert!(!stderr.contains("private_root"), "route={route:?}");
+    }
+}
+
+#[test]
+fn tidex_adapter_bank_status_is_valid_on_an_empty_private_authority() {
+    let executable = env!("CARGO_BIN_EXE_tidex");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("test-tidex-empty-adapter-bank-{unique}"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(executable)
+        .args(["adapter-bank", "status"])
+        .env("TIDEX_PRIVATE_ROOT", &root)
+        .env_remove("TIDEX_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["revision"], 0);
+    assert_eq!(status["verified_revision_count"], 0);
+    assert_eq!(status["registered_adapter_count"], 0);
+    assert_eq!(status["active_adapter_count"], 0);
+    assert_eq!(status["revoked_adapter_count"], 0);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tidex_capabilities_identify_receiver_profile_and_adapter_bank_engines() {
+    let executable = env!("CARGO_BIN_EXE_tidex");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("test-tidex-bank-capabilities-{unique}"));
+    let home = base.join("home");
+    let target = base.join("target");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let create = Command::new(executable)
+        .args(["workspace", "create", "bank-test", "--target"])
+        .arg(&target)
+        .env("TIDEX_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        create.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let select = Command::new(executable)
+        .args(["workspace", "use", "bank-test"])
+        .env("TIDEX_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        select.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&select.stderr)
+    );
+
+    let output = Command::new(executable)
+        .arg("capabilities")
+        .env("TIDEX_HOME", &home)
+        .env_remove("TIDEX_PRIVATE_ROOT")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "cerebro.tidex.capabilities/v1");
+    let capabilities = report["capabilities"].as_array().unwrap();
+    let by_id = |id: &str| {
+        capabilities
+            .iter()
+            .find(|capability| capability["id"] == id)
+            .unwrap_or_else(|| panic!("missing capability {id}"))
+    };
+    assert_eq!(
+        by_id("receiver.profile.physical")["engine"],
+        "model_adaptation::profile_receiver_model"
+    );
+    assert_eq!(
+        by_id("adapter_bank.index.dynamic")["engine"],
+        "adapter_bank::AdapterBank::query"
+    );
+    assert_eq!(
+        by_id("adapter_bank.lifecycle")["engine"],
+        "adapter_bank::AdapterBank::{activate,revoke,rollback}"
+    );
+
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn tidex_preserves_benchmark_and_generic_json_size_errors() {
+    let executable = env!("CARGO_BIN_EXE_tidex");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let input = std::env::temp_dir().join(format!("test-tidex-oversized-json-{unique}.json"));
+    std::fs::File::create(&input)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+
+    let benchmark = Command::new(executable)
+        .args(["benchmark", "portability"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(benchmark.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(benchmark.stderr).unwrap().trim(),
+        "tidex_benchmark_input_too_large"
+    );
+
+    let generic = Command::new(executable)
+        .args(["receiver", "describe-readout"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(generic.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(generic.stderr).unwrap().trim(),
+        "tidex_cli_json_input_too_large"
+    );
+
+    std::fs::remove_file(input).unwrap();
+}
+
+#[test]
 fn tidex_operator_acquires_the_selected_external_workspace_target() {
     let executable = env!("CARGO_BIN_EXE_tidex");
     let unique = std::time::SystemTime::now()

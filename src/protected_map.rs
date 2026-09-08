@@ -10,9 +10,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+// v2/v3 distinguish metric-dual constraint vectors from the historical raw
+// covectors. Legacy maps must be rebuilt from their authenticated sensitivities;
+// relabelling their schema would silently retain the wrong projection contract.
+const PROTECTED_MAP_SCHEMA: &str = "cerebro.tidex.protected_cortex_map/v2";
+const PROTECTED_MAP_ARTIFACT_SCHEMA: &str = "cerebro.tidex.protected_cortex_map_artifact/v3";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SensitivityEvidence {
     pub probe_id: ProbeId,
+    /// First-order covector: the predicted probe change is sensitivity dot delta.
     pub sensitivity: Vec<f64>,
     pub reliability: f64,
     pub causal_damage: Option<f64>,
@@ -67,7 +74,7 @@ pub fn persist_protected_map(
     root: &Path,
     report: &ProtectedMapReport,
 ) -> BrainResult<ProtectedMapArtifactReport> {
-    if report.schema != "cerebro.tidex.protected_cortex_map/v1"
+    if report.schema != PROTECTED_MAP_SCHEMA
         || report.parameter_dimension == 0
         || report.probe_count < 2
         || report.cortex.parameter_importance.len() != report.parameter_dimension
@@ -113,7 +120,7 @@ pub fn persist_protected_map(
         });
     }
     Ok(ProtectedMapArtifactReport {
-        schema: "cerebro.tidex.protected_cortex_map_artifact/v2".into(),
+        schema: PROTECTED_MAP_ARTIFACT_SCHEMA.into(),
         probe_count: report.probe_count,
         parameter_dimension: report.parameter_dimension,
         selected_rank: report.selected_rank,
@@ -134,7 +141,8 @@ pub fn load_protected_cortex(
     root: &Path,
     report: &ProtectedMapArtifactReport,
 ) -> BrainResult<ProtectedCortex> {
-    if report.schema != "cerebro.tidex.protected_cortex_map_artifact/v2"
+    // Do not reinterpret historical raw covectors as corrected metric vectors.
+    if report.schema != PROTECTED_MAP_ARTIFACT_SCHEMA
         || report.parameter_dimension == 0
         || report.selected_rank != report.cortex.directions.len()
     {
@@ -232,6 +240,72 @@ fn pearson(left: &[f64], right: &[f64]) -> Option<f64> {
     (denom > 1e-18).then_some((numerator / denom).clamp(-1.0, 1.0))
 }
 
+/// Represent a sensitivity covector g in the metric used by protected.rs.
+/// Its projector enforces u^T D delta = 0, so u must be proportional to D^+ g,
+/// not g. Normalize in D so its constraint is not discarded solely because of
+/// the projector's absolute Gram tolerance. Zero metric entries are permitted
+/// only outside the covector support; no epsilon invents missing sensitivity.
+fn metric_dual_direction(covector: &[f64], metric: &[f64]) -> BrainResult<Vec<f64>> {
+    if covector.len() != metric.len()
+        || covector.is_empty()
+        || covector.iter().any(|value| !value.is_finite())
+        || metric
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(BrainError::Invalid(
+            "protected_map_metric_dual_shape".into(),
+        ));
+    }
+    let mut whitened = Vec::with_capacity(covector.len());
+    for (&gradient, &importance) in covector.iter().zip(metric) {
+        if importance == 0.0 {
+            if gradient != 0.0 {
+                return Err(BrainError::Numerical(
+                    "protected_map_metric_lost_covector_support".into(),
+                ));
+            }
+            whitened.push(0.0);
+        } else {
+            whitened.push(gradient / importance.sqrt());
+        }
+    }
+    let dual_norm = norm(&whitened)?;
+    if dual_norm == 0.0 {
+        return Err(BrainError::Numerical(
+            "protected_map_metric_dual_degenerate".into(),
+        ));
+    }
+    let mut direction = Vec::with_capacity(covector.len());
+    let mut metric_energy = 0.0;
+    for ((&gradient, &value), &importance) in covector.iter().zip(&whitened).zip(metric) {
+        let dual = if importance == 0.0 {
+            0.0
+        } else {
+            (value / dual_norm) / importance.sqrt()
+        };
+        // Match the consumer's multiplication order: even a finite dual can
+        // overflow u*u before D is multiplied. Reject instead of publishing a
+        // map that cannot be projected by the existing numerical kernel.
+        let energy = dual * dual * importance;
+        if !dual.is_finite() || !energy.is_finite() || (gradient != 0.0 && dual == 0.0) {
+            return Err(BrainError::Numerical(
+                "protected_map_metric_dual_not_representable".into(),
+            ));
+        }
+        metric_energy += energy;
+        direction.push(dual);
+    }
+    if !metric_energy.is_finite()
+        || (metric_energy - 1.0).abs() > f64::EPSILON.sqrt() * covector.len() as f64
+    {
+        return Err(BrainError::Numerical(
+            "protected_map_metric_dual_normalization".into(),
+        ));
+    }
+    Ok(direction)
+}
+
 pub fn build_protected_cortex_map(
     evidence: &[SensitivityEvidence],
     target_explained_sensitivity: f64,
@@ -291,8 +365,18 @@ pub fn build_protected_cortex_map(
         ));
     }
     let max_importance = parameter_importance.iter().copied().fold(0.0_f64, f64::max);
-    for value in &mut parameter_importance {
+    for (parameter, value) in parameter_importance.iter_mut().enumerate() {
         *value /= max_importance;
+        if !value.is_finite()
+            || (*value == 0.0
+                && evidence
+                    .iter()
+                    .any(|probe| probe.sensitivity[parameter] != 0.0))
+        {
+            return Err(BrainError::Numerical(
+                "protected_map_metric_lost_sensitivity_support".into(),
+            ));
+        }
     }
 
     let mut directions = Vec::with_capacity(selected_rank);
@@ -319,6 +403,7 @@ pub fn build_protected_cortex_map(
         for value in &mut direction {
             *value /= direction_norm;
         }
+        let direction = metric_dual_direction(&direction, &parameter_importance)?;
         directions.push(ProtectedDirection {
             probe_id: ProbeId::parse(format!("sensitivity-pc-{component:03}"))?,
             direction,
@@ -341,7 +426,7 @@ pub fn build_protected_cortex_map(
         None
     };
     Ok(ProtectedMapReport {
-        schema: "cerebro.tidex.protected_cortex_map/v1".into(),
+        schema: PROTECTED_MAP_SCHEMA.into(),
         probe_count: evidence.len(),
         parameter_dimension: dim,
         selected_rank,
@@ -448,5 +533,162 @@ mod tests {
         zero[1].probe_id = "other".into();
         zero[1].sensitivity = vec![0.0, 0.0];
         assert!(build_protected_cortex_map(&zero, 0.9, 0.1).is_err());
+    }
+
+    #[test]
+    fn protected_map_preserves_probe_responses_in_anisotropic_metric() {
+        // These are exact gradients of two linear probes, not model outputs.
+        // Their nullspace is x + 2*y = 0; the third parameter is unobserved.
+        let evidence = vec![
+            SensitivityEvidence {
+                probe_id: "linear-a".into(),
+                sensitivity: vec![1.0, 2.0, 0.0],
+                reliability: 1.0,
+                causal_damage: None,
+            },
+            SensitivityEvidence {
+                probe_id: "linear-b".into(),
+                sensitivity: vec![2.0, 4.0, 0.0],
+                reliability: 0.5,
+                causal_damage: None,
+            },
+        ];
+        let map = build_protected_cortex_map(&evidence, 0.99, 1.0).unwrap();
+        assert_eq!(map.selected_rank, 1);
+        assert_eq!(map.cortex.parameter_importance, vec![0.25, 1.0, 0.0]);
+        let delta = [1.0, 0.0, 3.0];
+        let result = project_to_safe_subspace(&delta, &map.cortex).unwrap();
+        assert!(result.allowed);
+        for probe in &evidence {
+            // Measure the actual first-order probe change, independently of
+            // the projector's weighted-residual self-diagnostic.
+            assert!(dot(&probe.sensitivity, &result.projected).unwrap().abs() < 1e-12);
+        }
+        assert_eq!(result.projected[2], delta[2]);
+        assert!(result.projected[0].abs() > 0.1);
+        assert!(result.projected[1].abs() > 0.1);
+
+        // Establish that this fixture catches the historical builder: its
+        // weighted residual passes despite a nonzero actual probe change.
+        let mut historical = map.cortex.clone();
+        historical.directions[0].direction = evidence[0].sensitivity.clone();
+        let wrong = project_to_safe_subspace(&delta, &historical).unwrap();
+        assert!(wrong.max_weighted_residual < 1e-12);
+        assert!(
+            dot(&evidence[0].sensitivity, &wrong.projected)
+                .unwrap()
+                .abs()
+                > 0.1
+        );
+    }
+
+    #[test]
+    fn protected_map_preserves_all_independent_retained_covectors() {
+        let evidence = vec![
+            SensitivityEvidence {
+                probe_id: "mixed-a".into(),
+                sensitivity: vec![1.0, 2.0, 0.0, 0.0],
+                reliability: 1.0,
+                causal_damage: None,
+            },
+            SensitivityEvidence {
+                probe_id: "mixed-b".into(),
+                sensitivity: vec![-2.0, 1.0, 3.0, 0.0],
+                reliability: 0.7,
+                causal_damage: None,
+            },
+        ];
+        let map = build_protected_cortex_map(&evidence, 1.0, 1.0).unwrap();
+        assert_eq!(map.selected_rank, 2);
+        for delta in [
+            [1.0, -2.0, 0.5, 4.0],
+            [0.0, 1.0, -3.0, 2.0],
+            [-2.0, 0.1, 1.0, -4.0],
+        ] {
+            let result = project_to_safe_subspace(&delta, &map.cortex).unwrap();
+            for probe in &evidence {
+                assert!(dot(&probe.sensitivity, &result.projected).unwrap().abs() < 1e-10);
+            }
+            assert_eq!(result.projected[3], delta[3]);
+        }
+    }
+
+    #[test]
+    fn protected_map_rejects_metric_underflow_that_loses_sensitivity() {
+        let evidence = vec![
+            SensitivityEvidence {
+                probe_id: "tiny-a".into(),
+                sensitivity: vec![1.0, 1e-200],
+                reliability: 1.0,
+                causal_damage: None,
+            },
+            SensitivityEvidence {
+                probe_id: "tiny-b".into(),
+                sensitivity: vec![2.0, 2e-200],
+                reliability: 1.0,
+                causal_damage: None,
+            },
+        ];
+        let error = build_protected_cortex_map(&evidence, 0.99, 1.0).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("metric_lost_sensitivity_support"));
+        assert!(metric_dual_direction(&[1.0, 1.0], &[1.0, 0.0]).is_err());
+        assert!(metric_dual_direction(&[1.0, 0.0], &[f64::NAN, 0.0]).is_err());
+        assert!(metric_dual_direction(&[1.0, 1.0], &[1.0, 1e-320]).is_err());
+    }
+
+    #[test]
+    fn protected_map_roundtrip_keeps_covector_contract_and_rejects_legacy_schema() {
+        use std::fs;
+        use std::os::unix::fs::DirBuilderExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let evidence = vec![
+            SensitivityEvidence {
+                probe_id: "stored-a".into(),
+                sensitivity: vec![1.0, 2.0, 0.0],
+                reliability: 1.0,
+                causal_damage: None,
+            },
+            SensitivityEvidence {
+                probe_id: "stored-b".into(),
+                sensitivity: vec![2.0, 4.0, 0.0],
+                reliability: 1.0,
+                causal_damage: None,
+            },
+        ];
+        let mut map = build_protected_cortex_map(&evidence, 0.99, 1.0).unwrap();
+        assert_eq!(map.schema, "cerebro.tidex.protected_cortex_map/v2");
+        let root = std::env::temp_dir().join(format!(
+            "tidex-protected-map-dual-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let mut stored = persist_protected_map(&root, &map).unwrap();
+        assert_eq!(
+            stored.schema,
+            "cerebro.tidex.protected_cortex_map_artifact/v3"
+        );
+        let loaded = load_protected_cortex(&root, &stored).unwrap();
+        assert_eq!(loaded, map.cortex);
+        let result = project_to_safe_subspace(&[1.0, 0.0, 3.0], &loaded).unwrap();
+        assert!(
+            dot(&evidence[0].sensitivity, &result.projected)
+                .unwrap()
+                .abs()
+                < 1e-12
+        );
+
+        // Historical content is never silently treated as the new contract.
+        stored.schema = "cerebro.tidex.protected_cortex_map_artifact/v2".into();
+        assert!(load_protected_cortex(&root, &stored).is_err());
+        map.schema = "cerebro.tidex.protected_cortex_map/v1".into();
+        assert!(persist_protected_map(&root, &map).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -351,26 +351,33 @@ mod tests {
     }
 
     #[test]
-    fn v2_hash_survives_values_that_drift_under_json_f64_roundtrip() {
-        let payload = json!({
-            "a": 0.9376332445278925_f64,
-            "b": [9.262570687188195_f64, 0.012341817216899103_f64],
-        });
-        let payload_json = canonical_payload_json(&payload).unwrap();
+    fn v2_hash_is_bound_to_exact_payload_json_bytes_not_reserialization() {
+        // Two JSON texts may parse to the same semantic Value while differing
+        // byte-for-byte (here only insignificant whitespace differs). V2 hashes
+        // the exact stored payload_json bytes, so verification must never
+        // replace them with a parsed-and-reserialized representation.
+        let payload_json = "{\"a\":1.23, \"b\":[9.0,0.01]}".to_string();
         let parsed: Value = serde_json::from_str(&payload_json).unwrap();
-        // This is the exact class of issue observed in the real reconstruction
-        // event: serde_json can return the neighboring f64 for decimal input.
-        assert_ne!(payload, parsed);
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        assert_ne!(payload_json, reserialized);
+
         let hash = hash_event_v2(1, &"0".repeat(64), "x", &payload_json);
         let event = LedgerEvent {
             schema: EVENT_SCHEMA_V2.into(),
             seq: 1,
             prev_hash: "0".repeat(64),
             kind: "x".into(),
-            payload_json,
-            event_hash: hash,
+            payload_json: payload_json.clone(),
+            event_hash: hash.clone(),
         };
         verify_v2_event(&event, 1, &"0".repeat(64)).unwrap();
+
+        let tampered = LedgerEvent {
+            payload_json: reserialized,
+            event_hash: hash,
+            ..event
+        };
+        assert!(verify_v2_event(&tampered, 1, &"0".repeat(64)).is_err());
     }
 
     #[test]

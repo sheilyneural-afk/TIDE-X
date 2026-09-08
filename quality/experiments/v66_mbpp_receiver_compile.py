@@ -49,8 +49,9 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
 from datasets import load_dataset
-from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from quality.experiments.capability_statistics import exact_paired_binomial_p, paired_pass_counts
 
 from quality.experiments.v66_mbpp_capability_extract import (
     CAPABILITY_SCHEMA,
@@ -141,6 +142,8 @@ def setup_receiver_backbone(seed: int) -> tuple[Any, Any]:
 
 
 def setup_receiver(seed: int) -> tuple[Any, Any]:
+    from peft import LoraConfig, TaskType, get_peft_model
+
     model, tokenizer = setup_receiver_backbone(seed)
     model = get_peft_model(
         model,
@@ -685,6 +688,8 @@ def load_adapter_artifact_manifest(artifact_dir: Path) -> tuple[Path, dict[str, 
 
 
 def load_materialized_adapter(artifact_dir: Path, manifest: dict[str, Any]) -> tuple[Any, Any]:
+    from peft import PeftModel
+
     base, tokenizer = setup_receiver_backbone(SEED + 100)
     model = PeftModel.from_pretrained(base, artifact_dir, is_trainable=False)
     model.config.use_cache = False
@@ -697,45 +702,6 @@ def load_materialized_adapter(artifact_dir: Path, manifest: dict[str, Any]) -> t
         release_model(model, tokenizer)
         raise SystemExit("V66 adapter replay rejected: loaded adapter parameter digest mismatch")
     return model, tokenizer
-
-
-def exact_paired_binomial_p(gained: int, lost: int) -> float:
-    discordant = gained + lost
-    if discordant == 0:
-        return 1.0
-    tail = min(gained, lost)
-    probability = 2.0 * sum(math.comb(discordant, index) for index in range(tail + 1)) / (
-        2 ** discordant
-    )
-    return min(1.0, probability)
-
-
-def paired_pass_counts(
-    baseline: dict[str, Any],
-    compiled: dict[str, Any],
-) -> dict[str, int | float]:
-    baseline_by_id = {
-        int(item["task_id"]): bool(item["pass"])
-        for item in baseline["results"]
-    }
-    compiled_by_id = {
-        int(item["task_id"]): bool(item["pass"])
-        for item in compiled["results"]
-    }
-    if baseline_by_id.keys() != compiled_by_id.keys():
-        raise SystemExit("V66 adapter replay rejected: paired evaluation identity mismatch")
-    both = sum(baseline_by_id[key] and compiled_by_id[key] for key in baseline_by_id)
-    gained = sum((not baseline_by_id[key]) and compiled_by_id[key] for key in baseline_by_id)
-    lost = sum(baseline_by_id[key] and (not compiled_by_id[key]) for key in baseline_by_id)
-    neither = len(baseline_by_id) - both - gained - lost
-    return {
-        "both_pass": both,
-        "compiled_only_pass": gained,
-        "virgin_only_pass": lost,
-        "neither_pass": neither,
-        "discordant_count": gained + lost,
-        "exact_two_sided_p": exact_paired_binomial_p(gained, lost),
-    }
 
 
 def replay_compiled_adapter(

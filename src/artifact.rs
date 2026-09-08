@@ -23,6 +23,19 @@ pub struct DeltaArtifactRef {
     pub parameter_count: u64,
 }
 
+/// Descriptor-bound sequential reader for one already authenticated dense
+/// delta artifact. Opening checks the declared content identity. Subsequent
+/// reads hash the exact bytes delivered to the consumer, and finish verifies
+/// that stream against the reference. A retained descriptor prevents pathname
+/// substitution, but does not itself prevent writes to the same inode.
+/// Consumers must not publish results until finish succeeds.
+pub struct VerifiedDvecReader {
+    reference: DeltaArtifactRef,
+    reader: BufReader<File>,
+    next_parameter: u64,
+    consumed_hasher: Sha256,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct F64ArtifactRef {
     pub path: PathBuf,
@@ -87,6 +100,20 @@ impl ArtifactWriteAuthority {
 
     pub fn create_content_addressed_dvec(&self, values: &[f32]) -> BrainResult<DeltaArtifactRef> {
         create_content_addressed_dvec_under_root(&self.root, values)
+    }
+
+    /// Persist a large dense delta without first collecting it into one
+    /// in-memory vector. The caller declares the exact flat parameter count;
+    /// too few or too many produced values fail closed before installation.
+    pub fn create_content_addressed_dvec_iter<I>(
+        &self,
+        parameter_count: u64,
+        values: I,
+    ) -> BrainResult<DeltaArtifactRef>
+    where
+        I: IntoIterator<Item = f32>,
+    {
+        create_content_addressed_dvec_iter_under_root(&self.root, parameter_count, values)
     }
 
     pub fn create_content_addressed_f64(&self, values: &[f64]) -> BrainResult<F64ArtifactRef> {
@@ -281,6 +308,121 @@ pub fn verify_dvec_reference_under_root(
     verified_delta_reference_under_root(root, reference)
 }
 
+impl VerifiedDvecReader {
+    /// Authenticate a dvec reference and retain its descriptor for bounded
+    /// sequential reads. The actual consumed stream is authenticated again in
+    /// finish, without rereading the file or trusting unchanged path metadata.
+    pub fn open(root: &Path, reference: &DeltaArtifactRef) -> BrainResult<Self> {
+        let (inspected, mut file) = verified_delta_reference_open_under_root(root, reference)?;
+        // Parse and hash the same header bytes. Read them before constructing
+        // BufReader, so opening does not prefetch unconsumed tensor data.
+        let mut header = [0u8; HEADER_BYTES as usize];
+        file.read_exact(&mut header)?;
+        let count = read_header(&mut header.as_slice())?;
+        let mut consumed_hasher = Sha256::new();
+        consumed_hasher.update(header);
+        let reader = BufReader::with_capacity(1 << 20, file);
+        if count != inspected.parameter_count {
+            return Err(BrainError::Integrity(
+                "artifact_header_reference_count_mismatch".into(),
+            ));
+        }
+        Ok(Self {
+            reference: inspected,
+            reader,
+            next_parameter: 0,
+            consumed_hasher,
+        })
+    }
+
+    pub fn parameter_count(&self) -> u64 {
+        self.reference.parameter_count
+    }
+
+    pub fn next_parameter(&self) -> u64 {
+        self.next_parameter
+    }
+
+    /// Read one scalar without allocating a temporary vector. This is the
+    /// hot path used by exact multi-source composition; the byte stream is
+    /// still accounted for by `finish`.
+    fn read_one_f32(&mut self) -> BrainResult<f32> {
+        if self.next_parameter >= self.reference.parameter_count {
+            return Err(BrainError::Invalid(
+                "artifact_stream_range_out_of_bounds".into(),
+            ));
+        }
+        let mut raw = [0u8; 4];
+        self.reader.read_exact(&mut raw)?;
+        self.consumed_hasher.update(raw);
+        let value = f32::from_le_bytes(raw);
+        if !value.is_finite() {
+            return Err(BrainError::Integrity("artifact_non_finite".into()));
+        }
+        self.next_parameter += 1;
+        Ok(value)
+    }
+
+    /// Read the next bounded chunk while preserving exact f32 payload
+    /// semantics. Non-finite data is rejected; values remain provisional until
+    /// finish authenticates the exact header and data bytes consumed.
+    pub fn read_f32(&mut self, len: usize) -> BrainResult<Vec<f32>> {
+        if len == 0 {
+            return Err(BrainError::Invalid("artifact_stream_chunk_empty".into()));
+        }
+        let end = self
+            .next_parameter
+            .checked_add(len as u64)
+            .ok_or_else(|| BrainError::Invalid("artifact_stream_range_overflow".into()))?;
+        if end > self.reference.parameter_count {
+            return Err(BrainError::Invalid(
+                "artifact_stream_range_out_of_bounds".into(),
+            ));
+        }
+        let byte_len = len
+            .checked_mul(4)
+            .ok_or_else(|| BrainError::Invalid("artifact_stream_range_overflow".into()))?;
+        let mut raw = vec![0u8; byte_len];
+        self.reader.read_exact(&mut raw)?;
+        self.consumed_hasher.update(&raw);
+        let mut values = Vec::with_capacity(len);
+        for chunk in raw.chunks_exact(4) {
+            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if !value.is_finite() {
+                return Err(BrainError::Integrity("artifact_non_finite".into()));
+            }
+            values.push(value);
+        }
+        self.next_parameter = end;
+        Ok(values)
+    }
+
+    /// A consumer must account for the whole declared flat parameter space.
+    /// Silently leaving a suffix unread would make a layout/delta mismatch
+    /// look like successful model materialization.
+    pub fn finish(mut self) -> BrainResult<()> {
+        if self.next_parameter != self.reference.parameter_count {
+            return Err(BrainError::Integrity(format!(
+                "artifact_stream_incomplete:{}:{}",
+                self.next_parameter, self.reference.parameter_count
+            )));
+        }
+        let mut trailing = [0u8; 1];
+        if self.reader.read(&mut trailing)? != 0 {
+            return Err(BrainError::Integrity(
+                "artifact_stream_trailing_bytes".into(),
+            ));
+        }
+        let consumed = Sha256Digest::parse(format!("{:x}", self.consumed_hasher.finalize()))?;
+        if consumed != self.reference.sha256 {
+            return Err(BrainError::Integrity(
+                "artifact_stream_consumed_digest_mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn write_dvec_values(file: &mut File, values: &[f32]) -> BrainResult<()> {
     let mut writer = BufWriter::with_capacity(1 << 20, file);
     write_header(&mut writer, values.len() as u64)?;
@@ -329,26 +471,14 @@ fn create_dvec_under_root(root: &Path, id: &str, values: &[f32]) -> BrainResult<
 }
 
 pub fn read_dvec_f32(root: &Path, reference: &DeltaArtifactRef) -> BrainResult<Vec<f32>> {
-    let (inspected, file) = verified_delta_reference_open_under_root(root, reference)?;
-    let mut reader = BufReader::with_capacity(1 << 20, file);
-    let count = read_header(&mut reader)?;
-    if count != inspected.parameter_count {
-        return Err(BrainError::Integrity(
-            "artifact_header_reference_count_mismatch".into(),
-        ));
-    }
-    let capacity = usize::try_from(count)
+    let mut reader = VerifiedDvecReader::open(root, reference)?;
+    let capacity = usize::try_from(reader.parameter_count())
         .map_err(|_| BrainError::Invalid("artifact_parameter_count_too_large".into()))?;
     let mut values = Vec::with_capacity(capacity);
-    let mut raw = [0u8; 4];
-    for _ in 0..count {
-        reader.read_exact(&mut raw)?;
-        let value = f32::from_le_bytes(raw);
-        if !value.is_finite() {
-            return Err(BrainError::Integrity("artifact_non_finite".into()));
-        }
-        values.push(value);
+    while reader.next_parameter() < reader.parameter_count() {
+        values.push(reader.read_one_f32()?);
     }
+    reader.finish()?;
     Ok(values)
 }
 
@@ -402,6 +532,67 @@ fn create_content_addressed_dvec_under_root(
     {
         return Err(BrainError::Integrity(
             "content_addressed_artifact_write_mismatch".into(),
+        ));
+    }
+    Ok(inspected)
+}
+
+fn create_content_addressed_dvec_iter_under_root<I>(
+    root: &Path,
+    parameter_count: u64,
+    values: I,
+) -> BrainResult<DeltaArtifactRef>
+where
+    I: IntoIterator<Item = f32>,
+{
+    if parameter_count == 0 {
+        return Err(BrainError::Invalid(
+            "artifact_stream_parameter_count_zero".into(),
+        ));
+    }
+    let root = writable_artifact_root(root)?;
+    let dir = ensure_private_directory(&root, &content_artifact_dir(&root))?;
+    let provisional_destination = dir.join("streaming-candidate.dvec");
+    let (temporary, digest) = stage_private_file(&root, &provisional_destination, |file| {
+        let mut writer = BufWriter::with_capacity(1 << 20, file);
+        write_header(&mut writer, parameter_count)?;
+        let mut observed = 0u64;
+        for value in values {
+            if observed >= parameter_count {
+                return Err(BrainError::Invalid(
+                    "artifact_stream_too_many_values".into(),
+                ));
+            }
+            if !value.is_finite() {
+                return Err(BrainError::Invalid(
+                    "artifact_stream_value_non_finite".into(),
+                ));
+            }
+            writer.write_all(&value.to_le_bytes())?;
+            observed += 1;
+        }
+        if observed != parameter_count {
+            return Err(BrainError::Invalid(format!(
+                "artifact_stream_value_count_mismatch:{observed}:{parameter_count}"
+            )));
+        }
+        writer.flush()?;
+        Ok(())
+    })?;
+    let final_path = content_output_path(&root, &digest);
+    if !install_private_immutable_file(&root, &temporary, &final_path, &digest)? {
+        let existing = inspect_dvec_under_root(&root, &final_path)?;
+        if existing.sha256 != digest || existing.parameter_count != parameter_count {
+            return Err(BrainError::Integrity(
+                "content_addressed_stream_collision".into(),
+            ));
+        }
+        return Ok(existing);
+    }
+    let inspected = inspect_dvec_under_root(&root, &final_path)?;
+    if inspected.sha256 != digest || inspected.parameter_count != parameter_count {
+        return Err(BrainError::Integrity(
+            "content_addressed_stream_write_mismatch".into(),
         ));
     }
     Ok(inspected)
@@ -604,25 +795,40 @@ fn create_content_addressed_f64_under_root(
 }
 
 pub fn read_f64_artifact(root: &Path, reference: &F64ArtifactRef) -> BrainResult<Vec<f64>> {
-    let (inspected, file) = verified_f64_reference_open_under_root(root, reference)?;
-    let mut reader = BufReader::with_capacity(1 << 20, file);
-    let count = read_f64_header(&mut reader)?;
+    let (inspected, mut file) = verified_f64_reference_open_under_root(root, reference)?;
+    let mut header = [0u8; HEADER_BYTES as usize];
+    file.read_exact(&mut header)?;
+    let count = read_f64_header(&mut header.as_slice())?;
     if count != inspected.element_count {
         return Err(BrainError::Integrity(
             "f64_artifact_header_reference_count_mismatch".into(),
         ));
     }
+    let mut consumed_hasher = Sha256::new();
+    consumed_hasher.update(header);
+    let mut reader = BufReader::with_capacity(1 << 20, file);
     let capacity = usize::try_from(count)
         .map_err(|_| BrainError::Invalid("f64_artifact_element_count_too_large".into()))?;
     let mut values = Vec::with_capacity(capacity);
     let mut raw = [0u8; 8];
     for _ in 0..count {
         reader.read_exact(&mut raw)?;
+        consumed_hasher.update(raw);
         let value = f64::from_le_bytes(raw);
         if !value.is_finite() {
             return Err(BrainError::Integrity("f64_artifact_non_finite".into()));
         }
         values.push(value);
+    }
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(BrainError::Integrity("f64_artifact_trailing_bytes".into()));
+    }
+    let consumed = Sha256Digest::parse(format!("{:x}", consumed_hasher.finalize()))?;
+    if consumed != reference.sha256 {
+        return Err(BrainError::Integrity(
+            "f64_artifact_consumed_digest_mismatch".into(),
+        ));
     }
     Ok(values)
 }
@@ -645,27 +851,17 @@ pub fn sketch_dvec(
     if sketch_dim < 16 {
         return Err(BrainError::Invalid("sketch_dimension_too_small".into()));
     }
-    let (inspected, file) = inspect_open_dvec_under_root(root, path)?;
-    let mut r = BufReader::with_capacity(1 << 20, file);
-    let count = read_header(&mut r)?;
-    if count != inspected.parameter_count {
-        return Err(BrainError::Integrity(
-            "artifact_header_reference_count_mismatch".into(),
-        ));
-    }
+    let reference = inspect_dvec(root, path)?;
+    let mut reader = VerifiedDvecReader::open(root, &reference)?;
     let mut out = vec![0.0; sketch_dim];
-    let mut raw = [0u8; 4];
-    for i in 0..count {
-        r.read_exact(&mut raw)?;
-        let v = f32::from_le_bytes(raw) as f64;
-        if !v.is_finite() {
-            return Err(BrainError::Integrity("artifact_non_finite".into()));
-        }
+    for i in 0..reference.parameter_count {
+        let v = f64::from(reader.read_one_f32()?);
         let h = splitmix64(i ^ seed);
         let bucket = (h as usize) % sketch_dim;
         let sign = if h & 1 == 0 { 1.0 } else { -1.0 };
         out[bucket] += sign * v;
     }
+    reader.finish()?;
     Ok(out)
 }
 
@@ -673,40 +869,30 @@ pub fn sketch_dvec(
 /// This enables tensor/block tomography with memory proportional to one model
 /// block rather than the full parameter vector.
 pub fn read_dvec_range(root: &Path, path: &Path, start: u64, len: usize) -> BrainResult<Vec<f64>> {
-    let (inspected, mut file) = inspect_open_dvec_under_root(root, path)?;
+    let reference = inspect_dvec(root, path)?;
     let end = start
         .checked_add(len as u64)
         .ok_or_else(|| BrainError::Invalid("artifact_range_overflow".into()))?;
-    if end > inspected.parameter_count {
+    if end > reference.parameter_count {
         return Err(BrainError::Invalid("artifact_range_out_of_bounds".into()));
     }
-    let byte_offset = HEADER_BYTES
-        .checked_add(
-            start
-                .checked_mul(4)
-                .ok_or_else(|| BrainError::Invalid("artifact_range_overflow".into()))?,
-        )
-        .ok_or_else(|| BrainError::Invalid("artifact_range_overflow".into()))?;
-    file.seek(SeekFrom::Start(byte_offset))?;
-    let buffer_capacity = len.saturating_mul(4).clamp(4096, 1 << 20);
-    let mut reader = BufReader::with_capacity(buffer_capacity, file);
+    let mut reader = VerifiedDvecReader::open(root, &reference)?;
     let mut values = Vec::with_capacity(len);
-    let mut raw = [0u8; 4];
-    for _ in 0..len {
-        reader.read_exact(&mut raw)?;
-        let value = f32::from_le_bytes(raw) as f64;
-        if !value.is_finite() {
-            return Err(BrainError::Integrity("artifact_non_finite".into()));
+    while reader.next_parameter() < reader.parameter_count() {
+        let ordinal = reader.next_parameter();
+        let value = reader.read_one_f32()?;
+        if ordinal >= start && ordinal < end {
+            values.push(f64::from(value));
         }
-        values.push(value);
     }
+    reader.finish()?;
     Ok(values)
 }
 
 fn combination_readers(
     root: &Path,
     sources: &[(DeltaArtifactRef, f64)],
-) -> BrainResult<(Vec<BufReader<File>>, u64)> {
+) -> BrainResult<(Vec<VerifiedDvecReader>, u64)> {
     if sources.is_empty() {
         return Err(BrainError::Invalid("artifact_combine_empty".into()));
     }
@@ -721,27 +907,27 @@ fn combination_readers(
     let mut readers = Vec::with_capacity(sources.len());
     let mut count = None;
     for (reference, _) in sources {
-        let (inspected, file) = verified_delta_reference_open_under_root(root, reference)?;
+        let reader = VerifiedDvecReader::open(root, reference)?;
         if let Some(expected) = count {
-            if expected != inspected.parameter_count {
+            if expected != reader.parameter_count() {
                 return Err(BrainError::Invalid(
                     "artifact_combine_parameter_count_mismatch".into(),
                 ));
             }
         } else {
-            count = Some(inspected.parameter_count);
-        }
-        let mut reader = BufReader::with_capacity(1 << 20, file);
-        let header_count = read_header(&mut reader)?;
-        if header_count != inspected.parameter_count {
-            return Err(BrainError::Integrity(
-                "artifact_header_reference_count_mismatch".into(),
-            ));
+            count = Some(reader.parameter_count());
         }
         readers.push(reader);
     }
     let count = count.ok_or_else(|| BrainError::Invalid("artifact_combine_empty".into()))?;
     Ok((readers, count))
+}
+
+fn finish_combination_readers(readers: Vec<VerifiedDvecReader>) -> BrainResult<()> {
+    for reader in readers {
+        reader.finish()?;
+    }
+    Ok(())
 }
 
 /// Stream exactly the f32 payload bytes of a linear combination.
@@ -750,7 +936,7 @@ fn combination_readers(
 /// verifier cannot silently accept a result generated with different rounding
 /// or source-validation semantics.
 fn stream_linear_combination_bytes<F>(
-    readers: &mut [BufReader<File>],
+    readers: &mut [VerifiedDvecReader],
     count: u64,
     sources: &[(DeltaArtifactRef, f64)],
     mut consume: F,
@@ -763,15 +949,10 @@ where
             "artifact_combine_reader_source_mismatch".into(),
         ));
     }
-    let mut raw = vec![[0u8; 4]; readers.len()];
     for _ in 0..count {
         let mut sum = 0.0f64;
         for index in 0..readers.len() {
-            readers[index].read_exact(&mut raw[index])?;
-            let value = f32::from_le_bytes(raw[index]);
-            if !value.is_finite() {
-                return Err(BrainError::Integrity("artifact_non_finite".into()));
-            }
+            let value = readers[index].read_one_f32()?;
             sum += sources[index].1 * f64::from(value);
         }
         if !sum.is_finite() || sum.abs() > f32::MAX as f64 {
@@ -789,13 +970,27 @@ fn write_linear_combination(
     file: &mut File,
     sources: &[(DeltaArtifactRef, f64)],
 ) -> BrainResult<u64> {
+    write_linear_combination_after_readers_opened(root, file, sources, || Ok(()))
+}
+
+fn write_linear_combination_after_readers_opened<F>(
+    root: &Path,
+    file: &mut File,
+    sources: &[(DeltaArtifactRef, f64)],
+    after_readers_opened: F,
+) -> BrainResult<u64>
+where
+    F: FnOnce() -> BrainResult<()>,
+{
     let (mut readers, count) = combination_readers(root, sources)?;
+    after_readers_opened()?;
     let mut writer = BufWriter::with_capacity(1 << 20, file);
     write_header(&mut writer, count)?;
     stream_linear_combination_bytes(&mut readers, count, sources, |bytes| {
         writer.write_all(&bytes)?;
         Ok(())
     })?;
+    finish_combination_readers(readers)?;
     writer.flush()?;
     Ok(count)
 }
@@ -810,23 +1005,21 @@ fn linear_combination_matches(
     if count != expected_count {
         return Ok(false);
     }
-    let (inspected, file) = inspect_open_dvec_under_root(root, path)?;
+    let inspected = inspect_dvec_under_root(root, path)?;
     if inspected.parameter_count != count {
         return Ok(false);
     }
-    let mut target = BufReader::with_capacity(1 << 20, file);
-    if read_header(&mut target)? != count {
-        return Ok(false);
-    }
+    let mut target = VerifiedDvecReader::open(root, &inspected)?;
     let mut matches = true;
     stream_linear_combination_bytes(&mut readers, count, sources, |expected| {
-        let mut actual = [0u8; 4];
-        target.read_exact(&mut actual)?;
+        let actual = target.read_one_f32()?.to_le_bytes();
         if actual != expected {
             matches = false;
         }
         Ok(())
     })?;
+    finish_combination_readers(readers)?;
+    target.finish()?;
     Ok(matches)
 }
 
@@ -841,8 +1034,20 @@ pub fn derive_content_addressed_dvec_combination(
     root: &Path,
     sources: &[(DeltaArtifactRef, f64)],
 ) -> BrainResult<DeltaArtifactRef> {
+    derive_content_addressed_dvec_combination_after_readers_opened(root, sources, || Ok(()))
+}
+
+fn derive_content_addressed_dvec_combination_after_readers_opened<F>(
+    root: &Path,
+    sources: &[(DeltaArtifactRef, f64)],
+    after_readers_opened: F,
+) -> BrainResult<DeltaArtifactRef>
+where
+    F: FnOnce() -> BrainResult<()>,
+{
     let root = verified_artifact_root(root)?;
     let (mut readers, parameter_count) = combination_readers(&root, sources)?;
+    after_readers_opened()?;
     let mut hasher = Sha256::new();
     hasher.update(MAGIC);
     hasher.update(parameter_count.to_le_bytes());
@@ -850,6 +1055,7 @@ pub fn derive_content_addressed_dvec_combination(
         hasher.update(bytes);
         Ok(())
     })?;
+    finish_combination_readers(readers)?;
     let sha256 = Sha256Digest::parse(format!("{:x}", hasher.finalize()))?;
     Ok(DeltaArtifactRef {
         path: content_output_path(&root, &sha256),
@@ -925,7 +1131,7 @@ fn combine_dvec_under_root(
         return Err(BrainError::Integrity("artifact_already_exists".into()));
     }
     let result = inspect_dvec_under_root(&root, &path)?;
-    if result.parameter_count != count {
+    if result.sha256 != digest || result.parameter_count != count {
         return Err(BrainError::Integrity(
             "artifact_combine_written_count_mismatch".into(),
         ));
@@ -1017,6 +1223,34 @@ mod tests {
     }
 
     #[test]
+    fn streaming_content_addressed_writer_enforces_exact_declared_count() {
+        let root = isolated_root("streaming-content");
+        fs::create_dir_all(&root).unwrap();
+        let writer = ArtifactWriteAuthority::for_test(&root).unwrap();
+
+        let reference = writer
+            .create_content_addressed_dvec_iter(3, [1.25_f32, -2.5, 3.75])
+            .unwrap();
+        assert_eq!(reference.parameter_count, 3);
+        assert_eq!(
+            read_dvec_f32(&root, &reference).unwrap(),
+            vec![1.25, -2.5, 3.75]
+        );
+
+        assert!(writer
+            .create_content_addressed_dvec_iter(3, [1.0_f32, 2.0])
+            .is_err());
+        assert!(writer
+            .create_content_addressed_dvec_iter(2, [1.0_f32, 2.0, 3.0])
+            .is_err());
+        assert!(writer
+            .create_content_addressed_dvec_iter(1, [f32::NAN])
+            .is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn derives_exact_content_addressed_combination_without_materializing() {
         let root = isolated_root("derive-combination");
         fs::create_dir_all(&root).unwrap();
@@ -1033,6 +1267,62 @@ mod tests {
         let materialized = combine_content_addressed_dvec(&root, &sources).unwrap();
         assert_eq!(derived, materialized);
         assert_eq!(read_dvec_f32(&root, &materialized).unwrap().len() as u64, 3);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_combination_rejects_source_mutation_after_reader_authentication() {
+        let root = isolated_root("combination-stream-toctou");
+        fs::create_dir_all(&root).unwrap();
+        let source = create_dvec(&root, "source", &[1.25, -2.5, 3.75]).unwrap();
+        let sources = vec![(source.clone(), 0.5)];
+        let original = fs::read(&source.path).unwrap();
+
+        let derive_error =
+            derive_content_addressed_dvec_combination_after_readers_opened(&root, &sources, || {
+                let mut modifier = fs::OpenOptions::new().write(true).open(&source.path)?;
+                modifier.seek(SeekFrom::Start(HEADER_BYTES))?;
+                modifier.write_all(&9.0_f32.to_le_bytes())?;
+                modifier.sync_all()?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(derive_error
+            .to_string()
+            .contains("artifact_stream_consumed_digest_mismatch"));
+
+        let mut modifier = fs::OpenOptions::new()
+            .write(true)
+            .open(&source.path)
+            .unwrap();
+        modifier.seek(SeekFrom::Start(HEADER_BYTES)).unwrap();
+        modifier
+            .write_all(
+                &original
+                    [HEADER_BYTES as usize..HEADER_BYTES as usize + std::mem::size_of::<f32>()],
+            )
+            .unwrap();
+        modifier.sync_all().unwrap();
+        drop(modifier);
+        assert_eq!(sha256_file(&source.path).unwrap(), source.sha256);
+
+        let destination = output_path(&root, "must-not-publish").unwrap();
+        let materialize_error = stage_private_file(&root, &destination, |file| {
+            write_linear_combination_after_readers_opened(&root, file, &sources, || {
+                let mut modifier = fs::OpenOptions::new().write(true).open(&source.path)?;
+                modifier.seek(SeekFrom::Start(HEADER_BYTES))?;
+                modifier.write_all(&11.0_f32.to_le_bytes())?;
+                modifier.sync_all()?;
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(materialize_error
+            .to_string()
+            .contains("artifact_stream_consumed_digest_mismatch"));
+        assert!(!destination.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1182,5 +1472,62 @@ mod tests {
 
         fs::remove_dir_all(trusted).unwrap();
         fs::remove_dir_all(foreign).unwrap();
+    }
+
+    #[test]
+    fn verified_stream_rejects_in_place_change_even_after_original_is_restored() {
+        let root = isolated_root("stream-consumed-identity");
+        fs::create_dir_all(&root).unwrap();
+        let reference = create_content_addressed_dvec(&root, &[1.25, -2.5, 3.75]).unwrap();
+        let original = fs::read(&reference.path).unwrap();
+        let mut stream = VerifiedDvecReader::open(&root, &reference).unwrap();
+
+        // Real same-inode writes, performed deterministically between open and
+        // consumption. Restoration defeats a post-hoc rehash of the file.
+        let mut modifier = fs::OpenOptions::new()
+            .write(true)
+            .open(&reference.path)
+            .unwrap();
+        modifier.seek(SeekFrom::Start(HEADER_BYTES)).unwrap();
+        modifier.write_all(&9.0_f32.to_le_bytes()).unwrap();
+        modifier.sync_all().unwrap();
+        assert_eq!(stream.read_f32(1).unwrap(), vec![9.0]);
+        modifier.seek(SeekFrom::Start(0)).unwrap();
+        modifier.write_all(&original).unwrap();
+        modifier.sync_all().unwrap();
+        assert_eq!(sha256_file(&reference.path).unwrap(), reference.sha256);
+        assert_eq!(stream.read_f32(2).unwrap(), vec![-2.5, 3.75]);
+        assert!(stream
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("consumed_digest_mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_stream_authenticates_chunked_content_and_rejects_growth() {
+        let root = isolated_root("stream-eof-identity");
+        fs::create_dir_all(&root).unwrap();
+        let reference = create_content_addressed_dvec(&root, &[1.25, -2.5, 3.75]).unwrap();
+        let mut stream = VerifiedDvecReader::open(&root, &reference).unwrap();
+        assert_eq!(stream.read_f32(1).unwrap(), vec![1.25]);
+        assert_eq!(stream.read_f32(2).unwrap(), vec![-2.5, 3.75]);
+        stream.finish().unwrap();
+
+        let mut stream = VerifiedDvecReader::open(&root, &reference).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&reference.path)
+            .unwrap()
+            .write_all(&[0u8])
+            .unwrap();
+        stream.read_f32(3).unwrap();
+        assert!(stream
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("trailing_bytes"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
