@@ -38,6 +38,10 @@ pub struct UniversalCapabilityCompilationRequest {
     pub protected_cortex: ProtectedCortex,
     pub risk_metric_rows: Vec<Vec<f64>>,
     pub policy: ReceiverCompilerPolicy,
+    /// Explicit opt-in to a target-independent serialized compiler. Legacy
+    /// requests retain their exact wire representation when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_compiler: Option<crate::receiver_compiler::FrozenReceiverCompiler>,
 }
 
 /// The only dispositions this experimental boundary can produce.
@@ -125,18 +129,49 @@ pub fn compile_experimental_universal_capability(
     risk_metric: &Matrix,
     policy: &ReceiverCompilerPolicy,
 ) -> BrainResult<UniversalCapabilityCompilation> {
-    envelope.verify_manifest()?;
-    ir.validate_against(envelope)?;
-    operational.validate_against(ir)?;
-
-    let receiver = compile_receiver_capability(
+    compile_experimental_with_frozen(
+        envelope,
         ir,
         operational,
         calibration,
         protected_cortex,
         risk_metric,
         policy,
-    )?;
+        None,
+    )
+}
+
+fn compile_experimental_with_frozen(
+    envelope: &SystemEnvelope,
+    ir: &CapabilityIr,
+    operational: &OperationalCapabilityContract,
+    calibration: &ReceiverCalibrationSet,
+    protected_cortex: &ProtectedCortex,
+    risk_metric: &Matrix,
+    policy: &ReceiverCompilerPolicy,
+    frozen: Option<&crate::receiver_compiler::FrozenReceiverCompiler>,
+) -> BrainResult<UniversalCapabilityCompilation> {
+    envelope.verify_manifest()?;
+    ir.validate_against(envelope)?;
+    operational.validate_against(ir)?;
+
+    let receiver = if let Some(frozen) = frozen {
+        frozen.validate_binding(calibration, protected_cortex, risk_metric, policy)?;
+        frozen.verify()?.compile_capability(
+            ir,
+            operational,
+            &calibration.wrong_functional_signatures,
+        )?
+    } else {
+        compile_receiver_capability(
+            ir,
+            operational,
+            calibration,
+            protected_cortex,
+            risk_metric,
+            policy,
+        )?
+    };
     let disposition = if receiver.allowed && receiver.operational_verification.allowed {
         UniversalCapabilityDisposition::ExperimentalOnly
     } else {
@@ -170,7 +205,7 @@ pub fn compile_experimental_universal_capability_request(
             "universal_capability_compilation_risk_metric_shape".into(),
         ));
     }
-    compile_experimental_universal_capability(
+    compile_experimental_with_frozen(
         &request.system_envelope,
         &request.capability_ir,
         &request.operational_contract,
@@ -178,6 +213,7 @@ pub fn compile_experimental_universal_capability_request(
         &request.protected_cortex,
         &risk_metric,
         &request.policy,
+        request.frozen_compiler.as_ref(),
     )
 }
 
@@ -528,6 +564,7 @@ mod tests {
         let functional = calibration();
         let request = UniversalCapabilityCompilationRequest {
             schema: "cerebro.tidex.universal_capability_compilation_request/v1".into(),
+            frozen_compiler: None,
             system_envelope: envelope,
             capability_ir: ir,
             operational_contract: operational,
@@ -646,6 +683,7 @@ mod tests {
             schema: "cerebro.tidex.universal_capability_planning_request/v1".into(),
             compilation: UniversalCapabilityCompilationRequest {
                 schema: "cerebro.tidex.universal_capability_compilation_request/v1".into(),
+                frozen_compiler: None,
                 system_envelope: envelope,
                 capability_ir: ir,
                 operational_contract: operational,
@@ -843,6 +881,7 @@ mod tests {
             schema: "cerebro.tidex.universal_capability_planning_request/v1".into(),
             compilation: UniversalCapabilityCompilationRequest {
                 schema: "cerebro.tidex.universal_capability_compilation_request/v1".into(),
+                frozen_compiler: None,
                 system_envelope: envelope,
                 capability_ir: ir.clone(),
                 operational_contract: operational,
@@ -1011,12 +1050,43 @@ mod tests {
 
     #[test]
     fn convergence_physical_backends_write_real_checkpoints_and_replay_without_activation() {
+        check_physical_backends(false);
+    }
+
+    #[test]
+    fn frozen_compiler_drives_all_four_physical_backends_without_activation() {
+        check_physical_backends(true);
+    }
+
+    fn check_physical_backends(use_frozen: bool) {
         use crate::checkpoint_adapter::{
             authenticate_compiled_checkpoint, materialize_compiled_checkpoint,
             CompiledCheckpointBackend,
         };
         use crate::weight_actuator::read_model_tensor_f32;
-        let (root, template) = physical_checkpoint_fixture();
+        let (root, mut template) = physical_checkpoint_fixture();
+        if use_frozen {
+            use crate::receiver_compiler::{
+                freeze_receiver_compiler, FrozenReceiverCompilerInput, ReceiverProposalMethod,
+            };
+            let compilation = &mut template.planning.compilation;
+            let mut calibration = compilation.calibration.clone();
+            calibration.wrong_functional_signatures.clear();
+            let input = FrozenReceiverCompilerInput {
+                schema: "cerebro.tidex.frozen_receiver_compiler_input/v1".into(),
+                calibration_capability_ids: (0..calibration.functional_signatures.len())
+                    .map(|i| CapabilityId::parse(format!("calibration.physical.{i}")).unwrap())
+                    .collect(),
+                calibration,
+                protected_cortex: compilation.protected_cortex.clone(),
+                risk_metric_rows: compilation.risk_metric_rows.clone(),
+                policy: compilation.policy.clone(),
+                proposal_method: ReceiverProposalMethod::DecodeThenProject,
+            };
+            let frozen = freeze_receiver_compiler(&input).unwrap();
+            let bytes = serde_json::to_vec(&frozen).unwrap();
+            compilation.frozen_compiler = Some(serde_json::from_slice(&bytes).unwrap());
+        }
         let base_path = root.join("physical-base.safetensors");
         let base_bytes = fs::read(&base_path).unwrap();
         let low_rank = template.backend.clone();

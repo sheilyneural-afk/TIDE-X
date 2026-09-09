@@ -136,6 +136,27 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let home = configured_tidex_home()?;
             acquire_workspace(&home, Some(Path::new(path)))?
         }
+        [area, command, path] if area == "receiver" && command == "freeze-compiler" => {
+            let input: cerebro_tidex::receiver_compiler::FrozenReceiverCompilerInput =
+                read_json_bounded(Path::new(path))?;
+            let frozen = cerebro_tidex::receiver_compiler::freeze_receiver_compiler(&input)?;
+            println!("{}", serde_json::to_string_pretty(&frozen)?);
+        }
+        [area, command, path] if area == "receiver" && command == "verify-compiler" => {
+            let frozen: cerebro_tidex::receiver_compiler::FrozenReceiverCompiler =
+                read_json_bounded(Path::new(path))?;
+            frozen.verify()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema": "cerebro.tidex.frozen_receiver_compiler_verification/v1",
+                    "manifest_sha256": frozen.manifest_sha256(),
+                    "calibration_replay_verified": true,
+                    "model_execution_verified": false,
+                    "authorizes_promotion": false
+                }))?
+            );
+        }
         [area, command, path] if area == "benchmark" && command == "response" => {
             let input: cerebro_tidex::receiver_compiler::ReceiverSignatureBenchmarkInput =
                 read_benchmark_json_bounded(Path::new(path))?;
@@ -700,6 +721,8 @@ fn usage() -> &'static str {
         "  tidex benchmark portability <input.json>\n",
         "  tidex benchmark response <input.json>\n",
         "  tidex benchmark receiver-basis <input.json>\n",
+        "  tidex receiver freeze-compiler <input.json>\n",
+        "  tidex receiver verify-compiler <compiler.json>\n",
         "  tidex receiver describe-readout <input.json>\n",
         "  tidex receiver acquire-readout <input.json>\n",
         "  tidex receiver import-axis <values-reference.json>\n",

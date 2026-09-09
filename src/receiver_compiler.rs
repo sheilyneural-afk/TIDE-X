@@ -18,6 +18,7 @@ use crate::capability_ir::{
     OperationalInterfaceVerification,
 };
 use crate::contracts::{BrainConfig, ProtectedCortex};
+use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
 use crate::identifiability::{resolution_map, ResolutionMap};
 use crate::identity::CapabilityId;
@@ -486,6 +487,14 @@ pub fn compile_receiver_capability(
         risk_metric,
         policy,
     )?;
+    finish_operational_compilation(ir, operational, numerical)
+}
+
+fn finish_operational_compilation(
+    ir: &CapabilityIr,
+    operational: &OperationalCapabilityContract,
+    numerical: ReceiverSignatureCompilation,
+) -> BrainResult<ReceiverCompilation> {
     let operational_verification =
         operational.verify_receiver_signature(ir, &numerical.predicted_functional_signature)?;
     Ok(ReceiverCompilation {
@@ -888,6 +897,330 @@ fn compile_signature_with_method(
     )
 }
 
+/// Target-independent learned state. Its maps are produced by the existing
+/// transport solvers, not by a second compilation implementation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ReceiverCompilerMaps {
+    decoder: crate::transport::FunctionalTransplantMap,
+    encoder: crate::transport::ValidatedTransportMap,
+    decoder_fit_diagnostics: Option<AffineTransportDiagnostics>,
+    encoder_fit_diagnostics: Option<AffineTransportDiagnostics>,
+    minimum_functional_anchor_separation: Option<f64>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPILER_FIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn fit_receiver_compiler_maps(
+    calibration: &ReceiverCalibrationSet,
+    policy: &ReceiverCompilerPolicy,
+    proposal_method: ReceiverProposalMethod,
+) -> BrainResult<ReceiverCompilerMaps> {
+    #[cfg(test)]
+    COMPILER_FIT_CALLS.with(|count| count.set(count.get() + 1));
+    let calibrated_affine = proposal_method == ReceiverProposalMethod::CalibratedAffine;
+    let minimum_functional_anchor_separation = if calibrated_affine {
+        Some(validate_functional_anchor_identity(
+            &calibration.functional_signatures,
+        )?)
+    } else {
+        None
+    };
+    // Each direction and each LOO fold retains its own training-only scale.
+    let (decoder, decoder_fit_diagnostics, encoder, encoder_fit_diagnostics) = if calibrated_affine
+    {
+        let regression = AffineTransportPolicy::CenteredTraceRidge {
+            relative_ridge: policy.ridge,
+        };
+        let (decoder, decoder_diagnostics) = learn_functional_transplant_with_policy(
+            &calibration.functional_signatures,
+            &calibration.receiver_solutions,
+            &regression,
+        )?;
+        let (encoder, encoder_diagnostics) = learn_transport_validated_with_policy(
+            &calibration.receiver_solutions,
+            &calibration.functional_signatures,
+            &regression,
+        )?;
+        (
+            decoder,
+            Some(decoder_diagnostics),
+            encoder,
+            Some(encoder_diagnostics),
+        )
+    } else {
+        let decoder = learn_functional_transplant(
+            &calibration.functional_signatures,
+            &calibration.receiver_solutions,
+            policy.ridge,
+        )?;
+        let encoder = learn_transport_validated(
+            &calibration.receiver_solutions,
+            &calibration.functional_signatures,
+            policy.ridge,
+        )?;
+        (decoder, None, encoder, None)
+    };
+    Ok(ReceiverCompilerMaps {
+        decoder,
+        encoder,
+        decoder_fit_diagnostics,
+        encoder_fit_diagnostics,
+        minimum_functional_anchor_separation,
+    })
+}
+
+/// This input has no target. Wrong signatures belong to a later query and must
+/// be empty here. Receiver identity, calibration lineage, method and safety
+/// policy are all part of the frozen artifact's identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenReceiverCompilerInput {
+    pub schema: String,
+    pub calibration_capability_ids: Vec<crate::identity::CapabilityId>,
+    pub calibration: ReceiverCalibrationSet,
+    pub protected_cortex: ProtectedCortex,
+    pub risk_metric_rows: Vec<Vec<f64>>,
+    pub policy: ReceiverCompilerPolicy,
+    pub proposal_method: ReceiverProposalMethod,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenReceiverCompiler {
+    schema: String,
+    input: FrozenReceiverCompilerInput,
+    maps: ReceiverCompilerMaps,
+    maximum_functional_leverage: f64,
+    manifest_sha256: Sha256Digest,
+}
+
+/// Non-deserializable, read-only handle. Only replay verification can construct
+/// it. Verifying a serialized compiler replays calibration; applying this handle
+/// to any number of targets performs no map fitting and no receiver training.
+pub struct VerifiedFrozenReceiverCompiler<'a> {
+    frozen: &'a FrozenReceiverCompiler,
+}
+
+pub fn freeze_receiver_compiler(
+    input: &FrozenReceiverCompilerInput,
+) -> BrainResult<FrozenReceiverCompiler> {
+    input.policy.validate()?;
+    let calibration = &input.calibration;
+    let n = calibration.functional_signatures.len();
+    let f = calibration
+        .functional_signatures
+        .first()
+        .map_or(0, Vec::len);
+    let k = calibration.receiver_solutions.first().map_or(0, Vec::len);
+    if input.schema != "cerebro.tidex.frozen_receiver_compiler_input/v1"
+        || !(5..=256).contains(&n)
+        || !(1..=256).contains(&f)
+        || !(1..=256).contains(&k)
+        || calibration.receiver_solutions.len() != n
+        || !calibration.wrong_functional_signatures.is_empty()
+        || calibration
+            .receiver_snapshot_binding_sha256
+            .as_ref()
+            .is_none_or(|value| *value == Sha256Digest::zero())
+        || input.calibration_capability_ids.len() != n
+        || input
+            .calibration_capability_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != n
+        || input.protected_cortex.parameter_importance.len() != k
+        || input.protected_cortex.directions.len() > 256
+        || input.risk_metric_rows.len() != k
+        || input.risk_metric_rows.iter().any(|row| row.len() != k)
+        || !matches!(
+            input.proposal_method,
+            ReceiverProposalMethod::DecodeThenProject | ReceiverProposalMethod::CalibratedAffine
+        )
+    {
+        return Err(BrainError::Invalid(
+            "frozen_receiver_compiler_input_invalid".into(),
+        ));
+    }
+    // Preserve the established cubic-work ceiling before invoking any solver.
+    let work = (n as u128 + 1)
+        * ((k as u128 + 1) * (f as u128 + 1).pow(3) + (f as u128 + 1) * (k as u128 + 1).pow(3));
+    if work > 250_000_000 {
+        return Err(BrainError::Invalid(
+            "frozen_receiver_compiler_work_limit".into(),
+        ));
+    }
+    validate_rows(
+        &calibration.functional_signatures,
+        Some(f),
+        "frozen_functional",
+    )?;
+    validate_rows(&calibration.receiver_solutions, Some(k), "frozen_receiver")?;
+    // Distinct labels must not turn identical (or numerically indistinguishable)
+    // functional observations into independent calibration capabilities. This
+    // applies to every frozen method, not only centered affine regression.
+    validate_functional_anchor_identity(&calibration.functional_signatures)?;
+    let risk_metric = Matrix::from_rows(&input.risk_metric_rows)?;
+    let zero = vec![0.0; k];
+    project_to_safe_subspace(&zero, &input.protected_cortex)?;
+    apply_quadratic_trust_region(&risk_metric, &zero, input.policy.maximum_quadratic_cost)?;
+    let maps = fit_receiver_compiler_maps(calibration, &input.policy, input.proposal_method)?;
+    if !maps.decoder.resolved
+        || !maps.encoder.resolved
+        || maps.decoder.loo_cv_r2 < input.policy.minimum_decoder_loo_r2
+        || maps.encoder.loo_cv_r2 < input.policy.minimum_encoder_loo_r2
+        || maps.decoder.min_loo_cosine < input.policy.minimum_decoder_loo_cosine
+    {
+        return Err(BrainError::Integrity(
+            "frozen_receiver_calibration_gates_failed".into(),
+        ));
+    }
+    let (_, maximum_functional_leverage) = crate::transport::functional_support_envelope(
+        &calibration.functional_signatures,
+        &calibration.functional_signatures[0],
+        input.policy.ridge,
+    )?;
+    let mut frozen = FrozenReceiverCompiler {
+        schema: "cerebro.tidex.frozen_receiver_compiler/v1".into(),
+        input: input.clone(),
+        maps,
+        maximum_functional_leverage,
+        manifest_sha256: Sha256Digest::zero(),
+    };
+    frozen.manifest_sha256 = Sha256Digest::digest_domain(
+        b"CEREBRO:TIDEX:FROZEN-RECEIVER-COMPILER:v1\0",
+        &serde_json::to_vec(&frozen)?,
+    );
+    Ok(frozen)
+}
+
+impl FrozenReceiverCompiler {
+    pub fn manifest_sha256(&self) -> &Sha256Digest {
+        &self.manifest_sha256
+    }
+
+    pub fn input(&self) -> &FrozenReceiverCompilerInput {
+        &self.input
+    }
+
+    /// A coherent caller-supplied hash is not proof of correct learned maps.
+    /// Refit only for this explicit authentication step and compare exact wire
+    /// bytes, including diagnostics and signed zero. Never replace stored maps.
+    pub fn verify(&self) -> BrainResult<VerifiedFrozenReceiverCompiler<'_>> {
+        let replay = freeze_receiver_compiler(&self.input)?;
+        if serde_json::to_vec(&replay)? != serde_json::to_vec(self)? {
+            return Err(BrainError::Integrity(
+                "frozen_receiver_compiler_replay_mismatch".into(),
+            ));
+        }
+        Ok(VerifiedFrozenReceiverCompiler { frozen: self })
+    }
+
+    pub fn validate_binding(
+        &self,
+        calibration: &ReceiverCalibrationSet,
+        protected_cortex: &ProtectedCortex,
+        risk_metric: &Matrix,
+        policy: &ReceiverCompilerPolicy,
+    ) -> BrainResult<()> {
+        let input = &self.input;
+        if input.calibration.receiver_snapshot_binding_sha256
+            != calibration.receiver_snapshot_binding_sha256
+            || input.calibration.functional_signatures != calibration.functional_signatures
+            || input.calibration.receiver_solutions != calibration.receiver_solutions
+            || input.protected_cortex != *protected_cortex
+            || Matrix::from_rows(&input.risk_metric_rows)? != *risk_metric
+            || input.policy != *policy
+        {
+            return Err(BrainError::Integrity(
+                "frozen_receiver_compiler_binding_mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl VerifiedFrozenReceiverCompiler<'_> {
+    pub fn compile_capability(
+        &self,
+        ir: &CapabilityIr,
+        operational: &OperationalCapabilityContract,
+        wrong_functional_signatures: &[Vec<f64>],
+    ) -> BrainResult<ReceiverCompilation> {
+        operational.validate_against(ir)?;
+        let requested = operational.canonical_transition_signature(ir)?;
+        let numerical =
+            self.compile(ir.capability_id(), &requested, wrong_functional_signatures)?;
+        finish_operational_compilation(ir, operational, numerical)
+    }
+
+    /// Apply the already-verified maps. All target-specific preservation,
+    /// inverse, identity and trust-region gates still run in the shared core.
+    pub fn compile(
+        &self,
+        capability_id: &crate::identity::CapabilityId,
+        requested: &[f64],
+        wrong_functional_signatures: &[Vec<f64>],
+    ) -> BrainResult<ReceiverSignatureCompilation> {
+        let input = &self.frozen.input;
+        if input.calibration_capability_ids.contains(capability_id)
+            || input
+                .calibration
+                .functional_signatures
+                .iter()
+                .any(|row| row == requested)
+        {
+            return Err(BrainError::Integrity(
+                "frozen_receiver_target_leaked_into_calibration".into(),
+            ));
+        }
+        if wrong_functional_signatures.len() > 256 {
+            return Err(BrainError::Invalid(
+                "frozen_receiver_wrong_signature_limit".into(),
+            ));
+        }
+        if requested.len() != input.calibration.functional_signatures[0].len()
+            || requested.iter().any(|value| !value.is_finite())
+        {
+            return Err(BrainError::Invalid("frozen_receiver_query_shape".into()));
+        }
+        // The same floating-point identity criterion used during freezing also
+        // applies to the target. A relabel plus a rounding-sized perturbation
+        // is not evidence of a held-out capability.
+        norm(requested)?;
+        let mut identities = input.calibration.functional_signatures.clone();
+        identities.push(requested.to_vec());
+        validate_functional_anchor_identity(&identities).map_err(|_| {
+            BrainError::Integrity("frozen_receiver_target_leaked_into_calibration".into())
+        })?;
+        let mut calibration = input.calibration.clone();
+        calibration.wrong_functional_signatures = wrong_functional_signatures.to_vec();
+        let mut numerical = compile_signature_with_maps(
+            requested,
+            &calibration,
+            &input.protected_cortex,
+            &Matrix::from_rows(&input.risk_metric_rows)?,
+            &input.policy,
+            input.proposal_method,
+            ReceiverProposalValidationProfile::ParametricCrossValidation,
+            Some(&self.frozen.maps),
+        )?;
+        let leverage = crate::transport::functional_leverage(
+            &input.calibration.functional_signatures,
+            requested,
+            input.policy.ridge,
+        )?;
+        numerical.proposal_within_calibrated_support =
+            leverage <= self.frozen.maximum_functional_leverage * (1.0 + 1e-10);
+        numerical.allowed &= numerical.proposal_within_calibrated_support;
+        Ok(numerical)
+    }
+}
+
 fn compile_signature_with_method_and_validation(
     requested: &[f64],
     calibration: &ReceiverCalibrationSet,
@@ -896,6 +1229,28 @@ fn compile_signature_with_method_and_validation(
     policy: &ReceiverCompilerPolicy,
     proposal_method: ReceiverProposalMethod,
     validation_profile: ReceiverProposalValidationProfile,
+) -> BrainResult<ReceiverSignatureCompilation> {
+    compile_signature_with_maps(
+        requested,
+        calibration,
+        protected_cortex,
+        risk_metric,
+        policy,
+        proposal_method,
+        validation_profile,
+        None,
+    )
+}
+
+fn compile_signature_with_maps(
+    requested: &[f64],
+    calibration: &ReceiverCalibrationSet,
+    protected_cortex: &ProtectedCortex,
+    risk_metric: &Matrix,
+    policy: &ReceiverCompilerPolicy,
+    proposal_method: ReceiverProposalMethod,
+    validation_profile: ReceiverProposalValidationProfile,
+    fitted: Option<&ReceiverCompilerMaps>,
 ) -> BrainResult<ReceiverSignatureCompilation> {
     policy.validate()?;
     if matches!(
@@ -974,50 +1329,19 @@ fn compile_signature_with_method_and_validation(
         return Err(BrainError::Invalid("receiver_compiler_safety_shape".into()));
     }
 
-    let calibrated_affine = proposal_method == ReceiverProposalMethod::CalibratedAffine;
-    let minimum_functional_anchor_separation = if calibrated_affine {
-        Some(validate_functional_anchor_identity(
-            &calibration.functional_signatures,
-        )?)
-    } else {
-        None
+    let freshly_fitted;
+    let maps = match fitted {
+        Some(maps) => maps,
+        None => {
+            freshly_fitted = fit_receiver_compiler_maps(calibration, policy, proposal_method)?;
+            &freshly_fitted
+        }
     };
-    // The forward decoder and inverse have different input geometry. Each fit
-    // derives its own scale from exactly its training rows, including inner LOO.
-    let (decoder, decoder_fit_diagnostics, encoder, encoder_fit_diagnostics) = if calibrated_affine
-    {
-        let regression = AffineTransportPolicy::CenteredTraceRidge {
-            relative_ridge: policy.ridge,
-        };
-        let (decoder, decoder_diagnostics) = learn_functional_transplant_with_policy(
-            &calibration.functional_signatures,
-            &calibration.receiver_solutions,
-            &regression,
-        )?;
-        let (encoder, encoder_diagnostics) = learn_transport_validated_with_policy(
-            &calibration.receiver_solutions,
-            &calibration.functional_signatures,
-            &regression,
-        )?;
-        (
-            decoder,
-            Some(decoder_diagnostics),
-            encoder,
-            Some(encoder_diagnostics),
-        )
-    } else {
-        let decoder = learn_functional_transplant(
-            &calibration.functional_signatures,
-            &calibration.receiver_solutions,
-            policy.ridge,
-        )?;
-        let encoder = learn_transport_validated(
-            &calibration.receiver_solutions,
-            &calibration.functional_signatures,
-            policy.ridge,
-        )?;
-        (decoder, None, encoder, None)
-    };
+    let decoder = &maps.decoder;
+    let encoder = &maps.encoder;
+    let decoder_fit_diagnostics = maps.decoder_fit_diagnostics.clone();
+    let encoder_fit_diagnostics = maps.encoder_fit_diagnostics.clone();
+    let minimum_functional_anchor_separation = maps.minimum_functional_anchor_separation;
     let (
         proposed,
         proposal_within_calibrated_support,
@@ -1401,6 +1725,235 @@ pub fn benchmark_receiver_portability_leave_one_out(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frozen_input(method: ReceiverProposalMethod) -> FrozenReceiverCompilerInput {
+        let mut calibration = coupled_calibration();
+        calibration.receiver_snapshot_binding_sha256 =
+            Some(Sha256Digest::digest_bytes(b"receiver-A"));
+        calibration.wrong_functional_signatures.clear();
+        FrozenReceiverCompilerInput {
+            schema: "cerebro.tidex.frozen_receiver_compiler_input/v1".into(),
+            calibration_capability_ids: (0..calibration.functional_signatures.len())
+                .map(|i| crate::identity::CapabilityId::parse(format!("calibration.{i}")).unwrap())
+                .collect(),
+            calibration,
+            protected_cortex: ProtectedCortex {
+                parameter_importance: vec![0.0; 2],
+                directions: vec![],
+                max_damage_ratio: 0.01,
+            },
+            risk_metric_rows: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            policy: response_policy(),
+            proposal_method: method,
+        }
+    }
+
+    #[test]
+    fn frozen_compiler_roundtrip_reuses_maps_without_target_time_fitting() {
+        for method in [
+            ReceiverProposalMethod::DecodeThenProject,
+            ReceiverProposalMethod::CalibratedAffine,
+        ] {
+            let input = frozen_input(method);
+            let frozen = freeze_receiver_compiler(&input).unwrap();
+            let bytes = serde_json::to_vec(&frozen).unwrap();
+            let reopened: FrozenReceiverCompiler = serde_json::from_slice(&bytes).unwrap();
+            let verified = reopened.verify().unwrap();
+            for (i, requested) in [vec![0.2, 0.4], vec![0.3, 0.8], vec![-0.1, 0.2]]
+                .iter()
+                .enumerate()
+            {
+                let wrong = vec![requested.iter().map(|v| -v).collect::<Vec<_>>()];
+                let before = COMPILER_FIT_CALLS.with(|count| count.get());
+                let result = verified
+                    .compile(
+                        &crate::identity::CapabilityId::parse(format!("heldout.{i}")).unwrap(),
+                        requested,
+                        &wrong,
+                    )
+                    .unwrap();
+                assert_eq!(COMPILER_FIT_CALLS.with(|count| count.get()), before);
+                assert!(result.allowed, "{result:#?}");
+                let mut calibration = input.calibration.clone();
+                calibration.wrong_functional_signatures = wrong;
+                let legacy = compile_signature_with_method_and_validation(
+                    requested,
+                    &calibration,
+                    &input.protected_cortex,
+                    &Matrix::identity(2),
+                    &input.policy,
+                    method,
+                    ReceiverProposalValidationProfile::ParametricCrossValidation,
+                )
+                .unwrap();
+                assert_eq!(result, legacy);
+            }
+            assert_eq!(serde_json::to_vec(&reopened).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn frozen_compiler_rejects_rehashed_forged_maps_and_diagnostics() {
+        let frozen =
+            freeze_receiver_compiler(&frozen_input(ReceiverProposalMethod::DecodeThenProject))
+                .unwrap();
+        for change in 0..3 {
+            let mut forged = frozen.clone();
+            match change {
+                0 => forged.maps.decoder.target_decoder.weights.set(0, 0, 999.0),
+                1 => forged.maps.encoder.loo_cv_r2 -= 0.5,
+                _ => forged.maps.encoder.map.target_dim += 1,
+            }
+            forged.manifest_sha256 = Sha256Digest::zero();
+            forged.manifest_sha256 = Sha256Digest::digest_domain(
+                b"CEREBRO:TIDEX:FROZEN-RECEIVER-COMPILER:v1\0",
+                &serde_json::to_vec(&forged).unwrap(),
+            );
+            assert!(forged.verify().is_err());
+        }
+    }
+
+    #[test]
+    fn frozen_compiler_rejects_unsupported_extrapolation_even_with_a_good_inverse() {
+        let mut input = frozen_input(ReceiverProposalMethod::DecodeThenProject);
+        input.policy.maximum_quadratic_cost = 1e9;
+        let frozen = freeze_receiver_compiler(&input).unwrap();
+        let verified = frozen.verify().unwrap();
+        let result = verified
+            .compile(
+                &crate::identity::CapabilityId::parse("heldout.ood").unwrap(),
+                &[100.0, 400.0],
+                &[vec![-100.0, -400.0]],
+            )
+            .unwrap();
+        assert!(result.functional_relative_error < input.policy.maximum_functional_relative_error);
+        assert!(!result.proposal_within_calibrated_support);
+        assert!(!result.allowed);
+    }
+
+    #[test]
+    fn frozen_compiler_rejects_target_leakage_and_changed_bindings() {
+        let input = frozen_input(ReceiverProposalMethod::DecodeThenProject);
+        let frozen = freeze_receiver_compiler(&input).unwrap();
+        let verified = frozen.verify().unwrap();
+        let wrong = vec![vec![-0.2, -0.4]];
+        assert!(verified
+            .compile(&input.calibration_capability_ids[0], &[0.2, 0.4], &wrong)
+            .is_err());
+        let id = crate::identity::CapabilityId::parse("heldout.target").unwrap();
+        assert!(verified
+            .compile(&id, &input.calibration.functional_signatures[0], &wrong)
+            .is_err());
+        for change in 0..5 {
+            let mut altered = input.clone();
+            match change {
+                0 => {
+                    altered.calibration.receiver_snapshot_binding_sha256 =
+                        Some(Sha256Digest::digest_bytes(b"other-model"))
+                }
+                1 => altered.calibration.receiver_solutions[0][0] += 0.01,
+                2 => altered.policy.maximum_quadratic_cost *= 2.0,
+                3 => altered.protected_cortex.max_damage_ratio = 1.0,
+                _ => altered.risk_metric_rows[0][0] *= 2.0,
+            }
+            assert!(frozen
+                .validate_binding(
+                    &altered.calibration,
+                    &altered.protected_cortex,
+                    &Matrix::from_rows(&altered.risk_metric_rows).unwrap(),
+                    &altered.policy,
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn frozen_compiler_rejects_relabeled_duplicate_and_roundoff_target_observations() {
+        for method in [
+            ReceiverProposalMethod::DecodeThenProject,
+            ReceiverProposalMethod::CalibratedAffine,
+        ] {
+            let input = frozen_input(method);
+            let mut duplicated = input.clone();
+            duplicated.calibration.functional_signatures[1] =
+                duplicated.calibration.functional_signatures[0].clone();
+            duplicated.calibration.receiver_solutions[1] =
+                duplicated.calibration.receiver_solutions[0].clone();
+            assert!(freeze_receiver_compiler(&duplicated)
+                .unwrap_err()
+                .to_string()
+                .contains("functional_identity_collision"));
+
+            let frozen = freeze_receiver_compiler(&input).unwrap();
+            let verified = frozen.verify().unwrap();
+            let mut relabeled = input.calibration.functional_signatures[0].clone();
+            relabeled[0] += f64::EPSILON;
+            let error = verified
+                .compile(
+                    &CapabilityId::parse("relabeled.target").unwrap(),
+                    &relabeled,
+                    &[vec![-0.2, -0.4]],
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("target_leaked_into_calibration"));
+        }
+    }
+
+    #[test]
+    fn frozen_compiler_rejects_unbound_malformed_or_target_bearing_inputs() {
+        let input = frozen_input(ReceiverProposalMethod::DecodeThenProject);
+        for change in 0..7 {
+            let mut altered = input.clone();
+            match change {
+                0 => altered.calibration.receiver_snapshot_binding_sha256 = None,
+                1 => {
+                    altered.calibration_capability_ids[1] =
+                        altered.calibration_capability_ids[0].clone()
+                }
+                2 => altered.calibration.wrong_functional_signatures = vec![vec![0.2, 0.4]],
+                3 => altered.calibration.receiver_solutions[0]
+                    .pop()
+                    .map(|_| ())
+                    .unwrap(),
+                4 => altered.calibration.functional_signatures[0][0] = f64::NAN,
+                5 => altered.proposal_method = ReceiverProposalMethod::FitProtectedCoordinates,
+                _ => altered.risk_metric_rows[0].clear(),
+            }
+            assert!(freeze_receiver_compiler(&altered).is_err());
+        }
+    }
+
+    #[test]
+    fn frozen_compiler_preserves_a_function_of_shared_weights_and_rejects_conflict() {
+        let mut input = frozen_input(ReceiverProposalMethod::DecodeThenProject);
+        let unit = 1.0 / 2.0_f64.sqrt();
+        input.protected_cortex.parameter_importance = vec![1e-5; 2];
+        input.protected_cortex.directions = vec![crate::contracts::ProtectedDirection {
+            probe_id: crate::identity::ProbeId::parse("shared.sum").unwrap(),
+            direction: vec![unit, unit],
+            importance: 1.0,
+        }];
+        let frozen = freeze_receiver_compiler(&input).unwrap();
+        let verified = frozen.verify().unwrap();
+        let id = crate::identity::CapabilityId::parse("heldout.shared").unwrap();
+        let result = verified
+            .compile(&id, &[0.2, 0.4], &[vec![-0.2, -0.4]])
+            .unwrap();
+        assert!(result.allowed, "{result:#?}");
+        let before = [1.0, 2.0];
+        let after = [
+            before[0] + result.target_delta[0],
+            before[1] + result.target_delta[1],
+        ];
+        assert!((after[0] - before[0]).abs() > 0.1);
+        assert!((after[1] - before[1]).abs() > 0.1);
+        assert!((after.iter().sum::<f64>() - before.iter().sum::<f64>()).abs() < 1e-12);
+        // This second target requires moving exactly the protected sum.
+        match verified.compile(&id, &[0.2, 0.8], &[vec![-0.2, -0.8]]) {
+            Ok(conflict) => assert!(!conflict.allowed),
+            Err(_) => (),
+        }
+    }
 
     fn receiver_basis_test_input() -> ReceiverBasisBenchmarkInput {
         let calibration_deltas = vec![

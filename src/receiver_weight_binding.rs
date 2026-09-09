@@ -32,7 +32,7 @@ use crate::contracts::ProtectedCortex;
 use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
 use crate::identity::{AcquisitionId, CapabilityId, ObservationId, ProbeId, SkillId, TensorId};
-use crate::linalg::{dot, norm, solve, Matrix};
+use crate::linalg::{dot, norm, Matrix};
 use crate::pure_capability_e2e::{LinearMapDescriptor, PureCapabilityDiscoveryAuthority};
 use crate::receiver_compiler::{
     compile_receiver_readout_capability, compile_receiver_signature,
@@ -41,6 +41,7 @@ use crate::receiver_compiler::{
     ReceiverReadoutCapabilityInput, ReceiverSignatureCompilation,
 };
 use crate::security::verify_internal_private_root;
+use crate::transport::functional_support_envelope;
 use crate::weight_actuator::{
     authenticate_lora_adapter_axis_receipt, inspect_linear_readout, inspect_model_safetensors,
     materialize_dense_delta_checkpoint, LinearReadoutInspection, LoraAdapterAxisReceipt,
@@ -1433,84 +1434,6 @@ fn validate_values(values: &[f64], dimension: usize) -> BrainResult<()> {
         return Err(invalid("receiver_weight_response_shape_or_nonfinite"));
     }
     Ok(())
-}
-
-fn augmented_signature(values: &[f64]) -> Vec<f64> {
-    let mut augmented = Vec::with_capacity(values.len() + 1);
-    augmented.extend_from_slice(values);
-    augmented.push(1.0);
-    augmented
-}
-
-/// Ridge leverage of one functional signature against calibration signatures.
-/// This is a source/functional support test, not a receiver-parameter norm
-/// heuristic.  It is invariant to receiver basis rotations and therefore
-/// better matches the question the compiler actually needs to answer: whether
-/// the target functional query is supported by the calibrated semantic design.
-fn functional_leverage(calibration: &[Vec<f64>], query: &[f64], ridge: f64) -> BrainResult<f64> {
-    if calibration.len() < 4
-        || query.is_empty()
-        || !ridge.is_finite()
-        || ridge <= 0.0
-        || calibration
-            .iter()
-            .any(|row| row.len() != query.len() || row.iter().any(|value| !value.is_finite()))
-        || query.iter().any(|value| !value.is_finite())
-    {
-        return Err(invalid("receiver_weight_functional_support_input_invalid"));
-    }
-    let dimension = query.len() + 1;
-    let mut gram = Matrix::zeros(dimension, dimension);
-    for row in calibration {
-        let augmented = augmented_signature(row);
-        for i in 0..dimension {
-            for j in 0..=i {
-                let value = gram.get(i, j) + augmented[i] * augmented[j];
-                gram.set(i, j, value);
-                if i != j {
-                    gram.set(j, i, value);
-                }
-            }
-        }
-    }
-    for index in 0..dimension {
-        gram.set(index, index, gram.get(index, index) + ridge);
-    }
-    let query = augmented_signature(query);
-    let solved = solve(gram, query.clone())?;
-    let leverage = dot(&query, &solved)?;
-    if !leverage.is_finite() || leverage < 0.0 {
-        return Err(BrainError::Numerical(
-            "receiver_weight_functional_support_nonfinite".into(),
-        ));
-    }
-    Ok(leverage)
-}
-
-/// Data-derived support envelope. Each calibration capability is treated once
-/// as if it were a target and scored against all remaining capabilities. The
-/// final target must not have greater leverage than the worst such calibration
-/// holdout. No target receiver solution is required for this gate.
-fn functional_support_envelope(
-    calibration: &[Vec<f64>],
-    query: &[f64],
-    ridge: f64,
-) -> BrainResult<(f64, f64)> {
-    if calibration.len() < 5 {
-        return Err(invalid("receiver_weight_functional_support_anchor_count"));
-    }
-    let mut maximum_loo = 0.0_f64;
-    for holdout in 0..calibration.len() {
-        let train = calibration
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != holdout)
-            .map(|(_, row)| row.clone())
-            .collect::<Vec<_>>();
-        maximum_loo = maximum_loo.max(functional_leverage(&train, &calibration[holdout], ridge)?);
-    }
-    let query_score = functional_leverage(calibration, query, ridge)?;
-    Ok((query_score, maximum_loo))
 }
 
 fn validate_target(

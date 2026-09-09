@@ -54,7 +54,8 @@ pub struct AffineTransportDiagnostics {
     pub leave_one_out: Vec<AffineFitDiagnostics>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportMap {
     pub source_dim: usize,
     pub target_dim: usize,
@@ -63,7 +64,8 @@ pub struct TransportMap {
     pub training_rms: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidatedTransportMap {
     pub schema: String,
     pub map: TransportMap,
@@ -75,7 +77,8 @@ pub struct ValidatedTransportMap {
     pub resolved: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FunctionalTransplantMap {
     pub schema: String,
     pub functional_dim: usize,
@@ -297,15 +300,24 @@ pub fn learn_transport(
 
 impl TransportMap {
     pub fn apply(&self, values: &[f64]) -> BrainResult<Vec<f64>> {
-        if values.len() != self.source_dim
+        self.weights.validate("transport_apply_weights")?;
+        if self.source_dim == 0
+            || self.target_dim == 0
+            || self.weights.row_count() != self.target_dim
+            || self.weights.column_count() != self.source_dim
+            || values.len() != self.source_dim
             || values.iter().any(|value| !value.is_finite())
             || self.bias.len() != self.target_dim
+            || self.bias.iter().any(|value| !value.is_finite())
         {
             return Err(BrainError::Invalid("transport_apply_shape".into()));
         }
         let mut output = self.weights.matvec(values)?;
         for (value, bias) in output.iter_mut().zip(&self.bias) {
             *value += bias;
+            if !value.is_finite() {
+                return Err(BrainError::Numerical("transport_apply_nonfinite".into()));
+            }
         }
         Ok(output)
     }
@@ -787,9 +799,125 @@ impl RelationalTransportMap {
     }
 }
 
+/// Functional-space leverage shared by receiver binding and frozen compilers.
+/// This is the existing calibration-support gate, not a receiver-norm heuristic.
+pub(crate) fn functional_leverage(
+    calibration: &[Vec<f64>],
+    query: &[f64],
+    ridge: f64,
+) -> BrainResult<f64> {
+    if calibration.len() < 4
+        || query.is_empty()
+        || !ridge.is_finite()
+        || ridge <= 0.0
+        || calibration
+            .iter()
+            .any(|row| row.len() != query.len() || row.iter().any(|v| !v.is_finite()))
+        || query.iter().any(|v| !v.is_finite())
+    {
+        return Err(BrainError::Invalid(
+            "receiver_weight_functional_support_input_invalid".into(),
+        ));
+    }
+    let dimension = query.len() + 1;
+    let augment = |values: &[f64]| {
+        let mut augmented = Vec::with_capacity(values.len() + 1);
+        augmented.extend_from_slice(values);
+        augmented.push(1.0);
+        augmented
+    };
+    let mut gram = Matrix::zeros(dimension, dimension);
+    for row in calibration {
+        let augmented = augment(row);
+        for i in 0..dimension {
+            for j in 0..=i {
+                let value = gram.get(i, j) + augmented[i] * augmented[j];
+                gram.set(i, j, value);
+                if i != j {
+                    gram.set(j, i, value);
+                }
+            }
+        }
+    }
+    for index in 0..dimension {
+        gram.set(index, index, gram.get(index, index) + ridge);
+    }
+    let query = augment(query);
+    let solved = solve(gram, query.clone())?;
+    let leverage = dot(&query, &solved)?;
+    if !leverage.is_finite() || leverage < 0.0 {
+        return Err(BrainError::Numerical(
+            "receiver_weight_functional_support_nonfinite".into(),
+        ));
+    }
+    Ok(leverage)
+}
+
+/// Maximum leave-one-capability-out leverage is fixed from calibration alone.
+pub(crate) fn functional_support_envelope(
+    calibration: &[Vec<f64>],
+    query: &[f64],
+    ridge: f64,
+) -> BrainResult<(f64, f64)> {
+    if calibration.len() < 5 {
+        return Err(BrainError::Invalid(
+            "receiver_weight_functional_support_anchor_count".into(),
+        ));
+    }
+    let mut maximum_loo = 0.0_f64;
+    for holdout in 0..calibration.len() {
+        let train = calibration
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != holdout)
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
+        maximum_loo = maximum_loo.max(functional_leverage(&train, &calibration[holdout], ridge)?);
+    }
+    Ok((functional_leverage(calibration, query, ridge)?, maximum_loo))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affine_apply_rejects_mislabeled_shapes_and_nonfinite_bias_or_output() {
+        let valid = TransportMap {
+            source_dim: 1,
+            target_dim: 1,
+            weights: Matrix::identity(1),
+            bias: vec![0.0],
+            training_rms: 0.0,
+        };
+        assert_eq!(valid.apply(&[2.0]).unwrap(), vec![2.0]);
+        let mut malformed = valid.clone();
+        malformed.weights = Matrix::from_rows(&[vec![1.0], vec![2.0]]).unwrap();
+        assert!(malformed.apply(&[2.0]).is_err());
+        let mut malformed = valid.clone();
+        malformed.bias[0] = f64::NAN;
+        assert!(malformed.apply(&[2.0]).is_err());
+        let mut overflow = valid;
+        overflow.weights.set(0, 0, f64::MAX);
+        overflow.bias[0] = f64::MAX;
+        assert!(overflow.apply(&[1.0]).is_err());
+    }
+
+    #[test]
+    fn matrix_wire_validates_geometry_before_creating_a_matrix() {
+        let matrix = Matrix::identity(2);
+        assert_eq!(
+            serde_json::from_slice::<Matrix>(&serde_json::to_vec(&matrix).unwrap()).unwrap(),
+            matrix
+        );
+        for malformed in [
+            serde_json::json!({"rows": 2, "cols": 2, "data": [1.0]}),
+            serde_json::json!({"rows": usize::MAX, "cols": 2, "data": []}),
+            serde_json::json!({"rows": 1, "cols": 1, "data": [1.0], "trusted": true}),
+        ] {
+            assert!(serde_json::from_value::<Matrix>(malformed).is_err());
+        }
+    }
 
     #[test]
     fn centered_trace_ridge_preserves_source_units_and_affine_origins() {

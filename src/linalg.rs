@@ -1,12 +1,35 @@
 #![allow(clippy::needless_range_loop)]
 use crate::error::{BrainError, BrainResult};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Matrix {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
     pub(crate) data: Vec<f64>,
 }
+
+impl<'de> serde::Deserialize<'de> for Matrix {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            rows: usize,
+            cols: usize,
+            data: Vec<f64>,
+        }
+        let wire = <Wire as serde::Deserialize>::deserialize(deserializer)?;
+        let matrix = Matrix {
+            rows: wire.rows,
+            cols: wire.cols,
+            data: wire.data,
+        };
+        matrix
+            .validate("matrix_wire")
+            .map_err(serde::de::Error::custom)?;
+        Ok(matrix)
+    }
+}
+
 impl Matrix {
     pub fn zeros(rows: usize, cols: usize) -> Self {
         Self {
