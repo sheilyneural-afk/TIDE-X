@@ -432,7 +432,7 @@ fn dtype_bits(dtype: &str) -> Option<u64> {
     match dtype {
         "F4" => Some(4),
         "F6_E2M3" | "F6_E3M2" => Some(6),
-        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" | "F8_E8M0" | "F8_E4M3FNUZ"
+        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" | "F8_E4M3FN" | "F8_E8M0" | "F8_E4M3FNUZ"
         | "F8_E5M2FNUZ" => Some(8),
         "I16" | "U16" | "F16" | "BF16" => Some(16),
         "I32" | "U32" | "F32" => Some(32),
@@ -1803,7 +1803,7 @@ fn encoded_header(
 fn copy_tensor_bytes(
     archive: &mut SafeTensorArchive,
     tensor: &ParsedTensor,
-    writer: &mut BufWriter<&mut File>,
+    writer: &mut impl Write,
 ) -> BrainResult<()> {
     archive.file.seek(SeekFrom::Start(
         archive
@@ -1829,7 +1829,7 @@ fn write_modified_tensor(
     archive: &mut SafeTensorArchive,
     tensor: &ParsedTensor,
     delta: &mut VerifiedDvecReader,
-    writer: &mut BufWriter<&mut File>,
+    writer: &mut impl Write,
 ) -> BrainResult<()> {
     archive.file.seek(SeekFrom::Start(
         archive
@@ -1868,6 +1868,52 @@ fn write_modified_tensor(
         completed += count;
     }
     archive.verify_consumed_tensor(tensor, hasher)
+}
+
+// One byte generator is used both by the physical writer and read-only
+// receipt replay. Hashing only a caller-named output cannot establish W + dW.
+fn write_checkpoint_stream(
+    archive: &mut SafeTensorArchive,
+    plans: &[OutputTensorPlan],
+    header: &[u8],
+    delta: &mut VerifiedDvecReader,
+    writer: &mut impl Write,
+) -> BrainResult<()> {
+    writer.write_all(&(header.len() as u64).to_le_bytes())?;
+    writer.write_all(header)?;
+    for plan in plans {
+        let tensor = archive
+            .tensors
+            .get(plan.source_index)
+            .cloned()
+            .ok_or_else(|| integrity("model_weight_output_source_index_invalid"))?;
+        if plan.modified {
+            write_modified_tensor(archive, &tensor, delta, writer)?;
+        } else {
+            copy_tensor_bytes(archive, &tensor, writer)?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+struct CheckpointDigestWriter {
+    hasher: Sha256,
+    byte_len: u64,
+}
+
+impl Write for CheckpointDigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.byte_len = self
+            .byte_len
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("checkpoint_digest_length_overflow"))?;
+        self.hasher.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn create_output_staging(output: &Path) -> BrainResult<(PathBuf, File)> {
@@ -2012,21 +2058,7 @@ pub fn materialize_dense_delta_checkpoint(
     let write_result = (|| -> BrainResult<()> {
         {
             let mut writer = BufWriter::with_capacity(1 << 20, &mut file);
-            writer.write_all(&(header.len() as u64).to_le_bytes())?;
-            writer.write_all(&header)?;
-            for plan in &plans {
-                let tensor = archive
-                    .tensors
-                    .get(plan.source_index)
-                    .cloned()
-                    .ok_or_else(|| integrity("model_weight_output_source_index_invalid"))?;
-                if plan.modified {
-                    write_modified_tensor(&mut archive, &tensor, &mut delta, &mut writer)?;
-                } else {
-                    copy_tensor_bytes(&mut archive, &tensor, &mut writer)?;
-                }
-            }
-            writer.flush()?;
+            write_checkpoint_stream(&mut archive, &plans, &header, &mut delta, &mut writer)?;
         }
         delta.finish()?;
         file.sync_all()?;
@@ -2095,20 +2127,8 @@ pub fn authenticate_weight_materialization_receipt(
         return Err(invalid("model_weight_receipt_delta_layout_count_mismatch"));
     }
 
-    // Hash the exact bytes delivered by the retained descriptor, including the
-    // header, so a same-inode mutation cannot be hidden between a pre-hash and
-    // this authentication boundary.
-    let mut delta = VerifiedDvecReader::open(private_root, delta_reference)?;
-    while delta.next_parameter() < delta.parameter_count() {
-        let remaining = delta.parameter_count() - delta.next_parameter();
-        let len = usize::try_from(remaining.min(STREAM_ELEMENTS as u64))
-            .map_err(|_| invalid("model_weight_receipt_delta_chunk_overflow"))?;
-        delta.read_f32(len)?;
-    }
-    delta.finish()?;
-
     let base_model_path = resolve_base_model_path(private_root, base_model_path)?;
-    let base = SafeTensorArchive::open(&base_model_path)?;
+    let mut base = SafeTensorArchive::open(&base_model_path)?;
     let plans = output_plans(&base, layout)?;
     let modified = plans
         .iter()
@@ -2120,7 +2140,19 @@ pub fn authenticate_weight_materialization_receipt(
             "model_weight_receipt_modified_tensor_count_mismatch",
         ));
     }
+    let header = encoded_header(&base.metadata, &plans)?;
+    let mut delta = VerifiedDvecReader::open(private_root, delta_reference)?;
+    let mut replay = CheckpointDigestWriter {
+        hasher: Sha256::new(),
+        byte_len: 0,
+    };
+    write_checkpoint_stream(&mut base, &plans, &header, &mut delta, &mut replay)?;
+    delta.finish()?;
+    let expected_output_sha256 = Sha256Digest::parse(format!("{:x}", replay.hasher.finalize()))?;
     let output = verify_output_semantics(output_path, &base.inventory, &modified)?;
+    if output.model_sha256 != expected_output_sha256 || output.model_byte_len != replay.byte_len {
+        return Err(integrity("model_weight_output_arithmetic_mismatch"));
+    }
     let expected = WeightMaterializationReceipt {
         schema: WEIGHT_MATERIALIZATION_RECEIPT_SCHEMA.to_string(),
         lifecycle: WeightMaterializationLifecycle::CandidateOnlyNotPromoted,
@@ -3131,6 +3163,39 @@ mod tests {
             error.contains("model_tensor_consumed_digest_mismatch"),
             "{error}"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn convergence_regression_receipt_cannot_certify_rehashed_incorrect_weights() {
+        let root = root("receipt-arithmetic");
+        let base = root.join("base.safetensors");
+        let output = root.join("output.safetensors");
+        write_fixture(&base);
+        let inventory = inspect_model_safetensors(&base).unwrap();
+        let q = TensorId::parse("model.layers.0.self_attn.q_proj.weight").unwrap();
+        let layout = parameter_layout_for_tensors(&inventory, std::slice::from_ref(&q)).unwrap();
+        let delta = create_content_addressed_dvec(&root, &[0.5, -0.5, 1.0, -1.0]).unwrap();
+        let mut receipt = materialize_dense_delta_checkpoint(
+            &root,
+            &base,
+            &inventory.model_sha256,
+            &layout,
+            &delta,
+            &output,
+        )
+        .unwrap();
+        let archive = SafeTensorArchive::open(&output).unwrap();
+        let offset = archive.data_start + archive.tensor(&q).unwrap().data_start;
+        drop(archive);
+        let mut file = OpenOptions::new().write(true).open(&output).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&99.0f32.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+        receipt.output_model_sha256 = sha256_file(&output).unwrap();
+        assert!(authenticate_weight_materialization_receipt(
+            &root, &base, &layout, &delta, &output, &receipt
+        )
+        .is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

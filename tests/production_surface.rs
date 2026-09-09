@@ -91,6 +91,10 @@ fn tidex_invalid_guarded_routes_fail_before_opening_private_state() {
         &["receiver", "profile"],
         &["receiver", "verify-profile"],
         &["receiver", "verify-live-profile"],
+        &["receiver", "project-physical-profile"],
+        &["materialize", "checkpoint"],
+        &["materialize", "verify-checkpoint"],
+        &["compile", "universal"],
     ];
     for route in routes {
         let output = Command::new(executable)
@@ -247,6 +251,50 @@ fn tidex_profiles_and_reauthenticates_a_physical_receiver_through_the_cli() {
         assert_eq!(profile["model_id"], "receiver.cli-test");
     }
 
+    let projection_request = root.join("projection-request.json");
+    std::fs::write(
+        &projection_request,
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"cerebro.tidex.physical_receiver_projection_input/v1",
+            "physical_profile":receipt["profile_reference"],
+            "tensor_ids":["model.layers.0.self_attn.q_proj.weight"],
+            "modalities":["text"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let projected = Command::new(executable)
+        .args(["receiver", "project-physical-profile"])
+        .arg(&projection_request)
+        .env("TIDEX_PRIVATE_ROOT", &root)
+        .output()
+        .unwrap();
+    assert!(
+        projected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projected.stderr)
+    );
+    let projection: serde_json::Value = serde_json::from_slice(&projected.stdout).unwrap();
+    assert_eq!(projection["profile"]["parameter_dimension"], 4);
+    assert_eq!(
+        projection["snapshot"]["model_snapshot_sha256"],
+        receipt["profile"]["checkpoint"]["sha256"]
+    );
+
+    let invalid = root.join("invalid-compiled.json");
+    std::fs::write(&invalid, b"{}").unwrap();
+    for command in ["checkpoint", "verify-checkpoint"] {
+        let rejected = Command::new(executable)
+            .args(["materialize", command])
+            .arg(&invalid)
+            .env("TIDEX_PRIVATE_ROOT", &root)
+            .output()
+            .unwrap();
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(!String::from_utf8_lossy(&rejected.stderr).contains("usage:"));
+        assert!(rejected.stdout.is_empty());
+    }
+
     std::fs::write(&config, b"{}").unwrap();
     let static_check = Command::new(executable)
         .args(["receiver", "verify-profile"])
@@ -321,6 +369,22 @@ fn tidex_capabilities_identify_receiver_profile_and_adapter_bank_engines() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema"], "cerebro.tidex.capabilities/v1");
     let capabilities = report["capabilities"].as_array().unwrap();
+    let ids = capabilities
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        ids.len(),
+        capabilities.len(),
+        "capability authorities must not be duplicated"
+    );
+    for id in [
+        "compile.universal_capability",
+        "materialize.compiled_checkpoint",
+        "adapter_bank.lifecycle",
+    ] {
+        assert!(ids.contains(id), "missing converged capability {id}");
+    }
     let by_id = |id: &str| {
         capabilities
             .iter()
@@ -337,7 +401,7 @@ fn tidex_capabilities_identify_receiver_profile_and_adapter_bank_engines() {
     );
     assert_eq!(
         by_id("adapter_bank.lifecycle")["engine"],
-        "adapter_bank::AdapterBank::{activate,revoke,rollback}"
+        "adapter_bank::AdapterBank::{authorize_governed_promotion_request,activate,revoke,rollback}"
     );
 
     std::fs::remove_dir_all(base).unwrap();

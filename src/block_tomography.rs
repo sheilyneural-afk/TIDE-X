@@ -18,6 +18,12 @@ use std::path::{Path, PathBuf};
 
 use crate::security::{verify_internal_private_root, verify_private_root};
 
+pub const MAX_PARAMETER_LAYOUT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_PARAMETER_BLOCKS: usize = 1_048_576;
+pub const MAX_PARAMETER_BLOCK_RANK: usize = 64;
+pub const MAX_PARAMETER_BLOCK_NAME_BYTES: usize = 16 * 1024;
+pub const MAX_LAYOUT_PARAMETER_COUNT: u64 = 1 << 50;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BlockShapeSpec {
@@ -46,8 +52,10 @@ pub struct ParameterBlockLayout {
 
 impl ParameterBlockLayout {
     pub fn from_shapes(specs: &[BlockShapeSpec]) -> BrainResult<Self> {
-        if specs.is_empty() {
-            return Err(BrainError::Invalid("block_layout_empty".into()));
+        if specs.is_empty() || specs.len() > MAX_PARAMETER_BLOCKS {
+            return Err(BrainError::Invalid(
+                "block_layout_cardinality_invalid".into(),
+            ));
         }
         let mut blocks = Vec::with_capacity(specs.len());
         let mut names = BTreeSet::new();
@@ -56,8 +64,10 @@ impl ParameterBlockLayout {
             if spec.name.trim().is_empty()
                 || spec.name != spec.name.trim()
                 || !names.insert(spec.name.clone())
+                || spec.name.len() > MAX_PARAMETER_BLOCK_NAME_BYTES
                 || spec.count == 0
                 || spec.shape.is_empty()
+                || spec.shape.len() > MAX_PARAMETER_BLOCK_RANK
                 || spec.shape.contains(&0)
             {
                 return Err(BrainError::Invalid(format!("block_layout_invalid:{index}")));
@@ -79,8 +89,14 @@ impl ParameterBlockLayout {
                 count: spec.count,
             });
             offset = offset
-                .checked_add(spec.count as u64)
+                .checked_add(
+                    u64::try_from(spec.count)
+                        .map_err(|_| BrainError::Invalid("block_layout_count_overflow".into()))?,
+                )
                 .ok_or_else(|| BrainError::Invalid("block_layout_offset_overflow".into()))?;
+            if offset > MAX_LAYOUT_PARAMETER_COUNT {
+                return Err(BrainError::Invalid("block_layout_parameter_limit".into()));
+            }
         }
         Ok(Self {
             schema: "cerebro.tidex.parameter_block_layout/v1".into(),
@@ -90,7 +106,11 @@ impl ParameterBlockLayout {
     }
 
     pub fn validate(&self) -> BrainResult<()> {
-        if self.schema != "cerebro.tidex.parameter_block_layout/v1" || self.blocks.is_empty() {
+        if self.schema != "cerebro.tidex.parameter_block_layout/v1"
+            || self.blocks.is_empty()
+            || self.blocks.len() > MAX_PARAMETER_BLOCKS
+            || self.total_parameter_count > MAX_LAYOUT_PARAMETER_COUNT
+        {
             return Err(BrainError::Invalid("block_layout_contract_invalid".into()));
         }
         let mut expected_offset = 0u64;
@@ -103,7 +123,9 @@ impl ParameterBlockLayout {
             if block.name.trim().is_empty()
                 || block.name != block.name.trim()
                 || !names.insert(block.name.clone())
+                || block.name.len() > MAX_PARAMETER_BLOCK_NAME_BYTES
                 || block.shape.is_empty()
+                || block.shape.len() > MAX_PARAMETER_BLOCK_RANK
                 || block.shape.contains(&0)
                 || block.count == 0
                 || shape_count != block.count
@@ -114,7 +136,10 @@ impl ParameterBlockLayout {
                 )));
             }
             expected_offset = expected_offset
-                .checked_add(block.count as u64)
+                .checked_add(
+                    u64::try_from(block.count)
+                        .map_err(|_| BrainError::Invalid("block_layout_count_overflow".into()))?,
+                )
                 .ok_or_else(|| BrainError::Invalid("block_layout_offset_overflow".into()))?;
         }
         if expected_offset != self.total_parameter_count {
@@ -225,6 +250,12 @@ impl ParameterLayoutAuthority {
     pub fn persist(&self, layout: ParameterBlockLayout) -> BrainResult<PrivateFileReference> {
         let artifact = ParameterLayoutArtifact::new(layout)?;
         let bytes = serde_json::to_vec(&artifact)?;
+        if u64::try_from(bytes.len())
+            .map_err(|_| BrainError::Invalid("parameter_layout_size_overflow".into()))?
+            > MAX_PARAMETER_LAYOUT_BYTES
+        {
+            return Err(BrainError::Invalid("parameter_layout_too_large".into()));
+        }
         let byte_sha256 = Sha256Digest::digest_bytes(&bytes);
         let path = self
             .root
@@ -245,7 +276,7 @@ impl ParameterLayoutAuthority {
         &self,
         source: PrivateFileReference,
     ) -> BrainResult<AuthenticatedParameterLayout> {
-        let bytes = source.read_verified(&self.root)?;
+        let bytes = source.read_verified_bounded(&self.root, MAX_PARAMETER_LAYOUT_BYTES)?;
         let artifact: ParameterLayoutArtifact = serde_json::from_slice(&bytes)?;
         artifact.validate()?;
         Ok(AuthenticatedParameterLayout { source, artifact })
@@ -822,5 +853,23 @@ mod tests {
             .unwrap()
             .insert("unrecognized".into(), serde_json::Value::Bool(true));
         assert!(serde_json::from_value::<ParameterLayoutArtifact>(value).is_err());
+    }
+
+    #[test]
+    fn layout_complexity_limits_fail_closed_before_geometry_work() {
+        let mut oversized_name = minimal_layout();
+        oversized_name.blocks[0].name = "x".repeat(MAX_PARAMETER_BLOCK_NAME_BYTES + 1);
+        assert!(oversized_name.validate().is_err());
+
+        let mut excessive_rank = minimal_layout();
+        excessive_rank.blocks[0].shape = vec![1; MAX_PARAMETER_BLOCK_RANK + 1];
+        excessive_rank.blocks[0].count = 1;
+        excessive_rank.blocks[1].offset = 1;
+        excessive_rank.total_parameter_count = 3;
+        assert!(excessive_rank.validate().is_err());
+
+        let mut excessive_total = minimal_layout();
+        excessive_total.total_parameter_count = MAX_LAYOUT_PARAMETER_COUNT + 1;
+        assert!(excessive_total.validate().is_err());
     }
 }

@@ -2033,6 +2033,7 @@ fn derive_candidate(
         wrong_functional_signatures.push(wrong.values);
     }
     let calibration = ReceiverCalibrationSet {
+        receiver_snapshot_binding_sha256: None,
         functional_signatures,
         receiver_solutions,
         wrong_functional_signatures,

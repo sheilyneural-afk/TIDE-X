@@ -385,46 +385,9 @@ impl BrainEngine {
                 BrainError::Integrity("parameter_layout_artifact_missing_or_invalid".into())
             })?;
         let layout: ParameterBlockLayout = serde_json::from_slice(&bytes)?;
-        if layout.schema != "cerebro.tidex.parameter_block_layout/v1"
-            || layout.blocks.is_empty()
-            || layout.total_parameter_count == 0
-        {
-            return Err(BrainError::Integrity(
-                "parameter_layout_contract_invalid".into(),
-            ));
-        }
-        let mut expected_offset = 0u64;
-        let mut names = BTreeSet::new();
-        for block in &layout.blocks {
-            if block.name.trim().is_empty()
-                || !names.insert(block.name.as_str())
-                || block.offset != expected_offset
-                || block.count == 0
-                || block.shape.is_empty()
-                || block.shape.contains(&0)
-            {
-                return Err(BrainError::Integrity(
-                    "parameter_layout_block_invalid".into(),
-                ));
-            }
-            let shape_count = block.shape.iter().try_fold(1usize, |acc, value| {
-                acc.checked_mul(*value)
-                    .ok_or_else(|| BrainError::Invalid("parameter_layout_shape_overflow".into()))
-            })?;
-            if shape_count != block.count {
-                return Err(BrainError::Integrity(
-                    "parameter_layout_shape_count_mismatch".into(),
-                ));
-            }
-            expected_offset = expected_offset
-                .checked_add(block.count as u64)
-                .ok_or_else(|| BrainError::Invalid("parameter_layout_offset_overflow".into()))?;
-        }
-        if expected_offset != layout.total_parameter_count {
-            return Err(BrainError::Integrity(
-                "parameter_layout_total_count_mismatch".into(),
-            ));
-        }
+        layout
+            .validate()
+            .map_err(|_| BrainError::Integrity("parameter_layout_contract_invalid".into()))?;
         Ok(layout)
     }
 
