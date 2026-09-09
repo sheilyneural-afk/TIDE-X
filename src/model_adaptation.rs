@@ -3,8 +3,9 @@
 //! A receiver profile binds a semantic model identity to exact checkpoint,
 //! configuration, tokenizer and physical parameter-topology identities. It is
 //! deliberately separate from workspace::ModelProfile, which describes a
-//! remote inference endpoint. This module supports the one format the weight
-//! actuator can currently materialize: a single SafeTensors file.
+//! remote inference endpoint. The actuator consumes one SafeTensors file; a
+//! standard Hugging Face sharded SafeTensors index is therefore normalized
+//! first into an immutable content-addressed single-file checkpoint.
 
 use crate::artifact::{sha256_file, verify_dvec_reference_under_root};
 use crate::authority::{write_or_verify_immutable, PrivateFileReference};
@@ -16,9 +17,11 @@ use crate::error::{BrainError, BrainResult};
 use crate::identity::{ArchitectureId, ModelId, SourceRevision, TensorId};
 use crate::security::verify_internal_private_root;
 use crate::weight_actuator::{
-    inspect_model_safetensors, lora_target_family, lora_target_layer, parameter_layout_for_tensors,
-    receiver_delta_dtype_supported, LoraAdapterAxisReceipt, ModelParameterInventory,
+    inspect_model_safetensors, lora_target_family, lora_target_layer,
+    normalize_sharded_safetensors, parameter_layout_for_tensors, receiver_delta_dtype_supported,
+    LoraAdapterAxisReceipt, ModelParameterInventory, ShardedSafetensorsNormalizationInput,
     LORA_ADAPTER_AXIS_RECEIPT_SCHEMA, MODEL_PARAMETER_INVENTORY_SCHEMA,
+    SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -625,15 +628,26 @@ pub fn profile_receiver_model(
     if input.schema != RECEIVER_MODEL_PROFILE_INPUT_SCHEMA {
         return Err(invalid("receiver_model_profile_input_schema_invalid"));
     }
-    if input
+    let checkpoint_path = if input
         .checkpoint_path
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(".safetensors.index.json"))
     {
-        return Err(invalid("receiver_checkpoint_sharded_unsupported"));
-    }
-    let checkpoint = inspect_source_file(&input.checkpoint_path, "receiver_model_checkpoint")?;
+        normalize_sharded_safetensors(
+            &root,
+            &ShardedSafetensorsNormalizationInput {
+                schema: SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA.to_string(),
+                index_path: input.checkpoint_path.clone(),
+            },
+        )?
+        .normalization
+        .normalized_checkpoint
+        .path
+    } else {
+        input.checkpoint_path.clone()
+    };
+    let checkpoint = inspect_source_file(&checkpoint_path, "receiver_model_checkpoint")?;
     let config = inspect_source_file(&input.config_path, "receiver_model_config")?;
     let tokenizer = inspect_source_file(&input.tokenizer_path, "receiver_model_tokenizer")?;
     let inventory = inspect_model_safetensors(&checkpoint.path)?;
@@ -1033,15 +1047,95 @@ mod tests {
     }
 
     #[test]
-    fn sharded_checkpoint_claim_fails_closed() {
+    fn sharded_checkpoint_is_normalized_and_profile_survives_source_removal() {
         let fixture = Fixture::new("sharded", 0.0);
-        let index = fixture.root.join("model.safetensors.index.json");
-        fs::write(&index, b"{}").unwrap();
+        let source = fixture.root.with_extension("sharded-source");
+        let _ = fs::remove_dir_all(&source);
+        fs::create_dir_all(&source).unwrap();
+
+        fn write_shard(path: &Path, tensors: &[(&str, Vec<f32>, Vec<usize>)]) {
+            let mut data = Vec::new();
+            let mut header = Map::new();
+            header.insert("__metadata__".to_string(), json!({"format":"pt"}));
+            for (name, values, shape) in tensors {
+                let start = data.len();
+                for value in values {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                header.insert(
+                    (*name).to_string(),
+                    json!({"dtype":"F32","shape":shape,"data_offsets":[start,data.len()]}),
+                );
+            }
+            let mut header = serde_json::to_vec(&Value::Object(header)).unwrap();
+            let padding = (8 - header.len() % 8) % 8;
+            header.extend(std::iter::repeat_n(b' ', padding));
+            let mut file = File::create(path).unwrap();
+            file.write_all(&(header.len() as u64).to_le_bytes())
+                .unwrap();
+            file.write_all(&header).unwrap();
+            file.write_all(&data).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let first = source.join("model-00001-of-00002.safetensors");
+        let second = source.join("model-00002-of-00002.safetensors");
+        write_shard(
+            &first,
+            &[
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    vec![1.0, 2.0, 3.0, 4.0],
+                    vec![2, 2],
+                ),
+                (
+                    "model.layers.0.input_layernorm.weight",
+                    vec![1.0, 1.0],
+                    vec![2],
+                ),
+            ],
+        );
+        write_shard(
+            &second,
+            &[(
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![-1.0, -2.0, -3.0, -4.0],
+                vec![2, 2],
+            )],
+        );
+        let index = source.join("model.safetensors.index.json");
+        fs::write(
+            &index,
+            serde_json::to_vec_pretty(&json!({
+                "metadata":{"total_size":40},
+                "weight_map":{
+                    "model.layers.0.self_attn.q_proj.weight":"model-00001-of-00002.safetensors",
+                    "model.layers.0.input_layernorm.weight":"model-00001-of-00002.safetensors",
+                    "model.layers.0.self_attn.v_proj.weight":"model-00002-of-00002.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
         let mut input = fixture.input();
         input.checkpoint_path = index;
-        let error = profile_receiver_model(&fixture.root, &input)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("receiver_checkpoint_sharded_unsupported"));
+        let receipt = profile_receiver_model(&fixture.root, &input).unwrap();
+        assert_eq!(
+            receipt.profile.checkpoint_format,
+            ReceiverCheckpointFormat::SingleSafetensorsV1
+        );
+        assert_eq!(receipt.profile.inventory.tensor_count, 3);
+        assert!(receipt
+            .profile
+            .checkpoint
+            .path
+            .starts_with(fixture.root.join("artifacts/models/by-sha")));
+        fs::remove_dir_all(source).unwrap();
+        assert_eq!(
+            authenticate_live_receiver_model_profile(&fixture.root, &receipt.profile_reference)
+                .unwrap(),
+            receipt.profile
+        );
     }
 }

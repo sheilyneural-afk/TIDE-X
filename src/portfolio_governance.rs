@@ -1,18 +1,23 @@
 //! Universal governance for candidate evolution in TIDE-X.
 //!
 //! This module derives conservative candidate decisions from paired raw
-//! observations. It never executes, persists, promotes, or activates a
-//! candidate. Hard invariants precede ranking; independent groups, not repeat
-//! rows, are the unit of evidence; and every resource loop is bounded.
+//! observations. It never executes, promotes, or activates a candidate. Sealed
+//! governance outputs may be persisted only as immutable canonical references
+//! under the verified private authority. Hard invariants precede ranking;
+//! independent groups, not repeat rows, are the unit of evidence; and every
+//! resource loop is bounded.
 
+use crate::authority::{write_or_verify_immutable, PrivateFileReference};
 use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
 use crate::finite::FiniteF64;
 use crate::linalg::stable_rms;
+use crate::security::verify_internal_private_root;
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
 
 const REPORT_DOMAIN: &[u8] = b"CEREBRO:TIDEX:PAIRED-EVALUATION:v1\0";
 const GATE_DOMAIN: &[u8] = b"CEREBRO:TIDEX:CANDIDATE-GATE:v1\0";
@@ -42,6 +47,7 @@ const MAX_GATE_HISTORY_PER_CANDIDATE: usize = 4_096;
 const MAX_TOTAL_GATE_HISTORY: usize = 65_536;
 const MAX_PARETO_WORK_UNITS: usize = 4_000_000;
 const MAX_ADAPTIVE_WORK_UNITS: usize = 4_000_000;
+const MAX_GOVERNANCE_WITNESS_BYTES: u64 = 128 * 1024 * 1024;
 const PER_MILLION: u32 = 1_000_000;
 const NUMERICAL_EPSILON: f64 = 1.0e-12;
 
@@ -1008,7 +1014,7 @@ impl CandidateGatePolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GateReason {
     ProvenHardViolation { metric_id: MetricId },
@@ -1021,7 +1027,7 @@ pub enum GateReason {
     FunctionalDrift { metric_id: MetricId },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateGateDisposition {
     AdvanceCandidate,
@@ -1883,7 +1889,7 @@ impl PetfcTrajectory {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PetfcDisposition {
     CompatibleForNextGate,
@@ -1892,7 +1898,7 @@ pub enum PetfcDisposition {
     BoundedUnknown,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PetfcReason {
     ProvenHardViolation {
@@ -3323,7 +3329,7 @@ impl CanaryPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CanaryPhase {
     AwaitingStage { stage_index: usize },
@@ -3331,7 +3337,7 @@ pub enum CanaryPhase {
     RollbackRequired { stage_index: usize },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CanaryStageDisposition {
     AdvanceStage,
@@ -3340,7 +3346,7 @@ pub enum CanaryStageDisposition {
     RollbackRequired,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CanaryReason {
     ProvenHardViolation { metric_id: MetricId },
@@ -3762,6 +3768,306 @@ pub(crate) fn authenticate_adapter_promotion_witnesses(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Canonical persistence for sealed governance witnesses.
+//
+// The sealed decision/assessment/state types intentionally remain
+// non-Deserialize. A CLI or external caller must never be able to manufacture
+// an approved governance object merely by supplying self-consistent JSON and
+// recomputing an unkeyed digest. Reopening is therefore only available through
+// canonical, content-addressed files under the verified private authority.
+// Private wire structs are decoded inside this module, reconstructed into the
+// sealed types, and authenticated before they can cross the boundary.
+// ---------------------------------------------------------------------------
+
+const CANDIDATE_GATE_WITNESS_KIND: &str = "candidate-gate";
+const PETFC_WITNESS_KIND: &str = "petfc";
+const CANARY_WITNESS_KIND: &str = "canary";
+
+fn governance_witness_path(root: &Path, kind: &str, semantic_digest: &str) -> BrainResult<PathBuf> {
+    let directory = match kind {
+        CANDIDATE_GATE_WITNESS_KIND => "candidate-gates",
+        PETFC_WITNESS_KIND => "petfc-assessments",
+        CANARY_WITNESS_KIND => "canary-states",
+        _ => return Err(invalid("governance_witness_kind_invalid")),
+    };
+    Ok(root
+        .join("state/portfolio_governance")
+        .join(directory)
+        .join("by-sha")
+        .join(format!("{semantic_digest}.json")))
+}
+
+fn persist_governance_witness<T: Serialize>(
+    private_root: &Path,
+    kind: &str,
+    semantic_digest: &str,
+    witness: &T,
+) -> BrainResult<PrivateFileReference> {
+    let root = verify_internal_private_root(private_root)?;
+    let bytes = serde_json::to_vec(witness)?;
+    if u64::try_from(bytes.len()).map_err(|_| invalid("governance_witness_size_overflow"))?
+        > MAX_GOVERNANCE_WITNESS_BYTES
+    {
+        return Err(invalid("governance_witness_too_large"));
+    }
+    let path = governance_witness_path(&root, kind, semantic_digest)?;
+    let sha256 = write_or_verify_immutable(&root, &path, &bytes)?;
+    Ok(PrivateFileReference::new(path, sha256))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateGateDecisionWire {
+    baseline_id: VariantId,
+    candidate_id: VariantId,
+    report_digest: Sha256Digest,
+    metric_catalog_digest: Sha256Digest,
+    evaluation_policy_digest: Sha256Digest,
+    independence_design_digest: Sha256Digest,
+    source_evidence_ids: BTreeSet<EvidenceId>,
+    source_observation_window: ObservationWindow,
+    policy_digest: Sha256Digest,
+    disposition: CandidateGateDisposition,
+    reasons: BTreeSet<GateReason>,
+    conservative_improvements: BTreeMap<MetricId, FiniteF64>,
+    minimum_observed_groups: usize,
+    decision_digest: Sha256Digest,
+}
+
+impl CandidateGateDecisionWire {
+    fn into_sealed(self) -> CandidateGateDecision {
+        CandidateGateDecision {
+            baseline_id: self.baseline_id,
+            candidate_id: self.candidate_id,
+            report_digest: PairedEvaluationDigest(self.report_digest),
+            metric_catalog_digest: MetricCatalogDigest(self.metric_catalog_digest),
+            evaluation_policy_digest: RobustEvaluationPolicyDigest(self.evaluation_policy_digest),
+            independence_design_digest: IndependenceDesignDigest(self.independence_design_digest),
+            source_evidence_ids: self.source_evidence_ids,
+            source_observation_window: self.source_observation_window,
+            policy_digest: CandidateGatePolicyDigest(self.policy_digest),
+            disposition: self.disposition,
+            reasons: self.reasons,
+            conservative_improvements: self.conservative_improvements,
+            minimum_observed_groups: self.minimum_observed_groups,
+            decision_digest: CandidateGateDigest(self.decision_digest),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PetfcAssessmentWire {
+    baseline_id: VariantId,
+    candidate_id: VariantId,
+    metric_catalog_digest: Sha256Digest,
+    evaluation_policy_digest: Sha256Digest,
+    independence_design_digest: Sha256Digest,
+    terminal_report_digest: Sha256Digest,
+    trajectory_evidence_ids: BTreeSet<EvidenceId>,
+    trajectory_observation_window: ObservationWindow,
+    trajectory_digest: Sha256Digest,
+    policy_digest: Sha256Digest,
+    disposition: PetfcDisposition,
+    reasons: BTreeSet<PetfcReason>,
+    path_length_lower: Option<FiniteF64>,
+    path_length_upper: Option<FiniteF64>,
+    endpoint_distance_lower: Option<FiniteF64>,
+    endpoint_distance_upper: Option<FiniteF64>,
+    maximum_step_upper: Option<FiniteF64>,
+    tortuosity_upper: Option<FiniteF64>,
+    waste_upper: Option<FiniteF64>,
+    quality_gain_lower: Option<FiniteF64>,
+    path_efficiency_lower: Option<FiniteF64>,
+    conservation_sum_upper: Option<FiniteF64>,
+    conservation_max_upper: Option<FiniteF64>,
+    degraded_metric_count: usize,
+    distributed_degradation_upper: Option<FiniteF64>,
+    utility_lower: Option<FiniteF64>,
+    assessment_digest: Sha256Digest,
+}
+
+impl PetfcAssessmentWire {
+    fn into_sealed(self) -> PetfcAssessment {
+        PetfcAssessment {
+            baseline_id: self.baseline_id,
+            candidate_id: self.candidate_id,
+            metric_catalog_digest: MetricCatalogDigest(self.metric_catalog_digest),
+            evaluation_policy_digest: RobustEvaluationPolicyDigest(self.evaluation_policy_digest),
+            independence_design_digest: IndependenceDesignDigest(self.independence_design_digest),
+            terminal_report_digest: PairedEvaluationDigest(self.terminal_report_digest),
+            trajectory_evidence_ids: self.trajectory_evidence_ids,
+            trajectory_observation_window: self.trajectory_observation_window,
+            trajectory_digest: PetfcTrajectoryDigest(self.trajectory_digest),
+            policy_digest: PetfcPolicyDigest(self.policy_digest),
+            disposition: self.disposition,
+            reasons: self.reasons,
+            path_length_lower: self.path_length_lower,
+            path_length_upper: self.path_length_upper,
+            endpoint_distance_lower: self.endpoint_distance_lower,
+            endpoint_distance_upper: self.endpoint_distance_upper,
+            maximum_step_upper: self.maximum_step_upper,
+            tortuosity_upper: self.tortuosity_upper,
+            waste_upper: self.waste_upper,
+            quality_gain_lower: self.quality_gain_lower,
+            path_efficiency_lower: self.path_efficiency_lower,
+            conservation_sum_upper: self.conservation_sum_upper,
+            conservation_max_upper: self.conservation_max_upper,
+            degraded_metric_count: self.degraded_metric_count,
+            distributed_degradation_upper: self.distributed_degradation_upper,
+            utility_lower: self.utility_lower,
+            assessment_digest: PetfcAssessmentDigest(self.assessment_digest),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanaryStateWire {
+    baseline_id: VariantId,
+    candidate_id: VariantId,
+    gate_digest: Sha256Digest,
+    evaluation_policy_digest: Sha256Digest,
+    policy_digest: Sha256Digest,
+    phase: CanaryPhase,
+    last_disposition: Option<CanaryStageDisposition>,
+    last_reasons: BTreeSet<CanaryReason>,
+    evaluated_reports: BTreeSet<Sha256Digest>,
+    evaluated_evidence_ids: BTreeSet<EvidenceId>,
+    last_observation_end_tick: Option<u64>,
+    state_digest: Sha256Digest,
+}
+
+impl CanaryStateWire {
+    fn into_sealed(self) -> CanaryState {
+        CanaryState {
+            baseline_id: self.baseline_id,
+            candidate_id: self.candidate_id,
+            gate_digest: CandidateGateDigest(self.gate_digest),
+            evaluation_policy_digest: RobustEvaluationPolicyDigest(self.evaluation_policy_digest),
+            policy_digest: CanaryPolicyDigest(self.policy_digest),
+            phase: self.phase,
+            last_disposition: self.last_disposition,
+            last_reasons: self.last_reasons,
+            evaluated_reports: self
+                .evaluated_reports
+                .into_iter()
+                .map(PairedEvaluationDigest)
+                .collect(),
+            evaluated_evidence_ids: self.evaluated_evidence_ids,
+            last_observation_end_tick: self.last_observation_end_tick,
+            state_digest: CanaryStateDigest(self.state_digest),
+        }
+    }
+}
+
+impl CandidateGateDecision {
+    /// Persist only a decision that was already sealed by the governance
+    /// reducer. The persisted artifact is immutable and can later be reopened
+    /// without making the sealed type generally deserializable.
+    pub fn persist(&self, private_root: &Path) -> BrainResult<PrivateFileReference> {
+        self.authenticate()?;
+        let reference = persist_governance_witness(
+            private_root,
+            CANDIDATE_GATE_WITNESS_KIND,
+            self.digest().as_str(),
+            self,
+        )?;
+        if authenticate_candidate_gate_decision(private_root, &reference)? != *self {
+            return Err(integrity("candidate_gate_persistence_replay_mismatch"));
+        }
+        Ok(reference)
+    }
+}
+
+impl PetfcAssessment {
+    pub fn persist(&self, private_root: &Path) -> BrainResult<PrivateFileReference> {
+        self.authenticate()?;
+        let reference = persist_governance_witness(
+            private_root,
+            PETFC_WITNESS_KIND,
+            self.digest().as_str(),
+            self,
+        )?;
+        if authenticate_petfc_assessment(private_root, &reference)? != *self {
+            return Err(integrity("petfc_persistence_replay_mismatch"));
+        }
+        Ok(reference)
+    }
+}
+
+impl CanaryState {
+    pub fn persist(&self, private_root: &Path) -> BrainResult<PrivateFileReference> {
+        self.authenticate()?;
+        let reference = persist_governance_witness(
+            private_root,
+            CANARY_WITNESS_KIND,
+            self.digest().as_str(),
+            self,
+        )?;
+        if authenticate_canary_state(private_root, &reference)? != *self {
+            return Err(integrity("canary_persistence_replay_mismatch"));
+        }
+        Ok(reference)
+    }
+}
+
+pub fn authenticate_candidate_gate_decision(
+    private_root: &Path,
+    reference: &PrivateFileReference,
+) -> BrainResult<CandidateGateDecision> {
+    let root = verify_internal_private_root(private_root)?;
+    let bytes = reference.read_verified_bounded(&root, MAX_GOVERNANCE_WITNESS_BYTES)?;
+    let decision = serde_json::from_slice::<CandidateGateDecisionWire>(&bytes)?.into_sealed();
+    decision.authenticate()?;
+    if reference.path
+        != governance_witness_path(
+            &root,
+            CANDIDATE_GATE_WITNESS_KIND,
+            decision.digest().as_str(),
+        )?
+        || serde_json::to_vec(&decision)? != bytes
+    {
+        return Err(integrity("candidate_gate_persisted_witness_noncanonical"));
+    }
+    Ok(decision)
+}
+
+pub fn authenticate_petfc_assessment(
+    private_root: &Path,
+    reference: &PrivateFileReference,
+) -> BrainResult<PetfcAssessment> {
+    let root = verify_internal_private_root(private_root)?;
+    let bytes = reference.read_verified_bounded(&root, MAX_GOVERNANCE_WITNESS_BYTES)?;
+    let assessment = serde_json::from_slice::<PetfcAssessmentWire>(&bytes)?.into_sealed();
+    assessment.authenticate()?;
+    if reference.path
+        != governance_witness_path(&root, PETFC_WITNESS_KIND, assessment.digest().as_str())?
+        || serde_json::to_vec(&assessment)? != bytes
+    {
+        return Err(integrity("petfc_persisted_witness_noncanonical"));
+    }
+    Ok(assessment)
+}
+
+pub fn authenticate_canary_state(
+    private_root: &Path,
+    reference: &PrivateFileReference,
+) -> BrainResult<CanaryState> {
+    let root = verify_internal_private_root(private_root)?;
+    let bytes = reference.read_verified_bounded(&root, MAX_GOVERNANCE_WITNESS_BYTES)?;
+    let state = serde_json::from_slice::<CanaryStateWire>(&bytes)?.into_sealed();
+    state.authenticate()?;
+    if reference.path
+        != governance_witness_path(&root, CANARY_WITNESS_KIND, state.digest().as_str())?
+        || serde_json::to_vec(&state)? != bytes
+    {
+        return Err(integrity("canary_persisted_witness_noncanonical"));
+    }
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -4522,6 +4828,49 @@ mod tests {
             3,
         );
         state.evaluate_stage(specs, &second, &policy).unwrap()
+    }
+
+    #[test]
+    fn sealed_governance_witnesses_roundtrip_only_from_canonical_private_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "tidex-governance-witness-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::security::secure_dir(&root).unwrap();
+
+        let specs = default_specs();
+        let (gate, petfc) = eligible_candidate("candidate", 0.7, 0.3, 100);
+        let canary = validated_canary(&specs, &gate);
+        let gate_ref = gate.persist(&root).unwrap();
+        let petfc_ref = petfc.persist(&root).unwrap();
+        let canary_ref = canary.persist(&root).unwrap();
+
+        assert_eq!(
+            authenticate_candidate_gate_decision(&root, &gate_ref).unwrap(),
+            gate
+        );
+        assert_eq!(
+            authenticate_petfc_assessment(&root, &petfc_ref).unwrap(),
+            petfc
+        );
+        assert_eq!(
+            authenticate_canary_state(&root, &canary_ref).unwrap(),
+            canary
+        );
+
+        let alias = root.join("state/portfolio_governance/alias-gate.json");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::copy(&gate_ref.path, &alias).unwrap();
+        let alias_ref = PrivateFileReference::new(alias, gate_ref.sha256.clone());
+        assert!(authenticate_candidate_gate_decision(&root, &alias_ref).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

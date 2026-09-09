@@ -11,13 +11,16 @@ use crate::artifact::{
     sha256_file, verify_dvec_reference_under_root, ArtifactWriteAuthority, DeltaArtifactRef,
     VerifiedDvecReader,
 };
-use crate::authority::PrivateFileReference;
+use crate::authority::{
+    install_private_immutable_file, stage_private_file, write_or_verify_immutable,
+    PrivateFileReference,
+};
 use crate::block_tomography::{parameter_layout_digest, BlockShapeSpec, ParameterBlockLayout};
 use crate::digest::{ParameterLayoutDigest, Sha256Digest};
 use crate::error::{BrainError, BrainResult};
 use crate::identity::TensorId;
 use crate::security::verify_internal_private_root;
-use serde::{Deserialize, Serialize};
+use serde::{de::MapAccess, de::Visitor, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +35,17 @@ pub const WEIGHT_MATERIALIZATION_RECEIPT_SCHEMA: &str =
     "cerebro.tidex.weight_materialization_receipt/v1";
 pub const LORA_ADAPTER_AXIS_INPUT_SCHEMA: &str = "cerebro.tidex.lora_adapter_axis_input/v1";
 pub const LORA_ADAPTER_AXIS_RECEIPT_SCHEMA: &str = "cerebro.tidex.lora_adapter_axis_receipt/v1";
+pub const SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA: &str =
+    "cerebro.tidex.sharded_safetensors_normalization_input/v1";
+pub const SHARDED_SAFETENSORS_NORMALIZATION_SCHEMA: &str =
+    "cerebro.tidex.sharded_safetensors_normalization/v1";
+pub const SHARDED_SAFETENSORS_NORMALIZATION_RECEIPT_SCHEMA: &str =
+    "cerebro.tidex.sharded_safetensors_normalization_receipt/v1";
 const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100_000_000;
+const MAX_SHARDED_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SHARDED_TENSORS: usize = 1_000_000;
+const MAX_SHARDED_FILES: usize = 4_096;
+const MAX_NORMALIZATION_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 const STREAM_ELEMENTS: usize = 262_144;
 static NEXT_OUTPUT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -64,6 +77,91 @@ pub struct ModelParameterInventory {
     pub total_parameter_count: u64,
     /// Source tensor order by increasing SafeTensors data offset.
     pub tensors: Vec<ModelTensorSpec>,
+}
+
+#[derive(Debug)]
+struct StrictWeightMap(BTreeMap<TensorId, String>);
+
+impl<'de> Deserialize<'de> for StrictWeightMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StrictWeightMapVisitor;
+
+        impl<'de> Visitor<'de> for StrictWeightMapVisitor {
+            type Value = StrictWeightMap;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a unique tensor-to-shard weight map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = BTreeMap::new();
+                while let Some((raw_tensor, shard)) = map.next_entry::<String, String>()? {
+                    let tensor = TensorId::parse(raw_tensor).map_err(serde::de::Error::custom)?;
+                    if shard.is_empty() || values.insert(tensor, shard).is_some() {
+                        return Err(serde::de::Error::custom(
+                            "sharded_safetensors_weight_map_duplicate_or_empty",
+                        ));
+                    }
+                }
+                Ok(StrictWeightMap(values))
+            }
+        }
+
+        deserializer.deserialize_map(StrictWeightMapVisitor)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HfSafetensorsIndex {
+    #[serde(default)]
+    metadata: BTreeMap<String, Value>,
+    weight_map: StrictWeightMap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShardedSafetensorsNormalizationInput {
+    pub schema: String,
+    pub index_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShardedSafetensorsSourceFile {
+    pub path: PathBuf,
+    pub sha256: Sha256Digest,
+    pub byte_len: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShardedSafetensorsNormalization {
+    pub schema: String,
+    pub index: ShardedSafetensorsSourceFile,
+    pub shards: Vec<ShardedSafetensorsSourceFile>,
+    pub weight_map_entry_count: usize,
+    pub source_tensor_byte_count: u64,
+    pub normalized_checkpoint: PrivateFileReference,
+    pub normalized_inventory: ModelParameterInventory,
+    pub tensor_payloads_preserved_exactly: bool,
+    pub authorizes_behavioral_equivalence: bool,
+    pub authorizes_promotion: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShardedSafetensorsNormalizationReceipt {
+    pub schema: String,
+    pub normalization: ShardedSafetensorsNormalization,
+    pub normalization_reference: PrivateFileReference,
+    pub authorizes_promotion: bool,
 }
 
 /// Two rows of an authenticated resident linear readout, represented exactly
@@ -248,6 +346,13 @@ struct SafeTensorArchive {
     // These digests and the inventory identity are committed by one pass over
     // the same raw header and tensor bytes. Later reads must match them.
     tensor_sha256: BTreeMap<TensorId, Sha256Digest>,
+}
+
+#[derive(Debug, Clone)]
+struct ShardedTensorLocation {
+    shard_index: usize,
+    tensor_index: usize,
+    spec: ModelTensorSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -932,7 +1037,8 @@ pub fn import_peft_lora_as_dense_axis(
     {
         return Err(invalid("lora_adapter_config_unsupported"));
     }
-    let base = inspect_model_safetensors(&input.base_model_path)?;
+    let base_model_path = resolve_base_model_path(root, &input.base_model_path)?;
+    let base = inspect_model_safetensors(&base_model_path)?;
     let adapter = inspect_model_safetensors(&input.adapter_model_path)?;
     let pairs = lora_adapter_pairs(&adapter.tensors)?;
     let (targets, patches) = prepare_lora_patches(
@@ -974,7 +1080,7 @@ pub fn import_peft_lora_as_dense_axis(
             layout.total_parameter_count,
             LoraDenseDeltaIter::new(&patches, lora_scale as f32),
         )?;
-    if sha256_file(&input.base_model_path)? != base.model_sha256
+    if sha256_file(&base_model_path)? != base.model_sha256
         || sha256_file(&input.adapter_model_path)? != adapter.model_sha256
         || Sha256Digest::digest_bytes(&fs::read(&input.adapter_config_path)?)
             != Sha256Digest::digest_bytes(&config_bytes)
@@ -983,7 +1089,7 @@ pub fn import_peft_lora_as_dense_axis(
     }
     Ok(LoraAdapterAxisReceipt {
         schema: LORA_ADAPTER_AXIS_RECEIPT_SCHEMA.into(),
-        base_model_path: input.base_model_path.clone(),
+        base_model_path,
         adapter_model_path: input.adapter_model_path.clone(),
         adapter_config_path: input.adapter_config_path.clone(),
         base_model_sha256: base.model_sha256,
@@ -1045,6 +1151,422 @@ pub fn authenticate_lora_adapter_axis_receipt(
 
 pub fn inspect_model_safetensors(path: &Path) -> BrainResult<ModelParameterInventory> {
     Ok(SafeTensorArchive::open(path)?.inventory)
+}
+
+fn read_sharded_index_source(
+    path: &Path,
+) -> BrainResult<(ShardedSafetensorsSourceFile, HfSafetensorsIndex)> {
+    let canonical = canonical_existing_file(path)?;
+    if !canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+    {
+        return Err(invalid("sharded_safetensors_index_name_invalid"));
+    }
+    let mut file = File::open(&canonical)?;
+    let metadata = file.metadata()?;
+    if metadata.len() == 0 || metadata.len() > MAX_SHARDED_INDEX_BYTES {
+        return Err(invalid("sharded_safetensors_index_size_invalid"));
+    }
+    let len = usize::try_from(metadata.len())
+        .map_err(|_| invalid("sharded_safetensors_index_size_overflow"))?;
+    let mut bytes = vec![0u8; len];
+    file.read_exact(&mut bytes)?;
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(integrity("sharded_safetensors_index_grew_during_read"));
+    }
+    let index: HfSafetensorsIndex = serde_json::from_slice(&bytes)?;
+    Ok((
+        ShardedSafetensorsSourceFile {
+            path: canonical,
+            sha256: Sha256Digest::digest_bytes(&bytes),
+            byte_len: metadata.len(),
+        },
+        index,
+    ))
+}
+
+fn canonical_shard_from_index(index_parent: &Path, relative: &str) -> BrainResult<PathBuf> {
+    if relative.is_empty() || relative.len() > 16 * 1024 {
+        return Err(invalid("sharded_safetensors_shard_name_invalid"));
+    }
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || !relative.ends_with(".safetensors")
+    {
+        return Err(invalid("sharded_safetensors_shard_path_invalid"));
+    }
+    let mut current = index_parent.to_path_buf();
+    let components = relative_path.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(invalid("sharded_safetensors_shard_path_invalid"));
+        };
+        current.push(name);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| integrity(format!("sharded_safetensors_shard_unreadable:{error}")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(integrity("sharded_safetensors_shard_symlink_forbidden"));
+        }
+        let final_component = index + 1 == components.len();
+        if final_component {
+            if !metadata.file_type().is_file() {
+                return Err(integrity("sharded_safetensors_shard_not_regular_file"));
+            }
+        } else if !metadata.file_type().is_dir() {
+            return Err(integrity("sharded_safetensors_shard_parent_not_directory"));
+        }
+    }
+    let canonical = fs::canonicalize(&current)?;
+    if !canonical.starts_with(index_parent) {
+        return Err(integrity("sharded_safetensors_shard_escaped_index_root"));
+    }
+    Ok(canonical)
+}
+
+fn normalized_checkpoint_path(root: &Path, digest: &Sha256Digest) -> PathBuf {
+    root.join("artifacts/models/by-sha")
+        .join(format!("{digest}.safetensors"))
+}
+
+fn sharded_normalization_path(root: &Path, digest: &Sha256Digest) -> PathBuf {
+    root.join("state/model_normalizations/sharded-safetensors/by-sha")
+        .join(format!("{digest}.json"))
+}
+
+fn normalized_sharded_header(locations: &[ShardedTensorLocation]) -> BrainResult<Vec<u8>> {
+    if locations.is_empty() || locations.len() > MAX_SHARDED_TENSORS {
+        return Err(invalid("sharded_safetensors_tensor_count_invalid"));
+    }
+    let mut map = Map::new();
+    map.insert(
+        "__metadata__".to_string(),
+        json!({
+            "format":"pt",
+            "tidex_normalization":"hf_safetensors_index_to_single_v1"
+        }),
+    );
+    let mut offset = 0u64;
+    for location in locations {
+        let end = offset
+            .checked_add(location.spec.data_byte_count)
+            .ok_or_else(|| invalid("sharded_safetensors_normalized_size_overflow"))?;
+        map.insert(
+            location.spec.tensor_id.as_str().to_string(),
+            json!({
+                "dtype": location.spec.dtype,
+                "shape": location.spec.shape,
+                "data_offsets": [offset, end]
+            }),
+        );
+        offset = end;
+    }
+    let mut bytes = serde_json::to_vec(&Value::Object(map))?;
+    let padding = (8 - (bytes.len() % 8)) % 8;
+    bytes.extend(std::iter::repeat_n(b' ', padding));
+    if bytes.is_empty() || bytes.len() as u64 > MAX_SAFETENSORS_HEADER_BYTES {
+        return Err(invalid("sharded_safetensors_normalized_header_invalid"));
+    }
+    Ok(bytes)
+}
+
+fn validate_normalization_contract(
+    root: &Path,
+    normalization: &ShardedSafetensorsNormalization,
+) -> BrainResult<()> {
+    if normalization.schema != SHARDED_SAFETENSORS_NORMALIZATION_SCHEMA
+        || normalization.index.byte_len == 0
+        || normalization.index.byte_len > MAX_SHARDED_INDEX_BYTES
+        || !normalization
+            .index
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+        || normalization.shards.is_empty()
+        || normalization.shards.len() > MAX_SHARDED_FILES
+        || normalization.weight_map_entry_count == 0
+        || normalization.weight_map_entry_count > MAX_SHARDED_TENSORS
+        || normalization.weight_map_entry_count != normalization.normalized_inventory.tensor_count
+        || !normalization.tensor_payloads_preserved_exactly
+        || normalization.authorizes_behavioral_equivalence
+        || normalization.authorizes_promotion
+        || normalization.normalized_checkpoint.path
+            != normalized_checkpoint_path(root, &normalization.normalized_checkpoint.sha256)
+        || normalization.normalized_inventory.model_sha256
+            != normalization.normalized_checkpoint.sha256
+    {
+        return Err(invalid(
+            "sharded_safetensors_normalization_contract_invalid",
+        ));
+    }
+    if normalization
+        .shards
+        .windows(2)
+        .any(|pair| pair[0].path >= pair[1].path)
+        || normalization
+            .shards
+            .iter()
+            .any(|source| source.byte_len == 0 || !source.path.is_absolute())
+    {
+        return Err(integrity("sharded_safetensors_source_manifest_invalid"));
+    }
+    let payload_bytes =
+        normalization
+            .normalized_inventory
+            .tensors
+            .iter()
+            .try_fold(0u64, |total, tensor| {
+                total
+                    .checked_add(tensor.data_byte_count)
+                    .ok_or_else(|| invalid("sharded_safetensors_payload_size_overflow"))
+            })?;
+    if payload_bytes != normalization.source_tensor_byte_count {
+        return Err(integrity("sharded_safetensors_payload_size_mismatch"));
+    }
+    normalization.normalized_checkpoint.verify(root)?;
+    let inventory = inspect_model_safetensors(&normalization.normalized_checkpoint.path)?;
+    if inventory != normalization.normalized_inventory {
+        return Err(integrity(
+            "sharded_safetensors_normalized_inventory_mismatch",
+        ));
+    }
+    Ok(())
+}
+
+pub fn authenticate_sharded_safetensors_normalization(
+    private_root: &Path,
+    reference: &PrivateFileReference,
+) -> BrainResult<ShardedSafetensorsNormalization> {
+    let root = verify_internal_private_root(private_root)?;
+    if reference.path != sharded_normalization_path(&root, &reference.sha256) {
+        return Err(integrity(
+            "sharded_safetensors_normalization_path_not_canonical",
+        ));
+    }
+    let bytes = reference.read_verified_bounded(&root, MAX_NORMALIZATION_RECORD_BYTES)?;
+    let normalization: ShardedSafetensorsNormalization = serde_json::from_slice(&bytes)?;
+    if serde_json::to_vec(&normalization)? != bytes {
+        return Err(integrity("sharded_safetensors_normalization_noncanonical"));
+    }
+    validate_normalization_contract(&root, &normalization)?;
+    Ok(normalization)
+}
+
+pub fn normalize_sharded_safetensors(
+    private_root: &Path,
+    input: &ShardedSafetensorsNormalizationInput,
+) -> BrainResult<ShardedSafetensorsNormalizationReceipt> {
+    let root = verify_internal_private_root(private_root)?;
+    if input.schema != SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA {
+        return Err(invalid("sharded_safetensors_normalization_input_invalid"));
+    }
+    let (index_source, index) = read_sharded_index_source(&input.index_path)?;
+    let weight_map = index.weight_map.0;
+    if weight_map.is_empty() || weight_map.len() > MAX_SHARDED_TENSORS {
+        return Err(invalid("sharded_safetensors_weight_map_size_invalid"));
+    }
+    let declared_total_size = index
+        .metadata
+        .get("total_size")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| invalid("sharded_safetensors_total_size_invalid"))
+        })
+        .transpose()?;
+    let index_parent = index_source
+        .path
+        .parent()
+        .ok_or_else(|| invalid("sharded_safetensors_index_parent_missing"))?;
+    let shard_names = weight_map.values().cloned().collect::<BTreeSet<_>>();
+    if shard_names.is_empty() || shard_names.len() > MAX_SHARDED_FILES {
+        return Err(invalid("sharded_safetensors_shard_count_invalid"));
+    }
+
+    let mut archives = Vec::with_capacity(shard_names.len());
+    let mut shard_labels = Vec::with_capacity(shard_names.len());
+    let mut shard_sources = Vec::with_capacity(shard_names.len());
+    let mut shard_by_name = BTreeMap::new();
+    let mut canonical_paths = BTreeSet::new();
+    for name in shard_names {
+        let path = canonical_shard_from_index(index_parent, &name)?;
+        if !canonical_paths.insert(path.clone()) {
+            return Err(integrity("sharded_safetensors_shard_alias_collision"));
+        }
+        let archive = SafeTensorArchive::open(&path)?;
+        let shard_index = archives.len();
+        shard_by_name.insert(name.clone(), shard_index);
+        shard_labels.push(name);
+        shard_sources.push(ShardedSafetensorsSourceFile {
+            path,
+            sha256: archive.inventory.model_sha256.clone(),
+            byte_len: archive.inventory.model_byte_len,
+        });
+        archives.push(archive);
+    }
+
+    let actual_tensor_count = archives.iter().try_fold(0usize, |total, archive| {
+        total
+            .checked_add(archive.tensors.len())
+            .ok_or_else(|| invalid("sharded_safetensors_tensor_count_overflow"))
+    })?;
+    if actual_tensor_count != weight_map.len() {
+        return Err(integrity("sharded_safetensors_weight_map_not_bijective"));
+    }
+    for (shard_index, archive) in archives.iter().enumerate() {
+        let label = shard_labels
+            .get(shard_index)
+            .ok_or_else(|| integrity("sharded_safetensors_shard_label_missing"))?;
+        for tensor in &archive.tensors {
+            if weight_map.get(&tensor.spec.tensor_id) != Some(label) {
+                return Err(integrity("sharded_safetensors_weight_map_tensor_mismatch"));
+            }
+        }
+    }
+
+    let mut locations = Vec::with_capacity(weight_map.len());
+    let mut source_tensor_byte_count = 0u64;
+    for (tensor_id, shard_name) in &weight_map {
+        let shard_index = shard_by_name
+            .get(shard_name)
+            .copied()
+            .ok_or_else(|| integrity("sharded_safetensors_weight_map_shard_missing"))?;
+        let archive = archives
+            .get(shard_index)
+            .ok_or_else(|| integrity("sharded_safetensors_archive_missing"))?;
+        let tensor_index = archive
+            .index
+            .get(tensor_id)
+            .copied()
+            .ok_or_else(|| integrity("sharded_safetensors_weight_map_tensor_missing"))?;
+        let spec = archive
+            .tensors
+            .get(tensor_index)
+            .ok_or_else(|| integrity("sharded_safetensors_tensor_index_invalid"))?
+            .spec
+            .clone();
+        source_tensor_byte_count = source_tensor_byte_count
+            .checked_add(spec.data_byte_count)
+            .ok_or_else(|| invalid("sharded_safetensors_payload_size_overflow"))?;
+        locations.push(ShardedTensorLocation {
+            shard_index,
+            tensor_index,
+            spec,
+        });
+    }
+    if declared_total_size.is_some_and(|declared| declared != source_tensor_byte_count) {
+        return Err(integrity("sharded_safetensors_total_size_mismatch"));
+    }
+
+    let header = normalized_sharded_header(&locations)?;
+    let staging_destination = root.join("artifacts/models/normalization-staging/model.safetensors");
+    let (temporary, normalized_sha256) =
+        stage_private_file(&root, &staging_destination, |output| {
+            let mut writer = BufWriter::with_capacity(1 << 20, output);
+            writer.write_all(&(header.len() as u64).to_le_bytes())?;
+            writer.write_all(&header)?;
+            for location in &locations {
+                let archive = archives
+                    .get_mut(location.shard_index)
+                    .ok_or_else(|| integrity("sharded_safetensors_archive_missing"))?;
+                let tensor = archive
+                    .tensors
+                    .get(location.tensor_index)
+                    .cloned()
+                    .ok_or_else(|| integrity("sharded_safetensors_tensor_index_invalid"))?;
+                if tensor.spec != location.spec {
+                    return Err(integrity("sharded_safetensors_tensor_changed_before_copy"));
+                }
+                copy_tensor_bytes(archive, &tensor, &mut writer)?;
+            }
+            writer.flush()?;
+            Ok(())
+        })?;
+    let normalized_path = normalized_checkpoint_path(&root, &normalized_sha256);
+    if !install_private_immutable_file(&root, &temporary, &normalized_path, &normalized_sha256)? {
+        PrivateFileReference::new(normalized_path.clone(), normalized_sha256.clone())
+            .verify(&root)?;
+    }
+    let normalized_checkpoint =
+        PrivateFileReference::new(normalized_path, normalized_sha256.clone());
+    let normalized_inventory = inspect_model_safetensors(&normalized_checkpoint.path)?;
+    let expected_specs = locations
+        .iter()
+        .map(|location| location.spec.clone())
+        .collect::<Vec<_>>();
+    if normalized_inventory.model_sha256 != normalized_sha256
+        || normalized_inventory.tensors != expected_specs
+    {
+        return Err(integrity("sharded_safetensors_normalized_output_mismatch"));
+    }
+
+    shard_sources.sort_by(|left, right| left.path.cmp(&right.path));
+    let normalization = ShardedSafetensorsNormalization {
+        schema: SHARDED_SAFETENSORS_NORMALIZATION_SCHEMA.to_string(),
+        index: index_source,
+        shards: shard_sources,
+        weight_map_entry_count: weight_map.len(),
+        source_tensor_byte_count,
+        normalized_checkpoint,
+        normalized_inventory,
+        tensor_payloads_preserved_exactly: true,
+        authorizes_behavioral_equivalence: false,
+        authorizes_promotion: false,
+    };
+    validate_normalization_contract(&root, &normalization)?;
+    let bytes = serde_json::to_vec(&normalization)?;
+    let digest = Sha256Digest::digest_bytes(&bytes);
+    let path = sharded_normalization_path(&root, &digest);
+    let written = write_or_verify_immutable(&root, &path, &bytes)?;
+    if written != digest {
+        return Err(integrity(
+            "sharded_safetensors_normalization_write_mismatch",
+        ));
+    }
+    let normalization_reference = PrivateFileReference::new(path, digest);
+    if authenticate_sharded_safetensors_normalization(&root, &normalization_reference)?
+        != normalization
+    {
+        return Err(integrity(
+            "sharded_safetensors_normalization_replay_mismatch",
+        ));
+    }
+    Ok(ShardedSafetensorsNormalizationReceipt {
+        schema: SHARDED_SAFETENSORS_NORMALIZATION_RECEIPT_SCHEMA.to_string(),
+        normalization,
+        normalization_reference,
+        authorizes_promotion: false,
+    })
+}
+
+fn is_sharded_safetensors_index(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+}
+
+fn resolve_base_model_path(private_root: &Path, path: &Path) -> BrainResult<PathBuf> {
+    if is_sharded_safetensors_index(path) {
+        Ok(normalize_sharded_safetensors(
+            private_root,
+            &ShardedSafetensorsNormalizationInput {
+                schema: SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA.to_string(),
+                index_path: path.to_path_buf(),
+            },
+        )?
+        .normalization
+        .normalized_checkpoint
+        .path)
+    } else {
+        canonical_existing_file(path)
+    }
 }
 
 /// Extract two rows without loading a whole language-model readout into RAM.
@@ -1464,7 +1986,8 @@ pub fn materialize_dense_delta_checkpoint(
         return Err(invalid("model_weight_delta_layout_count_mismatch"));
     }
     let output = canonical_output_path(output_path)?;
-    let mut archive = SafeTensorArchive::open(base_model_path)?;
+    let base_model_path = resolve_base_model_path(private_root, base_model_path)?;
+    let mut archive = SafeTensorArchive::open(&base_model_path)?;
     if &archive.inventory.model_sha256 != expected_base_sha256 {
         return Err(integrity("model_weight_base_digest_mismatch"));
     }
@@ -1584,7 +2107,8 @@ pub fn authenticate_weight_materialization_receipt(
     }
     delta.finish()?;
 
-    let base = SafeTensorArchive::open(base_model_path)?;
+    let base_model_path = resolve_base_model_path(private_root, base_model_path)?;
+    let base = SafeTensorArchive::open(&base_model_path)?;
     let plans = output_plans(&base, layout)?;
     let modified = plans
         .iter()
@@ -1790,6 +2314,275 @@ mod tests {
         file.write_all(&header).unwrap();
         file.write_all(&data).unwrap();
         file.sync_all().unwrap();
+    }
+
+    fn write_f32_safetensors(path: &Path, tensors: &[(&str, Vec<f32>, Vec<usize>)]) {
+        let mut data = Vec::new();
+        let mut entries = Map::new();
+        entries.insert("__metadata__".into(), json!({"format":"pt"}));
+        for (name, values, shape) in tensors {
+            let start = data.len();
+            for value in values {
+                data.extend(value.to_le_bytes());
+            }
+            entries.insert(
+                (*name).to_string(),
+                json!({"dtype":"F32","shape":shape,"data_offsets":[start,data.len()]}),
+            );
+        }
+        let mut header = serde_json::to_vec(&Value::Object(entries)).unwrap();
+        let padding = (8 - header.len() % 8) % 8;
+        header.extend(std::iter::repeat_n(b' ', padding));
+        let mut file = File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&data).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn sharded_base_fixture(label: &str) -> (PathBuf, PathBuf) {
+        let private = root(label);
+        let source = private.with_extension("source");
+        let _ = fs::remove_dir_all(&source);
+        fs::create_dir_all(&source).unwrap();
+        let shard_a = source.join("model-00001-of-00002.safetensors");
+        let shard_b = source.join("model-00002-of-00002.safetensors");
+        write_f32_safetensors(
+            &shard_a,
+            &[(
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![1.0, 2.0, 3.0, 4.0],
+                vec![2, 2],
+            )],
+        );
+        write_f32_safetensors(
+            &shard_b,
+            &[(
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![-1.0, -2.0, -3.0, -4.0],
+                vec![2, 2],
+            )],
+        );
+        let index = source.join("model.safetensors.index.json");
+        fs::write(
+            &index,
+            serde_json::to_vec_pretty(&json!({
+                "metadata":{"total_size":32},
+                "weight_map":{
+                    "model.layers.0.self_attn.q_proj.weight":"model-00001-of-00002.safetensors",
+                    "model.layers.0.self_attn.v_proj.weight":"model-00002-of-00002.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (private, index)
+    }
+
+    #[test]
+    fn sharded_normalization_is_exact_content_addressed_and_source_independent_after_import() {
+        let (root, index) = sharded_base_fixture("sharded-normalization");
+        let receipt = normalize_sharded_safetensors(
+            &root,
+            &ShardedSafetensorsNormalizationInput {
+                schema: SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA.to_string(),
+                index_path: index.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.normalization.weight_map_entry_count, 2);
+        assert_eq!(receipt.normalization.source_tensor_byte_count, 32);
+        assert!(receipt.normalization.tensor_payloads_preserved_exactly);
+        assert!(!receipt.normalization.authorizes_behavioral_equivalence);
+        assert!(!receipt.authorizes_promotion);
+        assert!(receipt
+            .normalization
+            .normalized_checkpoint
+            .path
+            .starts_with(root.join("artifacts/models/by-sha")));
+        let q = TensorId::parse("model.layers.0.self_attn.q_proj.weight").unwrap();
+        let v = TensorId::parse("model.layers.0.self_attn.v_proj.weight").unwrap();
+        assert_eq!(
+            read_model_tensor_f32(&receipt.normalization.normalized_checkpoint.path, &q).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            read_model_tensor_f32(&receipt.normalization.normalized_checkpoint.path, &v).unwrap(),
+            vec![-1.0, -2.0, -3.0, -4.0]
+        );
+        let replay =
+            authenticate_sharded_safetensors_normalization(&root, &receipt.normalization_reference)
+                .unwrap();
+        assert_eq!(replay, receipt.normalization);
+
+        let source = index.parent().unwrap().to_path_buf();
+        fs::remove_dir_all(&source).unwrap();
+        assert_eq!(
+            authenticate_sharded_safetensors_normalization(&root, &receipt.normalization_reference)
+                .unwrap(),
+            receipt.normalization
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sharded_normalization_rejects_nonbijective_duplicate_and_escaping_indexes() {
+        let (root, index) = sharded_base_fixture("sharded-guards");
+        let source = index.parent().unwrap();
+        fs::write(
+            &index,
+            serde_json::to_vec(&json!({
+                "metadata":{"total_size":32},
+                "weight_map":{
+                    "model.layers.0.self_attn.q_proj.weight":"model-00002-of-00002.safetensors",
+                    "model.layers.0.self_attn.v_proj.weight":"model-00002-of-00002.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(normalize_sharded_safetensors(
+            &root,
+            &ShardedSafetensorsNormalizationInput {
+                schema: SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA.to_string(),
+                index_path: index.clone(),
+            },
+        )
+        .is_err());
+
+        fs::write(
+            &index,
+            br#"{"metadata":{"total_size":32},"weight_map":{"model.layers.0.self_attn.q_proj.weight":"model-00001-of-00002.safetensors","model.layers.0.self_attn.q_proj.weight":"model-00001-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(normalize_sharded_safetensors(
+            &root,
+            &ShardedSafetensorsNormalizationInput {
+                schema: SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA.to_string(),
+                index_path: index.clone(),
+            },
+        )
+        .is_err());
+
+        fs::write(
+            &index,
+            serde_json::to_vec(&json!({
+                "metadata":{"total_size":16},
+                "weight_map":{
+                    "model.layers.0.self_attn.q_proj.weight":"../escape.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(normalize_sharded_safetensors(
+            &root,
+            &ShardedSafetensorsNormalizationInput {
+                schema: SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA.to_string(),
+                index_path: index.clone(),
+            },
+        )
+        .is_err());
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dense_materialization_accepts_sharded_base_via_same_normalization_authority() {
+        let (root, index) = sharded_base_fixture("sharded-materialization");
+        let normalized = normalize_sharded_safetensors(
+            &root,
+            &ShardedSafetensorsNormalizationInput {
+                schema: SHARDED_SAFETENSORS_NORMALIZATION_INPUT_SCHEMA.to_string(),
+                index_path: index.clone(),
+            },
+        )
+        .unwrap();
+        let q = TensorId::parse("model.layers.0.self_attn.q_proj.weight").unwrap();
+        let layout = parameter_layout_for_tensors(
+            &normalized.normalization.normalized_inventory,
+            std::slice::from_ref(&q),
+        )
+        .unwrap();
+        let delta = create_content_addressed_dvec(&root, &[0.5, -0.5, 1.0, -1.0]).unwrap();
+        let output = root.join("sharded-output.safetensors");
+        let receipt = materialize_dense_delta_checkpoint(
+            &root,
+            &index,
+            &normalized.normalization.normalized_checkpoint.sha256,
+            &layout,
+            &delta,
+            &output,
+        )
+        .unwrap();
+        assert_eq!(
+            read_model_tensor_f32(&output, &q).unwrap(),
+            vec![1.5, 1.5, 4.0, 3.0]
+        );
+        authenticate_weight_materialization_receipt(
+            &root,
+            &normalized.normalization.normalized_checkpoint.path,
+            &layout,
+            &delta,
+            &output,
+            &receipt,
+        )
+        .unwrap();
+        fs::remove_dir_all(index.parent().unwrap()).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn peft_lora_import_accepts_sharded_base_through_retained_normalization() {
+        let (root, index) = sharded_base_fixture("sharded-lora-axis");
+        let adapter = root.join("adapter_model.safetensors");
+        let config = root.join("adapter_config.json");
+        write_lora_fixture(&adapter);
+        fs::write(
+            &config,
+            serde_json::to_vec(&json!({
+                "r": 1,
+                "lora_alpha": 2.0,
+                "target_modules": ["q_proj", "v_proj"],
+                "bias": "none",
+                "use_rslora": false,
+                "use_dora": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let receipt = import_peft_lora_as_dense_axis(
+            &root,
+            &LoraAdapterAxisInput {
+                schema: LORA_ADAPTER_AXIS_INPUT_SCHEMA.to_string(),
+                base_model_path: index.clone(),
+                adapter_model_path: adapter,
+                adapter_config_path: config,
+            },
+        )
+        .unwrap();
+        assert_ne!(receipt.base_model_path, index);
+        assert!(receipt
+            .base_model_path
+            .starts_with(root.join("artifacts/models/by-sha")));
+        assert_eq!(
+            read_dvec_f32(&root, &receipt.dense_delta).unwrap(),
+            vec![6.0, 12.0, 8.0, 16.0, 4.0, -4.0, 6.0, -6.0]
+        );
+        fs::remove_dir_all(index.parent().unwrap()).unwrap();
+        let replay_ref = {
+            let bytes = serde_json::to_vec(&receipt).unwrap();
+            let digest = Sha256Digest::digest_bytes(&bytes);
+            let path = root.join("state/test-sharded-lora-receipt.json");
+            write_or_verify_immutable(&root, &path, &bytes).unwrap();
+            PrivateFileReference::new(path, digest)
+        };
+        assert_eq!(
+            authenticate_lora_adapter_axis_receipt(&root, &replay_ref).unwrap(),
+            receipt
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -5,8 +5,8 @@ use cerebro_tidex::acquisition_contract::{
 use cerebro_tidex::adapter_bank::{
     AdapterActivationRequest, AdapterBank, AdapterBankLookup, AdapterBankQuery,
     AdapterCandidateMaterializationRequest, AdapterCompositionRequest, AdapterExecutionResolution,
-    AdapterImportRequest, AdapterResolutionRequest, AdapterRevocationRequest,
-    AdapterRollbackRequest,
+    AdapterGovernedPromotionRequest, AdapterImportRequest, AdapterResolutionRequest,
+    AdapterRevocationRequest, AdapterRollbackRequest,
 };
 use cerebro_tidex::authority::PrivateFileReference;
 use cerebro_tidex::content_vault::capture_to_vault;
@@ -150,6 +150,14 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 .create_content_addressed_dvec(&values)?;
             println!("{}", serde_json::to_string_pretty(&delta)?);
         }
+        [area, command, path] if area == "receiver" && command == "normalize-sharded" => {
+            let root = configured_private_root()?;
+            let input: cerebro_tidex::weight_actuator::ShardedSafetensorsNormalizationInput =
+                read_json_bounded(Path::new(path))?;
+            let receipt =
+                cerebro_tidex::weight_actuator::normalize_sharded_safetensors(&root, &input)?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
         [area, command, path] if area == "receiver" && command == "import-lora-axis" => {
             let root = configured_private_root()?;
             let input: cerebro_tidex::weight_actuator::LoraAdapterAxisInput =
@@ -245,6 +253,15 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::to_string_pretty(&bank.materialize_candidate(&input)?)?
             );
         }
+        [area, command, path] if area == "adapter-bank" && command == "authorize" => {
+            let root = configured_private_root()?;
+            let bank = AdapterBank::open(&root)?;
+            let input: AdapterGovernedPromotionRequest = read_json_bounded(Path::new(path))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&bank.authorize_governed_promotion_request(&input)?)?
+            );
+        }
         [area, command, path] if area == "adapter-bank" && command == "verify-materialization" => {
             let root = configured_private_root()?;
             let bank = AdapterBank::open(&root)?;
@@ -335,11 +352,12 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                         {"id":"compile.receiver.capability_ir_readout","status":"experimental_partial_candidate_only","engine":"capability_ir::execute_linear_readout -> receiver_compiler::compile_receiver_readout_capability","reason":"executes an authenticated resident readout fragment before compiling receiver-native coordinates; full task semantics and independent receiver validation remain separate"},
                         {"id":"compile.receiver.measured_weights","status":"experimental_candidate_only","engine":"receiver_weight_binding::prepare_receiver_weight_candidate","reason":"authenticated measured-response calibration -> receiver coordinates -> dense delta -> standalone candidate; inverse predictions are not model execution or capability-transfer evidence"},
                         {"id":"benchmark.portability","canonical_name":"benchmark.receiver_compilation","status":"implemented","engine":"receiver_compiler::benchmark_receiver_portability_leave_one_out","reason":"leave-one-capability-out functional-space benchmark over declared calibration cases; the legacy portability id is retained for compatibility, while the benchmark measures receiver compilation recovery inside that domain and is not a universal cross-model claim"},
-                        {"id":"receiver.profile.physical","status":"implemented","engine":"model_adaptation::profile_receiver_model","reason":"binds one exact single-file SafeTensors receiver to config, tokenizer, physical topology and authenticated adaptation layouts; unknown or unsupported surfaces remain fail-closed"},
+                        {"id":"receiver.normalize.sharded_safetensors","status":"implemented","engine":"weight_actuator::normalize_sharded_safetensors","reason":"validates a Hugging Face SafeTensors weight_map against every shard and streams exact tensor payloads into one immutable content-addressed SafeTensors checkpoint; normalization is structural/data-plane evidence, not behavioral equivalence or promotion"},
+                        {"id":"receiver.profile.physical","status":"implemented","engine":"model_adaptation::profile_receiver_model","reason":"binds an exact single-file SafeTensors receiver to config, tokenizer, physical topology and authenticated adaptation layouts; standard Hugging Face sharded SafeTensors inputs are first normalized into the same retained single-file authority; unsupported surfaces remain fail-closed"},
                         {"id":"adapter_bank.modular","status":"implemented","engine":"adapter_bank::AdapterBank","reason":"immutable manifests with normalized retained provenance and a transactionally published snapshot chain"},
                         {"id":"adapter_bank.index.dynamic","status":"implemented","engine":"adapter_bank::AdapterBank::query","reason":"capability/model projections are regenerated and authenticated from the primary manifest table"},
                         {"id":"adapter.compose.exact_dense","status":"implemented","engine":"adapter_bank::AdapterBank::compose_exact","reason":"canonical ordered f32 axes multiplied and accumulated in f64 with one final f32 rounding; no SVD, pruning or rank truncation"},
-                        {"id":"adapter_bank.lifecycle","status":"implemented_governed","engine":"adapter_bank::AdapterBank::{activate,revoke,rollback}","reason":"activation consumes an opaque independently governed permit; revocation is sticky and transitive; rollback publishes a new forward revision"},
+                        {"id":"adapter_bank.lifecycle","status":"implemented_governed","engine":"adapter_bank::AdapterBank::{authorize_governed_promotion_request,activate,revoke,rollback}","reason":"authorization reopens and semantically reauthenticates sealed gate/PETFC/canary witnesses before minting a current-index-bound permit; activation consumes that permit; revocation is sticky and transitive; rollback publishes a new forward revision"},
                         {"id":"runtime.sleep","status":"implemented","engine":"BrainEngine::sleep_cycle"},
                         {"id":"capability_ir.v63.contract","status":"implemented_foundation","engine":"capability_ir::OperationalCapabilityContract","reason":"StateIR anchors, repeated OperatorIR transitions, canonical transition signatures, closure and contraction verification are implemented; evidence is bounded to tested domains and does not establish a universal capability representation across arbitrary models or tasks"},
                         {"id":"model.assistance","status":"configured_not_authoritative","reason":"model profiles are selectable; no model call is permitted to create evidence or promotion authority"}
@@ -435,6 +453,7 @@ fn usage() -> &'static str {
         "  tidex receiver describe-readout <input.json>\n",
         "  tidex receiver acquire-readout <input.json>\n",
         "  tidex receiver import-axis <values-reference.json>\n",
+        "  tidex receiver normalize-sharded <input.json>\n",
         "  tidex receiver import-lora-axis <input.json>\n",
         "  tidex receiver profile <input.json>\n",
         "  tidex receiver verify-profile <reference.json>\n",
@@ -446,6 +465,7 @@ fn usage() -> &'static str {
         "  tidex adapter-bank import <input.json>\n",
         "  tidex adapter-bank compose <input.json>\n",
         "  tidex adapter-bank materialize <input.json>\n",
+        "  tidex adapter-bank authorize <input.json>\n",
         "  tidex adapter-bank verify-materialization <reference.json>\n",
         "  tidex adapter-bank query <query.json>\n",
         "  tidex adapter-bank show <lookup.json>\n",

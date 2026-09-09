@@ -29,8 +29,9 @@ use crate::model_adaptation::{
     validate_lora_axis_against_profile, ReceiverAdaptationLayoutBinding,
 };
 use crate::portfolio_governance::{
-    authenticate_adapter_promotion_witnesses, CanaryState, CandidateGateDecision, PetfcAssessment,
-    VariantId,
+    authenticate_adapter_promotion_witnesses, authenticate_canary_state,
+    authenticate_candidate_gate_decision, authenticate_petfc_assessment, CanaryState,
+    CandidateGateDecision, PetfcAssessment, VariantId,
 };
 use crate::security::verify_internal_private_root;
 use crate::weight_actuator::{
@@ -63,6 +64,8 @@ pub const ADAPTER_BANK_COMMIT_SCHEMA: &str = "cerebro.tidex.adapter_bank_commit/
 pub const ADAPTER_BANK_REPORT_SCHEMA: &str = "cerebro.tidex.adapter_bank_report/v1";
 pub const ADAPTER_PROMOTION_AUTHORIZATION_SCHEMA: &str =
     "cerebro.tidex.adapter_promotion_authorization/v1";
+pub const ADAPTER_GOVERNED_PROMOTION_REQUEST_SCHEMA: &str =
+    "cerebro.tidex.adapter_governed_promotion_request/v1";
 pub const ADAPTER_CANDIDATE_MATERIALIZATION_REQUEST_SCHEMA: &str =
     "cerebro.tidex.adapter_candidate_materialization_request/v1";
 pub const ADAPTER_CANDIDATE_MATERIALIZATION_SCHEMA: &str =
@@ -427,6 +430,17 @@ pub struct AdapterCandidateMaterializationRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct AdapterGovernedPromotionRequest {
+    pub schema: String,
+    pub materialization: PrivateFileReference,
+    pub candidate_gate: PrivateFileReference,
+    pub petfc_assessment: PrivateFileReference,
+    pub canary_state: PrivateFileReference,
+    pub expected: AdapterBankExpectation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterCandidateMaterialization {
     pub schema: String,
     pub adapter: AdapterVersion,
@@ -630,14 +644,6 @@ impl AdapterBank {
     fn materialization_path(&self, digest: &Sha256Digest) -> PathBuf {
         self.bank_root()
             .join("materializations/by-sha")
-            .join(format!("{digest}.json"))
-    }
-
-    fn governance_witness_path(&self, authority: &str, digest: &Sha256Digest) -> PathBuf {
-        self.bank_root()
-            .join("governance-witnesses")
-            .join(authority)
-            .join("by-sha")
             .join(format!("{digest}.json"))
     }
 
@@ -2159,24 +2165,6 @@ impl AdapterBank {
         VariantId::parse(format!("adapter.manifest.{}", manifest.sha256))
     }
 
-    fn persist_governance_witness<T: Serialize>(
-        &self,
-        authority: &str,
-        witness: &T,
-    ) -> BrainResult<PrivateFileReference> {
-        if !matches!(authority, "candidate-gate" | "petfc" | "canary") {
-            return Err(invalid("adapter_governance_witness_authority_invalid"));
-        }
-        let bytes = serde_json::to_vec(witness)?;
-        let digest = Sha256Digest::digest_bytes(&bytes);
-        let path = self.governance_witness_path(authority, &digest);
-        let written = write_or_verify_immutable(&self.root, &path, &bytes)?;
-        if written != digest {
-            return Err(integrity("adapter_governance_witness_write_mismatch"));
-        }
-        Ok(PrivateFileReference::new(path, digest))
-    }
-
     fn persist_promotion_authorization(
         &self,
         authorization: &AdapterPromotionAuthorization,
@@ -2192,6 +2180,28 @@ impl AdapterBank {
         let reference = PrivateFileReference::new(path, digest);
         self.authenticate_promotion_authorization(&reference)?;
         Ok(reference)
+    }
+
+    /// Resolve immutable sealed governance witnesses and delegate to the sole
+    /// production promotion issuer. The request itself carries no decision
+    /// authority: every referenced witness is semantically replayed first.
+    pub fn authorize_governed_promotion_request(
+        &self,
+        request: &AdapterGovernedPromotionRequest,
+    ) -> BrainResult<PrivateFileReference> {
+        if request.schema != ADAPTER_GOVERNED_PROMOTION_REQUEST_SCHEMA {
+            return Err(invalid("adapter_governed_promotion_request_invalid"));
+        }
+        let gate = authenticate_candidate_gate_decision(&self.root, &request.candidate_gate)?;
+        let petfc = authenticate_petfc_assessment(&self.root, &request.petfc_assessment)?;
+        let canary = authenticate_canary_state(&self.root, &request.canary_state)?;
+        self.authorize_governed_promotion(
+            &request.materialization,
+            &gate,
+            &petfc,
+            &canary,
+            &request.expected,
+        )
     }
 
     /// Mint a promotion permit only after the complete sealed governance chain,
@@ -2234,9 +2244,9 @@ impl AdapterBank {
             authenticate_adapter_promotion_witnesses(&candidate_id, gate, petfc, canary)?;
 
             let evidence = AdapterPromotionEvidence {
-                independent_execution: self.persist_governance_witness("candidate-gate", gate)?,
-                preservation_assessment: self.persist_governance_witness("petfc", petfc)?,
-                negative_controls: self.persist_governance_witness("canary", canary)?,
+                independent_execution: gate.persist(&self.root)?,
+                preservation_assessment: petfc.persist(&self.root)?,
+                negative_controls: canary.persist(&self.root)?,
                 materialization_receipt: materialization_reference.clone(),
             };
             let decision = PromotionDecision {
@@ -2301,42 +2311,21 @@ impl AdapterBank {
                 evidence.verify(&self.root)?;
             }
         }
-        let materialization = if authorization.governed {
-            if authorization.evidence.independent_execution.path
-                != self.governance_witness_path(
-                    "candidate-gate",
-                    &authorization.evidence.independent_execution.sha256,
-                )
-                || authorization.evidence.preservation_assessment.path
-                    != self.governance_witness_path(
-                        "petfc",
-                        &authorization.evidence.preservation_assessment.sha256,
-                    )
-                || authorization.evidence.negative_controls.path
-                    != self.governance_witness_path(
-                        "canary",
-                        &authorization.evidence.negative_controls.sha256,
-                    )
-            {
-                return Err(integrity(
-                    "adapter_promotion_governance_witness_path_not_canonical",
-                ));
-            }
-            authorization
-                .evidence
-                .independent_execution
-                .verify(&self.root)?;
-            authorization
-                .evidence
-                .preservation_assessment
-                .verify(&self.root)?;
-            authorization
-                .evidence
-                .negative_controls
-                .verify(&self.root)?;
-            Some(self.authenticate_candidate_materialization(
+        let governed_evidence = if authorization.governed {
+            let gate = authenticate_candidate_gate_decision(
+                &self.root,
+                &authorization.evidence.independent_execution,
+            )?;
+            let petfc = authenticate_petfc_assessment(
+                &self.root,
+                &authorization.evidence.preservation_assessment,
+            )?;
+            let canary =
+                authenticate_canary_state(&self.root, &authorization.evidence.negative_controls)?;
+            let materialization = self.authenticate_candidate_materialization(
                 &authorization.evidence.materialization_receipt,
-            )?)
+            )?;
+            Some((materialization, gate, petfc, canary))
         } else {
             None
         };
@@ -2357,8 +2346,10 @@ impl AdapterBank {
         {
             return Err(integrity("adapter_promotion_manifest_binding_mismatch"));
         }
-        if let Some(materialization) = materialization {
+        if let Some((materialization, gate, petfc, canary)) = governed_evidence {
             self.require_promotable_capability_bundle(&manifest)?;
+            let candidate_id = self.governance_candidate_id(&authorization.manifest)?;
+            authenticate_adapter_promotion_witnesses(&candidate_id, &gate, &petfc, &canary)?;
             if materialization.adapter != authorization.adapter
                 || materialization.manifest != authorization.manifest
                 || materialization.capability_id != authorization.capability_id
@@ -2983,8 +2974,25 @@ impl AdapterBank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acquisition_contract::{
+        AcquisitionBudget, AcquisitionRequest, AcquisitionScope, NoisePolicy, RequestedResidency,
+    };
+    use crate::capability_bundle::CapabilityBundleStatus;
+    use crate::capability_ir::{
+        CapabilityIr, IrNode, OutputBinding, PrimitiveSet, TypedPort, ValueReference, ValueType,
+    };
+    use crate::content_vault::capture_to_vault;
+    use crate::finite::FiniteF64;
+    use crate::identity::{AcquisitionId, CapabilityNodeId, PortId, PrimitiveId};
     use crate::model_adaptation::{
         profile_receiver_model, ReceiverModelProfileInput, RECEIVER_MODEL_PROFILE_INPUT_SCHEMA,
+    };
+    use crate::portfolio_governance::{
+        decide_candidate, evaluate_paired_groups, evaluate_petfc, CanaryPolicy, CanaryStage,
+        CandidateGatePolicy, EvidenceId, HardInvariant, IndependenceGroupId, MetricDirection,
+        MetricId, MetricSpec, ObservationWindow, PairId, PairedEvaluationReport,
+        PairedExperimentalUnit, PairedObservation, PetfcConservationLimits, PetfcMetricPolicy,
+        PetfcPathLimits, PetfcPolicy, PetfcTrajectory, PetfcUtilityPolicy, RobustEvaluationPolicy,
     };
     use crate::security::secure_dir;
     use serde_json::{json, Map, Value};
@@ -3177,6 +3185,67 @@ mod tests {
             }
         }
 
+        fn closed_capability_bundle(&self) -> PrivateFileReference {
+            let donor = self.root.with_extension("governance-donor");
+            let _ = fs::remove_dir_all(&donor);
+            fs::create_dir_all(donor.join("src")).unwrap();
+            fs::write(donor.join("src/capability.rs"), b"pub fn apply() {}\n").unwrap();
+            let acquisition = AcquisitionRequest::new(
+                AcquisitionId::parse("adapter-bank-governance-acquisition.v1").unwrap(),
+                AcquisitionScope::WholeProject,
+                RequestedResidency::BestVerified,
+                NoisePolicy::ConservativeGeneratedArtifacts,
+                AcquisitionBudget {
+                    max_files: 16,
+                    max_total_bytes: 1 << 20,
+                },
+                vec![],
+            )
+            .unwrap();
+            let capture = capture_to_vault(&donor, &self.root, &acquisition).unwrap();
+            fs::remove_dir_all(&donor).unwrap();
+            let capability_id = CapabilityId::parse("capability.test:v1").unwrap();
+            let ir = CapabilityIr::new(
+                capability_id.clone(),
+                capture.envelope(),
+                PrimitiveSet::tidex_core_v1().unwrap(),
+                vec![TypedPort::tensor_f64(PortId::parse("scores").unwrap(), vec![4]).unwrap()],
+                vec![IrNode::new(
+                    CapabilityNodeId::parse("node.apply").unwrap(),
+                    PrimitiveId::parse("select.arg_max").unwrap(),
+                    vec![ValueReference::Input {
+                        name: PortId::parse("scores").unwrap(),
+                    }],
+                    TypedPort::scalar(PortId::parse("choice").unwrap(), ValueType::I64).unwrap(),
+                    vec![PathBuf::from("src/capability.rs")],
+                )
+                .unwrap()],
+                vec![OutputBinding::new(
+                    TypedPort::scalar(PortId::parse("selected").unwrap(), ValueType::I64).unwrap(),
+                    ValueReference::NodeOutput {
+                        node_id: CapabilityNodeId::parse("node.apply").unwrap(),
+                    },
+                )
+                .unwrap()],
+            )
+            .unwrap();
+            let ir_ref = ir.persist(&self.root, capture.envelope()).unwrap();
+            let capture_ref = capture.persist(&self.root).unwrap();
+            let bundle = crate::capability_bundle::CapabilityBundle::create_closed(
+                &self.root,
+                capability_id,
+                capture_ref,
+                ir_ref,
+                BTreeSet::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                bundle.status(),
+                CapabilityBundleStatus::RepresentationClosed
+            );
+            bundle.persist(&self.root).unwrap()
+        }
+
         fn evidence(&self, label: &str) -> PrivateFileReference {
             let bytes = format!("verified-evidence:{label}").into_bytes();
             let digest = Sha256Digest::digest_bytes(&bytes);
@@ -3244,6 +3313,199 @@ mod tests {
             expected: expectation(current),
         })
         .unwrap()
+    }
+
+    fn governance_metric(value: &str) -> MetricId {
+        MetricId::parse(value).unwrap()
+    }
+
+    fn governance_specs() -> Vec<MetricSpec> {
+        vec![
+            MetricSpec::new(
+                governance_metric("quality"),
+                MetricDirection::Maximize,
+                Some(HardInvariant::at_least(0.0).unwrap()),
+            )
+            .unwrap(),
+            MetricSpec::new(
+                governance_metric("loss"),
+                MetricDirection::Minimize,
+                Some(HardInvariant::at_most(1.0).unwrap()),
+            )
+            .unwrap(),
+        ]
+    }
+
+    fn governance_rows(
+        groups: usize,
+        baseline_quality: f64,
+        candidate_quality: f64,
+        baseline_loss: f64,
+        candidate_loss: f64,
+    ) -> Vec<(f64, f64, f64, f64)> {
+        vec![
+            (
+                baseline_quality,
+                candidate_quality,
+                baseline_loss,
+                candidate_loss
+            );
+            groups
+        ]
+    }
+
+    fn governance_report(
+        specs: &[MetricSpec],
+        baseline: &str,
+        candidate: &str,
+        start_tick: u64,
+        rows: &[(f64, f64, f64, f64)],
+        minimum_groups: usize,
+    ) -> PairedEvaluationReport {
+        let mut observations = Vec::new();
+        for (index, (baseline_quality, candidate_quality, baseline_loss, candidate_loss)) in
+            rows.iter().copied().enumerate()
+        {
+            let unit = PairedExperimentalUnit::new(
+                IndependenceGroupId::parse(format!("group-{index}")).unwrap(),
+                PairId::parse(format!("pair-{start_tick}-{index}")).unwrap(),
+                EvidenceId::parse(format!("evidence-{start_tick}-{index}")).unwrap(),
+                ObservationWindow::new(start_tick, start_tick + 1).unwrap(),
+            );
+            observations.push(
+                PairedObservation::new(
+                    governance_metric("quality"),
+                    unit.clone(),
+                    baseline_quality,
+                    candidate_quality,
+                )
+                .unwrap(),
+            );
+            observations.push(
+                PairedObservation::new(
+                    governance_metric("loss"),
+                    unit,
+                    baseline_loss,
+                    candidate_loss,
+                )
+                .unwrap(),
+            );
+        }
+        evaluate_paired_groups(
+            VariantId::parse(baseline).unwrap(),
+            VariantId::parse(candidate).unwrap(),
+            specs,
+            &observations,
+            &RobustEvaluationPolicy::new(minimum_groups, minimum_groups.min(3), 1_000).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn governance_gate_policy(specs: &[MetricSpec], minimum_groups: usize) -> CandidateGatePolicy {
+        CandidateGatePolicy::new(
+            specs,
+            minimum_groups,
+            1.0,
+            BTreeMap::from([
+                (governance_metric("loss"), FiniteF64::new(0.0).unwrap()),
+                (governance_metric("quality"), FiniteF64::new(0.0).unwrap()),
+            ]),
+        )
+        .unwrap()
+    }
+
+    fn governance_petfc_policy(specs: &[MetricSpec]) -> PetfcPolicy {
+        PetfcPolicy::new(
+            specs,
+            governance_metric("quality"),
+            vec![
+                PetfcMetricPolicy::new(governance_metric("quality"), 1.0, 0.0).unwrap(),
+                PetfcMetricPolicy::new(governance_metric("loss"), 1.0, 0.0).unwrap(),
+            ],
+            PetfcPathLimits::new(2, 8, 2.0, 2.0, 0.6, 0.0).unwrap(),
+            PetfcConservationLimits::new(0.0, 0, 2.0).unwrap(),
+            PetfcUtilityPolicy::new(0.0, 0.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn governed_witness_chain(
+        candidate: &VariantId,
+    ) -> (CandidateGateDecision, PetfcAssessment, CanaryState) {
+        let specs = governance_specs();
+        let candidate_name = candidate.as_str();
+        let first = governance_report(
+            &specs,
+            "baseline",
+            "adapter-middle",
+            100,
+            &governance_rows(3, 0.2, 0.4, 0.8, 0.6),
+            3,
+        );
+        let second = governance_report(
+            &specs,
+            "baseline",
+            candidate_name,
+            110,
+            &governance_rows(3, 0.2, 0.7, 0.8, 0.3),
+            3,
+        );
+        let gate_report = governance_report(
+            &specs,
+            "baseline",
+            candidate_name,
+            120,
+            &governance_rows(3, 0.2, 0.7, 0.8, 0.3),
+            3,
+        );
+        let gate =
+            decide_candidate(&specs, &gate_report, &governance_gate_policy(&specs, 3)).unwrap();
+        let petfc_policy = governance_petfc_policy(&specs);
+        let trajectory = PetfcTrajectory::start(&first, &petfc_policy)
+            .unwrap()
+            .append_report(&second)
+            .unwrap();
+        let petfc = evaluate_petfc(&specs, &trajectory, &petfc_policy).unwrap();
+
+        let canary_policy = CanaryPolicy::new(
+            &specs,
+            Sha256Digest::digest_bytes(b"adapter-bank-governed-canary-salt"),
+            vec![
+                CanaryStage::new(100_000, 3).unwrap(),
+                CanaryStage::new(500_000, 4).unwrap(),
+            ],
+            1.0,
+            BTreeMap::from([
+                (governance_metric("loss"), FiniteF64::new(0.0).unwrap()),
+                (governance_metric("quality"), FiniteF64::new(0.0).unwrap()),
+            ]),
+        )
+        .unwrap();
+        let first_canary_tick = gate.source_observation_window().end_tick() + 10;
+        let first_canary = governance_report(
+            &specs,
+            "baseline",
+            candidate_name,
+            first_canary_tick,
+            &governance_rows(3, 0.2, 0.7, 0.8, 0.3),
+            3,
+        );
+        let state = CanaryState::start(&gate, &canary_policy)
+            .unwrap()
+            .evaluate_stage(&specs, &first_canary, &canary_policy)
+            .unwrap();
+        let second_canary = governance_report(
+            &specs,
+            "baseline",
+            candidate_name,
+            first_canary_tick + 10,
+            &governance_rows(4, 0.2, 0.7, 0.8, 0.3),
+            3,
+        );
+        let canary = state
+            .evaluate_stage(&specs, &second_canary, &canary_policy)
+            .unwrap();
+        (gate, petfc, canary)
     }
 
     #[test]
@@ -3455,6 +3717,74 @@ mod tests {
                 .as_str(),
             format!("adapter.manifest.{}", manifest_reference.sha256)
         );
+    }
+
+    #[test]
+    fn governed_authorization_request_replays_real_witnesses_and_activates() {
+        let fixture = Fixture::new("governed-production-path");
+        let bank = AdapterBank::open(&fixture.root).unwrap();
+        let capability_bundle = fixture.closed_capability_bundle();
+        let (adapter_model, adapter_config) = fixture.adapter("governed", 0.25);
+        let mut import = fixture.import_request(
+            "adapter.governed",
+            "lineage.governed",
+            adapter_model,
+            adapter_config,
+            initial_expectation(),
+        );
+        import.capability_bundle = Some(capability_bundle);
+        let adapter = import.adapter.clone();
+        let imported = bank.import_lora(&import).unwrap();
+        let manifest_ref = imported.manifest.clone().unwrap();
+
+        let materialization = bank
+            .materialize_candidate(&AdapterCandidateMaterializationRequest {
+                schema: ADAPTER_CANDIDATE_MATERIALIZATION_REQUEST_SCHEMA.to_string(),
+                adapter: adapter.clone(),
+                output_path: fixture.root.join("governed-candidate.safetensors"),
+                expected: expectation(&imported),
+            })
+            .unwrap();
+        let candidate_id = bank.governance_candidate_id(&manifest_ref).unwrap();
+        let (gate, petfc, canary) = governed_witness_chain(&candidate_id);
+        authenticate_adapter_promotion_witnesses(&candidate_id, &gate, &petfc, &canary).unwrap();
+        let request = AdapterGovernedPromotionRequest {
+            schema: ADAPTER_GOVERNED_PROMOTION_REQUEST_SCHEMA.to_string(),
+            materialization: materialization.clone(),
+            candidate_gate: gate.persist(&fixture.root).unwrap(),
+            petfc_assessment: petfc.persist(&fixture.root).unwrap(),
+            canary_state: canary.persist(&fixture.root).unwrap(),
+            expected: expectation(&imported),
+        };
+
+        let authorization = bank.authorize_governed_promotion_request(&request).unwrap();
+        let activated = bank
+            .activate(&AdapterActivationRequest {
+                schema: ADAPTER_ACTIVATION_REQUEST_SCHEMA.to_string(),
+                adapter: adapter.clone(),
+                authorization: authorization.clone(),
+                expected: expectation(&imported),
+            })
+            .unwrap();
+        assert_eq!(activated.revision, imported.revision + 1);
+
+        let manifest = bank.authenticate_manifest(&manifest_ref).unwrap();
+        let resolution = bank
+            .resolve_active(&AdapterResolutionRequest {
+                schema: ADAPTER_RESOLUTION_REQUEST_SCHEMA.to_string(),
+                receiver_model: manifest.receiver_model.clone(),
+                capability_id: manifest.capability_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(resolution.authorization, authorization);
+        assert_eq!(resolution.adapter, adapter);
+        assert!(resolution.materialized_candidate.is_some());
+        bank.authenticate_execution_resolution(&resolution).unwrap();
+
+        assert!(bank.authorize_governed_promotion_request(&request).is_err());
+        let history = bank.verify_history().unwrap();
+        assert_eq!(history.revision, activated.revision);
+        assert_eq!(history.active_adapter_count, 1);
     }
 
     #[test]
